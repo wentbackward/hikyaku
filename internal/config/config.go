@@ -100,6 +100,7 @@ type Backend struct {
 	ID               string               `yaml:"id"`
 	Type             string               `yaml:"type"` // openai | anthropic | ollama
 	BaseURL          string               `yaml:"base_url"`
+	URLJoin          string               `yaml:"url_join"` // openai (default) | rfc3986 — how the lane path is joined onto base_url
 	APIKey           string               `yaml:"api_key"`
 	AuthType         string               `yaml:"auth_type"` // bearer | x-api-key | "" (auto: bearer for openai, x-api-key for anthropic)
 	Group            string               `yaml:"group"`     // optional; LB group name
@@ -464,6 +465,12 @@ func validateBackends(backends []Backend) (map[string]bool, error) {
 		}
 		if b.Type != "openai" && b.Type != "anthropic" && b.Type != "ollama" {
 			return nil, fmt.Errorf("backend %q: type must be openai, anthropic, or ollama, got %q", b.ID, b.Type)
+		}
+		switch b.URLJoin {
+		case "", "openai", "rfc3986":
+			// ok; "" means default (openai) at use site
+		default:
+			return nil, fmt.Errorf("backend %q: url_join must be openai or rfc3986, got %q", b.ID, b.URLJoin)
 		}
 		if b.Default {
 			if defaultID != "" {

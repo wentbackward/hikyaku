@@ -101,12 +101,8 @@ backends:
 Both formats produce identical results. If you specify an explicit `id` inside the map value, it takes precedence over the map key. The `id` and `type` fields are still required in both cases.
 
 - **`type`** — `openai`, `anthropic`, or `ollama`. Determines auth header format, stream parsing, and `enable_thinking` translation. Must match the protocol the client speaks: OpenAI format (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`) routes to `openai` backends; Anthropic format (`/v1/messages`) routes to `anthropic` backends; Ollama-native format (`/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/api/tags`) routes to `ollama` backends.
-- **`base_url`** — the full base URL for the backend. Include any version or path segments (e.g. `https://api.openai.com/v1/`, `https://api.novita.ai/openai/v1/`, `http://gpu-server:8000/v1/`).
-  
-  **URL resolution (RFC 3986).** The proxy combines `base_url` with the request path using standard URL resolution ([RFC 3986 §5.2.2](https://www.rfc-editor.org/rfc/rfc3986#section-5.2.2)). Absolute paths (starting with `/`) replace the base URL's path entirely. Relative paths append to it. As a consequence:
-  - Include a trailing slash on `base_url` when your backend uses a path prefix (e.g. `"http://host:port/v1/"`), so that relative resolution appends correctly.
-  - Health-check and alive-probe paths are absolute (e.g. `/v1/models`, `/health`) — they replace the base path. Specify them exactly as the backend expects.
-  - The incoming request path from the client is forwarded verbatim; the proxy does not manipulate it.
+- **`base_url`** — the full base URL for the backend. Include any version or path segments (e.g. `https://api.openai.com/v1/`, `https://api.novita.ai/openai/v1/`, `http://gpu-server:8000/v1/`, `https://token-plan.maas.aliyuncs.com/compatible-mode/v1/`).
+- **`url_join`** — `openai` (default) or `rfc3986`. Controls how the request path is combined with `base_url`. See [URL composition](#url-composition) below.
 - **`api_key`** — static key or OAuth token. Sent to the backend using the auth header format determined by `auth_type`. If empty, the client's original auth headers pass through to the backend.
 - **`auth_type`** — `bearer` or `x-api-key`. Controls which HTTP header carries the API key. Default: `bearer` for `openai` backends, `x-api-key` for `anthropic` backends. Override to `bearer` when using OAuth tokens with Anthropic.
 - **`timeout_seconds`** — idle timeout per request. If no bytes flow for this duration, the request is cancelled. Default: 300.
@@ -124,6 +120,44 @@ Both formats produce identical results. If you specify an explicit `id` inside t
     # also: ports: 4000           # single port
     # also: ports: [4000, 4005]   # explicit list
 ```
+
+### URL composition
+
+The proxy combines `base_url` with the request path to produce the upstream URL. The L1 request log line (`[req]`) shows the final URL it sent, so misconfiguration is visible without changing log levels:
+
+```
+[req] [abc1234] POST /v1/chat/completions model=qwen→qwen-max backend=qwen \
+  url=https://host/compatible-mode/v1/chat/completions status=200 dur=0.821s
+```
+
+Two composition modes, set per-backend via `url_join`:
+
+#### `openai` (default)
+
+Append-style join, the same convention the OpenAI / Anthropic SDKs use. The lane prefix (`/v1` for openai/anthropic, `/api` for ollama) is only stripped from the incoming path when `base_url` already provides it — so duplicated prefixes collapse cleanly, and bare base URLs still work.
+
+| `base_url` path | Incoming path | Upstream path |
+|---|---|---|
+| `""` (host only) | `/v1/chat/completions` | `/v1/chat/completions` |
+| `/v1` | `/v1/chat/completions` | `/v1/chat/completions` |
+| `/v1/` | `/v1/chat/completions` | `/v1/chat/completions` |
+| `/compatible-mode/v1` | `/v1/chat/completions` | `/compatible-mode/v1/chat/completions` |
+| `/proxy` | `/v1/chat/completions` | `/proxy/v1/chat/completions` |
+
+This is required for providers like Aliyun's Qwen-compatible endpoint that nest the version segment under a longer base path. The pre-v0.4.1 RFC-style resolution would silently drop the `/compatible-mode` prefix on those, producing 404s.
+
+#### `rfc3986`
+
+Strict [RFC 3986 §5.2.2](https://www.rfc-editor.org/rfc/rfc3986#section-5.2.2) reference resolution. The incoming `/v1/...` path is absolute, so per the spec it replaces `base_url`'s path entirely. This was the pre-v0.4.1 behaviour, preserved as an escape hatch for backends where the operator wants exactly this — for example, when `base_url`'s path component is intentionally ignored.
+
+```yaml
+- id: legacy
+  type: openai
+  base_url: "https://host/ignored/prefix"
+  url_join: rfc3986   # /v1/chat/completions → https://host/v1/chat/completions
+```
+
+Probe and health-check paths are always treated as absolute (they replace `base_url`'s path) regardless of `url_join`.
 
 ### Ollama backends
 

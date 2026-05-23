@@ -103,6 +103,31 @@ backends:
     max_concurrency: 5   # optional: limit in-flight requests to this backend (0 = unlimited)
     skip_probe: true
 
+  # url_join controls how the lane path (/v1/..., /api/...) is composed onto
+  # base_url. Two modes:
+  #
+  #   openai (default) — append-style, like the OpenAI SDK. Strips a
+  #     duplicated lane prefix when base_url already provides one, so all of
+  #     these resolve correctly:
+  #       base "https://api.openai.com"          → ".../v1/chat/completions"
+  #       base "https://api.openai.com/v1"       → ".../v1/chat/completions"
+  #       base "https://host/compatible-mode/v1" → ".../compatible-mode/v1/chat/completions"
+  #     The third form is required for providers like Aliyun's Qwen-compatible
+  #     endpoint that nest /v1 under a longer base path. RFC 3986 resolution
+  #     would silently drop the "/compatible-mode" prefix on those.
+  #
+  #   rfc3986 — strict RFC reference resolution. The incoming /v1/... path
+  #     is absolute, so it replaces base_url's path entirely. Use only if
+  #     you specifically need this behaviour.
+  #
+  # Example: emergency-mode Qwen-compatible upstream.
+  # - id: qwen
+  #   type: openai
+  #   base_url: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+  #   url_join: openai   # default; shown here for clarity
+  #   api_key: "${QWEN_API_KEY}"
+  #   timeout_seconds: 300
+
 # --- Load-balanced groups ---------------------------------------------------
 #
 # Define groups to distribute traffic across multiple backends.

@@ -5,7 +5,7 @@
 - **Multi-protocol** — OpenAI (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`), Anthropic (`/v1/messages`), Ollama native (`/api/chat`, `/api/generate`, `/api/embed`, `/api/tags`)
 - **Protocol isolation** — no translation between protocols. Each lane isolated to its backend type
 - **SSE passthrough** — zero-copy streaming, metrics parsed from byte stream without buffering
-- **RFC 3986 URL resolution** — all URLs via `url.ResolveReference`, no string concatenation
+- **Two URL-join modes** — `openai` (default, append-style, OpenAI-SDK convention, supports nested base paths like Aliyun's `/compatible-mode/v1`) or `rfc3986` (strict reference resolution per [RFC 3986 §5.2.2](https://www.rfc-editor.org/rfc/rfc3986#section-5.2.2))
 
 ## Routing & Virtual Models
 - **Virtual models** — same underlying model, multiple names with different parameter profiles

@@ -639,7 +639,9 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 					s.balancer.InvalidatePin(lbGroup, lbAffKey)
 				}
 			}
-			upstreamURL := targetURL.ResolveReference(&url.URL{Path: r.URL.Path}).String()
+			// r.URL has been rewritten by the director to the final upstream
+			// scheme/host/path, so r.URL.String() is the actual outbound URL.
+			upstreamURL := r.URL.String()
 			logger.Request("[%s] %s %s model=%s backend=%s url=%s status=502 dur=%.3fs ERROR: %v",
 				rid, r.Method, r.URL.Path, modelName, backendID, upstreamURL, elapsed, err)
 			log.Printf("[proxy] upstream error backend=%s: %v", backendID, err)
@@ -720,6 +722,16 @@ func (c *captureCtx) finishError(t0 time.Time, msg string) {
 	}
 }
 
+// upstreamURL returns the full URL that was sent to the backend, as rewritten
+// by the director (scheme + host + resolved path + query). Used in request
+// logs so misconfigured base_url / endpoint composition is visible at L1.
+func upstreamURL(resp *http.Response) string {
+	if resp == nil || resp.Request == nil || resp.Request.URL == nil {
+		return ""
+	}
+	return resp.Request.URL.String()
+}
+
 func timing(t0 time.Time) capture.TimingSnapshot {
 	return capture.TimingSnapshot{
 		StartedAt:  t0.UTC().Format(time.RFC3339Nano),
@@ -766,16 +778,7 @@ func director(target *url.URL, backend *config.Backend, body []byte, pathOverrid
 		if pathOverride != "" {
 			endpointPath = pathOverride
 		}
-		// Combine the base_url's path with the endpoint path using RFC 3986.
-		// Absolute paths (starting with "/") replace the base path entirely.
-		// Users should configure base_url with a trailing slash (e.g. "http://host:port/v1/")
-		// so that relative resolution appends correctly.
-		ref, err := url.Parse(endpointPath)
-		if err != nil {
-			req.URL.Path = endpointPath // fallback
-		} else {
-			req.URL.Path = target.ResolveReference(ref).Path
-		}
+		req.URL.Path = joinUpstreamPath(target.Path, endpointPath, backend.Type, backend.URLJoin)
 		// Auth headers — auth_type overrides the default for the backend type.
 		// Default: "x-api-key" for anthropic, "bearer" for openai.
 		// Explicit "bearer" is needed for OAuth tokens on Anthropic.
@@ -813,6 +816,91 @@ func director(target *url.URL, backend *config.Backend, body []byte, pathOverrid
 			applyHeaderOps(req.Header, routeHeaders)
 		}
 	}
+}
+
+// joinUpstreamPath composes the final upstream path from a backend's base_url
+// path component and the incoming request path. The mode controls *how* that
+// composition happens:
+//
+//   - "openai" (default): backwards-compatible append. If base_url's path
+//     already provides the lane prefix (/v1 for openai/anthropic, /api for
+//     ollama), the incoming lane prefix is stripped before joining so it
+//     doesn't double up. Otherwise the incoming path appends as-is. This
+//     makes all of these work:
+//     base ""                     + "/v1/chat/completions" → "/v1/chat/completions"
+//     base "/v1"                  + "/v1/chat/completions" → "/v1/chat/completions"
+//     base "/compatible-mode/v1"  + "/v1/chat/completions" → "/compatible-mode/v1/chat/completions"
+//     Matches what the OpenAI/Anthropic SDKs and LiteLLM do, plus Aliyun's
+//     Qwen-style nested base URLs.
+//
+//   - "rfc3986": resolves the incoming path as a strict RFC 3986 reference
+//     against base_url. The incoming path is absolute, so per the spec it
+//     replaces base_url's path entirely. The pre-fix behavior, kept as an
+//     escape hatch.
+//
+// Returns just the path component (caller assigns to req.URL.Path).
+func joinUpstreamPath(basePath, endpointPath, backendType, mode string) string {
+	if mode == "" {
+		mode = "openai"
+	}
+	if mode == "rfc3986" {
+		ref, err := url.Parse(endpointPath)
+		if err != nil {
+			return endpointPath
+		}
+		base := &url.URL{Path: basePath}
+		return base.ResolveReference(ref).Path
+	}
+
+	// openai mode: strip the lane prefix from endpointPath only when basePath
+	// already supplies it, then single-slash-join.
+	suffix := stripLanePrefixIfBaseHas(endpointPath, basePath, backendType)
+	return singleJoiningSlash(basePath, suffix)
+}
+
+// stripLanePrefixIfBaseHas removes the lane prefix (/v1 or /api) from path,
+// but only when basePath already ends with that same prefix. This keeps the
+// helper compatible with both base-url styles in the wild:
+//
+//	base "/v1" or "/compatible-mode/v1" → strip (prevents double /v1)
+//	base "" or "/" or "/some/other/prefix" → no strip (path appends as-is)
+func stripLanePrefixIfBaseHas(path, basePath, backendType string) string {
+	prefix := "/v1"
+	if backendType == "ollama" {
+		prefix = "/api"
+	}
+	baseTrimmed := strings.TrimSuffix(basePath, "/")
+	if !strings.HasSuffix(baseTrimmed, prefix) {
+		return path
+	}
+	// Match "/v1" exactly or "/v1/..." — but not "/v123/foo".
+	if path == prefix {
+		return "/"
+	}
+	if strings.HasPrefix(path, prefix+"/") {
+		return path[len(prefix):]
+	}
+	return path
+}
+
+// singleJoiningSlash joins a and b with exactly one slash between them.
+// Mirrors httputil.NewSingleHostReverseProxy's helper.
+func singleJoiningSlash(a, b string) string {
+	aslash := strings.HasSuffix(a, "/")
+	bslash := strings.HasPrefix(b, "/")
+	switch {
+	case aslash && bslash:
+		return a + b[1:]
+	case !aslash && !bslash:
+		if a == "" {
+			return b
+		}
+		if b == "" {
+			return a
+		}
+		return a + "/" + b
+	}
+	return a + b
 }
 
 // routeHeaders returns the route's HeadersOp from a Resolution, or a zero
@@ -973,8 +1061,8 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 							}
 						}
 					}
-					logger.Request("[%s] POST %s model=%s→%s backend=%s status=%s dur=%.3fs stream=true",
-						rid, path, virtualModel, realModel, backendID, statusStr, elapsed)
+					logger.Request("[%s] POST %s model=%s→%s backend=%s url=%s status=%s dur=%.3fs stream=true",
+						rid, path, virtualModel, realModel, backendID, upstreamURL(resp), statusStr, elapsed)
 					if ssep != nil && ssep.captureContent {
 						logger.Content("[resp %s] | %s", rid, ssep.ResponseText())
 					}
@@ -1017,8 +1105,8 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 					}
 				}
 			}
-			logger.Request("[%s] POST %s model=%s→%s backend=%s status=%s dur=%.3fs",
-				rid, path, virtualModel, realModel, backendID, statusStr, elapsed)
+			logger.Request("[%s] POST %s model=%s→%s backend=%s url=%s status=%s dur=%.3fs",
+				rid, path, virtualModel, realModel, backendID, upstreamURL(resp), statusStr, elapsed)
 
 			// Log upstream error body at level >= 1
 			if resp.StatusCode != http.StatusOK && logger.Get() >= logger.LevelRequest {
