@@ -2,6 +2,8 @@ bin/
 config.yaml
 config/
 .env
+scripts/.env.*
+!scripts/.env.example
 llm-proxy
 .omc/*.log
 .omc/
