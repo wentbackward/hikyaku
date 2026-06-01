@@ -84,6 +84,10 @@ func backendIDs(backends []*config.Backend) []string {
 
 // New creates a Balancer from the config and starts background goroutines.
 func New(cfg *config.Config) *Balancer {
+	// Seed the per-process affinity key (no-op in inspect builds). Guarded by
+	// sync.Once internally so SIGHUP reloads don't re-key and break affinity.
+	seedAffinityKey()
+
 	b := &Balancer{
 		groups: make(map[string]*Group, len(cfg.Groups)),
 		hc:     newHCClient(cfg),
@@ -169,7 +173,7 @@ func (b *Balancer) Select(groupName, key string, ctx *RequestContext) (*BackendS
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[lb] group %-20s → %-20s (pool=%d, affinity=%s)", groupName, selected.ID, len(pool), key)
+	logAffinity("[lb] group %-20s → %-20s (pool=%d, affinity=%s)", groupName, selected.ID, len(pool), key)
 	return selected, nil
 }
 

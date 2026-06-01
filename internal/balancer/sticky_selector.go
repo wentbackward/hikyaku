@@ -1,7 +1,6 @@
 package balancer
 
 import (
-	"log"
 	"slices"
 	"time"
 )
@@ -44,18 +43,18 @@ func (s *StickyLeastLoaded) Select(pool []*BackendState, key string, ctx *Reques
 					s.store.Touch(key)
 					return pinned, nil
 				}
-				log.Printf("[lb] affinity key=%-16s pinned=%s OVERLOADED (inflight=%d, max=%d)",
+				logAffinity("[lb] affinity key=%-16s pinned=%s OVERLOADED (inflight=%d, max=%d)",
 					key[:min(len(key), 16)], pinned.ID, pinned.InFlight.Load(), s.maxConcurrency)
 			}
 			if pinned == nil {
-				log.Printf("[lb] affinity key=%-16s pinned=%s NOT IN POOL (pool=%v)",
+				logAffinity("[lb] affinity key=%-16s pinned=%s NOT IN POOL (pool=%v)",
 					key[:min(len(key), 16)], entry.BackendID, poolIDs(pool))
 			} else {
-				log.Printf("[lb] affinity key=%-16s pinned=%s FAILING (cooldown active)",
+				logAffinity("[lb] affinity key=%-16s pinned=%s FAILING (cooldown active)",
 					key[:min(len(key), 16)], pinned.ID)
 			}
 		} else {
-			log.Printf("[lb] affinity key=%-16s MISS (no pin yet)", key[:min(len(key), 16)])
+			logAffinity("[lb] affinity key=%-16s MISS (no pin yet)", key[:min(len(key), 16)])
 		}
 	}
 

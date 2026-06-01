@@ -2,7 +2,6 @@ package balancer
 
 import (
 	"net/http"
-	"strconv"
 	"strings"
 )
 
@@ -35,8 +34,7 @@ func FirstUserMessageKey(body map[string]interface{}, maxBytes int) string {
 		if len(content) > maxBytes {
 			content = content[:maxBytes]
 		}
-		h := fnv64a([]byte(content))
-		return strconv.FormatUint(h, 16)
+		return hashAffinity([]byte(content))
 	}
 
 	return "" // no user message found
