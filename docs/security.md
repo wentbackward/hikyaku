@@ -17,6 +17,8 @@ Explicitly **not** addressed:
 - Rate limiting at the proxy. Backends' own limits apply.
 - PII review of prompts. Anything a user types may be logged or captured depending on configuration.
 
+**Untrusted-host / memory-scanning deployments** (e.g. on-prem hardware you don't fully control, where an adversary may read process memory) are a *partial* concern of the hardened build. It minimizes the plaintext window and closes the unprivileged leak vectors, but a transforming proxy must hold decrypted requests in RAM to route them — so the actual guarantee against a privileged host requires a TEE. This is covered in detail under [Memory confidentiality](#memory-confidentiality-and-the-limits-of-an-in-process-defense); read it before assuming the hardened build alone defends against host-level memory access.
+
 ## Transport
 
 ### Between clients and the proxy
@@ -28,11 +30,54 @@ Explicitly **not** addressed:
 
 If neither condition is met, startup fails with a clear message pointing at both options. This is intentional — the path of least resistance should leave no port serving plaintext.
 
-When using Tailscale, you can provision a per-node cert with `tailscale cert <host>.your-tailnet.ts.net` and point `server.tls` at it — clients then connect to `https://<host>.your-tailnet.ts.net:4000/v1` with certificate verification. Or stick with plaintext + WireGuard encryption by setting `allow_plaintext: true`; both are valid choices, you just have to pick one.
+**In the hardened build, plaintext is not an option at all.** `allow_plaintext` is ignored: the gateway refuses to start without `server.tls.cert` + `key`, and a non-loopback metrics bind likewise requires TLS. See [Hardened build](#hardened-build).
+
+**Minimum TLS version.** `server.min_tls_version` sets the floor for both legs — `"1.3"` (default) or `"1.2"`. In the inspect build this tightens Go's defaults when set; in the hardened build it is the enforced minimum. Lower it to `"1.2"` only to accommodate clients or backends on lagging infrastructure — never below. This is a deliberate no-lock-in knob: hardened pins a strong default but does not strand operators who can't yet reach 1.3.
+
+See [TLS with Tailscale](#tls-with-tailscale) for provisioning a cert on a tailnet.
 
 ### Between the proxy and upstream providers
 
-Standard Go `net/http` transport with system CA bundle. Any backend `base_url` starting with `https://` uses TLS and verifies the server certificate. No additional configuration needed for Anthropic, OpenAI, HuggingFace, or any other HTTPS-speaking backend.
+Standard Go `net/http` transport with system CA bundle. Any backend `base_url` starting with `https://` uses TLS and verifies the server certificate (no `InsecureSkipVerify` anywhere). No additional configuration needed for Anthropic, OpenAI, or any other HTTPS-speaking backend.
+
+**Hardened build adds two outbound guarantees:**
+
+- **OpenAI lane must be encrypted.** Any `type: openai` backend must have an `https://` base_url; an `http://` openai backend is rejected at startup. (The ollama and anthropic lanes are not constrained — local ollama/vLLM over `http://localhost` still works.)
+- **Minimum TLS version** is pinned to `server.min_tls_version` (default 1.3) on the shared outbound transport. `http://` backends are unaffected — they never perform a handshake — so this hardens any HTTPS backend without breaking local plaintext ones.
+
+### TLS with Tailscale
+
+Tailscale can issue a real (Let's Encrypt-backed) certificate for a node's MagicDNS name, which the proxy then terminates directly. **Compose does not provision this for you** — it only mounts files that already exist. The hardened build *requires* a working cert (you cannot terminate TLS at Tailscale and forward plaintext to hikyaku — hardened rejects plaintext), so the cert must be on disk and readable by the container.
+
+1. Enable **HTTPS certificates** for the tailnet (admin console → MagicDNS + HTTPS).
+2. On the host, provision the cert (writes `<fqdn>.crt` + `<fqdn>.key`):
+   ```bash
+   sudo tailscale cert <host>.<your-tailnet>.ts.net
+   ```
+3. Mount the directory and point `server.tls` at it:
+   ```yaml
+   # docker-compose.yml
+   volumes:
+     - ./certs:/certs:ro
+   ```
+   ```yaml
+   # config.yaml
+   server:
+     tls:
+       cert: /certs/<host>.<your-tailnet>.ts.net.crt
+       key:  /certs/<host>.<your-tailnet>.ts.net.key
+   ```
+4. Clients connect to `https://<host>.<your-tailnet>.ts.net:4000/v1` with full certificate verification.
+
+**Gotcha — file ownership vs. the non-root container.** The image runs as UID `65532` (`FROM scratch`, no root). `tailscale cert` writes the key root-owned `0600`, which UID `65532` cannot read → startup fails loading the key. Fix ownership on the mounted copies (keep the key `0600`, just owned by the runtime UID):
+
+```bash
+sudo chown 65532:65532 /path/to/certs/<host>.*.ts.net.crt /path/to/certs/<host>.*.ts.net.key
+```
+
+**Gotcha — renewal.** Tailscale certs are ~90-day. hikyaku loads the cert at startup and does not hot-reload it, so a renewed cert is picked up only on container restart. Re-run `tailscale cert`, re-apply ownership, and `docker compose restart hikyaku` on a schedule (or before expiry).
+
+For a non-Tailscale tailnet, or to skip TLS termination in hikyaku entirely, the inspect build also supports `allow_plaintext: true` behind WireGuard/VPN — but that path is unavailable in the hardened build.
 
 ### Metrics endpoint
 

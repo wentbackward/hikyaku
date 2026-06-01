@@ -46,11 +46,15 @@
 - **Drop empty content** — refuses (400) any request containing messages with nil/empty content. Does not strip or mutate. Opt-in (`server.drop_empty_content: true`). Refusal: "empty messages are blocked by your administrator"
 
 ## Security
-- **TLS enforcement** — refuses to start without TLS unless explicitly opted in
+- **TLS enforcement** — refuses to start without TLS unless explicitly opted in (inspect); mandatory in hardened
+- **Configurable TLS floor** — `server.min_tls_version` (`1.3` default, `1.2` for lagging infra); applied inbound + outbound
 - **Constant-time auth** — bearer token comparison
 - **Secret resolution** — `${ENV_VAR}` syntax, never stored in config
+- **Keyed affinity fingerprints** — HMAC-SHA256 with a per-process random key (hardened); affinity logs gated
+- **Request-buffer zeroing** — resolved outbound body wiped after forward (all builds); raw inbound body wiped early (hardened)
 - **Non-root container** — `FROM scratch`, USER 65532, no shell, no libc (~7MB)
-- **Hardened build** — `-tags hardened` compiles out capture, verbose logging, and prompt text
+- **Hardened build** — `-tags hardened`: published as `:…-hardened` images. Compiles out capture/verbose logging/prompt text AND enforces TLS both legs (https-only openai lane), keyed affinity hashing, and Linux process hardening (mlock, non-dumpable, no core dumps)
+- **TEE-deployable** — hardened build minimizes the plaintext window so it can run inside a confidential-computing VM (SEV-SNP/TDX/Grace-Blackwell) for memory confidentiality against a privileged host
 - **Per-backend auth** — api_key, tls_client_cert, bearer_token
 
 ## Operations

@@ -13,6 +13,7 @@ server:
   tls:
     cert: ""                     # path to TLS certificate
     key:  ""                     # path to TLS private key
+  # min_tls_version: "1.3"       # "1.3" (default) or "1.2"; floor for inbound + outbound TLS
   transport:
     max_idle_conns: 100          # total idle connections across all backends (default: 100)
     max_idle_conns_per_host: 20  # idle connections per backend (default: 20)
@@ -20,6 +21,8 @@ server:
 ```
 
 - **`passthrough_unrouted`** — when `false` (default), requests for unknown model names are rejected with a 404 that lists available virtual models. When `true`, unknown models are forwarded to the default backend as-is (see `default:` on backends below).
+- **`min_tls_version`** — minimum TLS version for both inbound (client→proxy) and outbound (proxy→backend) connections. `"1.3"` (default) or `"1.2"`. In the inspect build this tightens Go's defaults when set; in the [hardened build](security.md#hardened-build) it is the enforced floor. Lower to `"1.2"` only for clients/backends that can't yet negotiate 1.3 — never below. `http://` backends are unaffected (no TLS handshake).
+- **`allow_plaintext`** (not shown) — permits starting without `server.tls` on a trusted network. Ignored by the hardened build, which always requires TLS.
 - **`transport.max_idle_conns`** — total number of idle (keep-alive) connections across all backends. Default: 100.
 - **`transport.max_idle_conns_per_host`** — idle connections retained per backend host. Increase this if you have few backends with high concurrency. Default: 20.
 - **`transport.idle_conn_timeout`** — seconds an idle connection sits unused before being closed. Default: 120.
@@ -43,6 +46,8 @@ server:
 ```
 
 Clients connect to `https://spark-01.your-tailnet.ts.net:4000/v1`.
+
+> **Running the hardened image?** The cert is mandatory there, and the non-root container UID can't read a root-owned `0600` key by default — plus certs expire ~90 days. See [TLS with Tailscale](security.md#tls-with-tailscale) in the security doc for the ownership fix and renewal note.
 
 ## Backends
 
