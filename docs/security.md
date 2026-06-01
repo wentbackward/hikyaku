@@ -82,7 +82,16 @@ Incoming request bodies are capped at `server.max_request_body_mb` (default 50 M
 
 ## Hardened build
 
-For deployments where any of the above features are a concern, build with `-tags hardened`:
+For deployments where any of the above features are a concern, use the hardened variant. It is published as a container image alongside the regular one on every release — pull the `-hardened`-suffixed tag:
+
+```bash
+docker pull ghcr.io/wentbackward/hikyaku:latest-hardened
+# or a pinned version, e.g. ghcr.io/wentbackward/hikyaku:0.4-hardened
+```
+
+Both images are multi-arch (`linux/amd64`, `linux/arm64`), so the same tag runs on x86 and on ARM64 (NVIDIA Grace/Blackwell) hosts. A bespoke `docker-compose.yml` simply points `image:` at the `-hardened` tag.
+
+Or build it yourself:
 
 ```bash
 make build-hardened
@@ -90,6 +99,9 @@ make build-hardened
 
 # or directly:
 go build -tags hardened -o hikyaku ./cmd/hikyaku
+
+# or a hardened container image from the same Dockerfile:
+docker build --build-arg BUILD_TAGS=hardened -t hikyaku:hardened .
 ```
 
 The hardened tag **compiles out** (not just disables) the following:

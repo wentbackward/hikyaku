@@ -129,7 +129,7 @@ jobs:
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
-      - name: Build and push
+      - name: Build and push (regular)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -139,5 +139,34 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Hardened variant: same tags with a -hardened suffix (e.g. :latest-hardened,
+      # :0.4.2-hardened). suffix flavor with onlatest=true also suffixes latest.
+      - name: Extract metadata (hardened)
+        id: meta-hardened
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            suffix=-hardened,onlatest=true
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - name: Build and push (hardened)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-hardened.outputs.tags }}
+          labels: ${{ steps.meta-hardened.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            BUILD_TAGS=hardened
           cache-from: type=gha
           cache-to: type=gha,mode=max
