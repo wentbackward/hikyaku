@@ -60,7 +60,7 @@ check: lint test build
 # fail by design. These two packages hold the hardened enforcement assertions
 # (TLS policy, https-only openai backends, keyed affinity hash, log gating).
 test-hardened:
-	go test -tags hardened -count=1 ./internal/config/ ./internal/balancer/
+	go test -tags hardened -count=1 ./internal/config/ ./internal/balancer/ ./internal/sectls/ ./cmd/hikyaku/
 
 # Same as `check` but for the hardened build variant.
 check-hardened: lint-hardened test-hardened
