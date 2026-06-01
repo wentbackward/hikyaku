@@ -101,10 +101,32 @@ The hardened tag **compiles out** (not just disables) the following:
 | LOG_LEVEL 4 (full content) | Active at level 4 | `Content()` is a no-op; level clamped at 2 |
 | Journal `system_text` | Up to 2KB per request | Empty |
 | Journal `last_user_text` | Up to 8KB per request | Empty |
+| Affinity-key log lines | `[lb] affinity key=…` printed | Compiled out — prompt fingerprints never logged |
+
+In addition to compiling out the exposure features above, the hardened build **adds** the following enforcement and memory protections:
+
+| Control | Debug build | Hardened build |
+|---|---|---|
+| Inbound TLS | Optional (`allow_plaintext` escape hatch) | **Mandatory** — refuses to start without `server.tls`; `allow_plaintext` ignored |
+| OpenAI-lane backend scheme | `http://` allowed | **`https://` required** for `type: openai` backends |
+| Minimum TLS version | Go default | Configurable floor, default **TLS 1.3** (`server.min_tls_version: "1.2"` to support lagging clients) |
+| Affinity key derivation | Unkeyed FNV-1a | **Keyed HMAC-SHA256** with a per-process random key (no precomputation/confirmation oracle) |
+| Request-buffer wiping | None (GC only) | Outbound body zeroed after forward; raw inbound body wiped early |
+| Process memory (Linux) | None | `mlockall` (no swap), `PR_SET_DUMPABLE=0` (no non-root ptrace), `RLIMIT_CORE=0` (no core dumps) |
 
 The structural signals — message counts, char counts, code-fence counts, multimodal flag, routing params — remain in the journal. You keep useful telemetry; prompt content is never recorded.
 
 Everything else is identical: routing, metrics, parameter merge, streaming, backend auth, reload behaviour.
+
+`mlockall` requires `CAP_IPC_LOCK` (or a sufficient `RLIMIT_MEMLOCK`). If it's unavailable the binary logs a warning and continues rather than refusing to start — the assumption being that a TEE deployment (below) provides the actual memory-confidentiality guarantee.
+
+### Memory confidentiality and the limits of an in-process defense
+
+The hardened memory protections (buffer zeroing, `mlock`, non-dumpable, no core dumps) are **defense-in-depth, not a guarantee**. They shrink the window during which decrypted prompt content exists in RAM and close the *unprivileged* leak vectors — swap, core dumps, and non-root `ptrace`.
+
+They do **not** stop an adversary who is already privileged on the host. With root or `CAP_SYS_PTRACE`, an attacker can read `/proc/<pid>/mem` while a request is being processed, and hikyaku — like any transforming proxy — must hold the decrypted body in memory to route, merge parameters, and inject system prompts. No in-process technique changes that.
+
+**If your threat model includes a hostile or untrusted host, the load-bearing control is hardware memory encryption — a TEE / confidential computing environment** (e.g. NVIDIA confidential computing / nvTrust, AMD SEV-SNP, Intel TDX). Inside a TEE, even a privileged host or hypervisor cannot read the plaintext. hikyaku's role is to (a) minimize the plaintext window and (b) run cleanly inside such an environment; deploy the hardened build inside a TEE for an end-to-end confidentiality story. Additionally set `kernel.yama.ptrace_scope=2` (or higher) on the host to further restrict ptrace.
 
 ### Runtime identification
 

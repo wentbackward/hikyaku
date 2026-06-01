@@ -53,6 +53,7 @@ linters:
             - gopkg.in/yaml.v3
             - go.opentelemetry.io
             - github.com/prometheus/client_golang
+            - golang.org/x/sys/unix  # hardened-build process protections (mlock, prctl, rlimit)
           deny:
             - pkg: io/ioutil
               desc: deprecated since Go 1.16; use io or os

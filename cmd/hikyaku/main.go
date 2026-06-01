@@ -17,6 +17,7 @@ import (
 	"github.com/wentbackward/hikyaku/internal/journal"
 	"github.com/wentbackward/hikyaku/internal/logger"
 	"github.com/wentbackward/hikyaku/internal/proxy"
+	"github.com/wentbackward/hikyaku/internal/sectls"
 	"github.com/wentbackward/hikyaku/internal/telemetry"
 )
 
@@ -33,6 +34,10 @@ func main() {
 	// even if the config file is missing or malformed.
 	logStartupBanner()
 
+	// Apply process-level memory protections (hardened builds only; no-op
+	// otherwise). Done early so protections cover the whole process lifetime.
+	applyProcessHardening()
+
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		log.Fatalf("config: %v", err)
@@ -41,6 +46,7 @@ func main() {
 		log.Fatalf("%v", err)
 	}
 	logger.Apply(cfg.Server.LogLevel)
+	logSecurityPosture(cfg)
 
 	metrics, metricsHandler, err := telemetry.Init()
 	if err != nil {
@@ -73,6 +79,7 @@ func main() {
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 0, // disabled — streaming responses can take minutes
 		IdleTimeout:  120 * time.Second,
+		TLSConfig:    serverTLSConfig(cfg), // nil (Go defaults) in inspect; TLS-min floor in hardened
 	}
 
 	// ── Metrics server ─────────────────────────────────────────────────────
@@ -84,6 +91,7 @@ func main() {
 			Addr:        fmt.Sprintf("%s:%d", cfg.Telemetry.Prometheus.Host, cfg.Telemetry.Prometheus.Port),
 			Handler:     metricsMux,
 			ReadTimeout: 5 * time.Second,
+			TLSConfig:   serverTLSConfig(cfg),
 		}
 	}
 
@@ -199,7 +207,10 @@ func probeBackends(cfg *config.Config) {
 		byBackend[r.Backend] = append(byBackend[r.Backend], vmodel{r.VirtualModel, r.RealModel})
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: sectls.ClientConfig(cfg.MinTLS())},
+	}
 
 	for i := range cfg.Backends {
 		b := &cfg.Backends[i]

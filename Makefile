@@ -54,8 +54,16 @@ vet:
 # Run everything CI runs, in order.
 check: lint test build
 
+# Hardened-specific unit tests. We do NOT run the full suite under -tags
+# hardened: the capture/journal packages (and the proxy capture tests) assert
+# inspect-only features that hardened deliberately compiles out, so they would
+# fail by design. These two packages hold the hardened enforcement assertions
+# (TLS policy, https-only openai backends, keyed affinity hash, log gating).
+test-hardened:
+	go test -tags hardened -count=1 ./internal/config/ ./internal/balancer/
+
 # Same as `check` but for the hardened build variant.
-check-hardened: lint-hardened
+check-hardened: lint-hardened test-hardened
 	go build -tags hardened ./cmd/hikyaku
 
 # One-time setup for contributors: point git at the version-controlled

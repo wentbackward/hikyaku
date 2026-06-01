@@ -3,6 +3,7 @@
 package config
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net/url"
 	"os"
@@ -37,6 +38,7 @@ type ServerConfig struct {
 	MaxRequestBodyMB    int             `yaml:"max_request_body_mb"`  // hard cap per request body; default 50, 0 means use default
 	AllowPlaintext      bool            `yaml:"allow_plaintext"`      // required to start without TLS; appropriate only on Tailscale/private networks
 	TLS                 TLSConfig       `yaml:"tls"`
+	MinTLSVersion       string          `yaml:"min_tls_version"` // "1.2" | "1.3" (default "1.3"); floor for inbound + outbound TLS
 	Transport           TransportConfig `yaml:"transport"`
 	DropEmptyContent    *bool           `yaml:"drop_empty_content"` // globally strip nil/empty-content messages; default false
 }
@@ -445,11 +447,27 @@ func applyDefaults(cfg *Config) {
 }
 
 func validate(cfg *Config) error {
+	switch cfg.Server.MinTLSVersion {
+	case "", "1.2", "1.3":
+		// ok; "" means default (1.3) at use site
+	default:
+		return fmt.Errorf("server.min_tls_version must be \"1.2\" or \"1.3\", got %q", cfg.Server.MinTLSVersion)
+	}
 	ids, err := validateBackends(cfg.Backends)
 	if err != nil {
 		return err
 	}
 	return validateRoutes(cfg.Routes, ids)
+}
+
+// MinTLS returns the configured minimum TLS version as a crypto/tls constant.
+// Defaults to TLS 1.3; setting server.min_tls_version: "1.2" lowers the floor
+// for clients on lagging infrastructure (never below 1.2, never plaintext).
+func (c *Config) MinTLS() uint16 {
+	if c.Server.MinTLSVersion == "1.2" {
+		return tls.VersionTLS12
+	}
+	return tls.VersionTLS13
 }
 
 func validateBackends(backends []Backend) (map[string]bool, error) {
@@ -576,6 +594,11 @@ func (c *Config) HasExplicitDefault() bool {
 // Call from main after Load so startup fails fast with a clear message
 // rather than silently serving plaintext.
 func (c *Config) ValidateListenPolicy() error {
+	// Hardened builds refuse plaintext outright, ignoring allow_plaintext.
+	if err := hardenedListenPolicy(c); err != nil {
+		return err
+	}
+
 	// Gateway — always network-facing, always requires TLS or explicit opt-in.
 	gatewayTLS := c.Server.TLS.Cert != "" && c.Server.TLS.Key != ""
 	if !gatewayTLS && !c.Server.AllowPlaintext {

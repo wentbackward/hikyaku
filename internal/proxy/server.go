@@ -27,6 +27,7 @@ import (
 	"github.com/wentbackward/hikyaku/internal/journal"
 	"github.com/wentbackward/hikyaku/internal/logger"
 	"github.com/wentbackward/hikyaku/internal/router"
+	"github.com/wentbackward/hikyaku/internal/sectls"
 	"github.com/wentbackward/hikyaku/internal/telemetry"
 )
 
@@ -69,6 +70,7 @@ func New(version, buildMode string, cfg *config.Config, metrics *telemetry.Metri
 			MaxConnsPerHost:     0, // unlimited active — semaphore handles backpressure
 			IdleConnTimeout:     time.Duration(tc.IdleConnTimeout) * time.Second,
 			TLSHandshakeTimeout: 10 * time.Second,
+			TLSClientConfig:     sectls.ClientConfig(cfg.MinTLS()),
 		},
 	}
 	s.cfg.Store(cfg)
@@ -579,6 +581,19 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	}
 	bytesHeld := int64(len(newBody))
 	s.bufferedBytes.Add(bytesHeld)
+
+	// ── Minimize plaintext dwell ───────────────────────────────────────────
+	// Wipe the outbound body once the reverse proxy is done with it. The
+	// reverse proxy consumes bytes.NewReader(newBody) synchronously within
+	// ServeHTTP (no GetBody re-read path), so a function-scoped defer runs
+	// strictly after the bytes have left for the backend (or after an early
+	// return where they never did). Always-on: cheap, and frees large
+	// (multimodal) payloads promptly.
+	defer zeroize(newBody)
+	// In hardened builds rawBody is dead here (capture compiled out, L3 preview
+	// is a no-op) so wipe it immediately; in inspect it's a no-op because
+	// capture still needs rawBody until it writes during ServeHTTP.
+	zeroRawBody(rawBody)
 
 	// ── Build & execute reverse proxy ──────────────────────────────────────
 	targetURL, err := url.Parse(backend.BaseURL)

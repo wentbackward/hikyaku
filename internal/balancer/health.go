@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/wentbackward/hikyaku/internal/config"
+	"github.com/wentbackward/hikyaku/internal/sectls"
 )
 
 // hcClient is the HTTP client used for health probes.
@@ -27,6 +28,7 @@ func newHCClient(cfg *config.Config) *hcClient {
 			MaxIdleConnsPerHost: tc.MaxIdleConnsPerHost,
 			MaxConnsPerHost:     0,
 			IdleConnTimeout:     time.Duration(tc.IdleConnTimeout) * time.Second,
+			TLSClientConfig:     sectls.ClientConfig(cfg.MinTLS()),
 		},
 	}
 }

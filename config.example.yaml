@@ -12,6 +12,9 @@ server:
   tls:
     cert: ""   # path to TLS certificate (e.g. /certs/spark-01.ts.net.crt)
     key:  ""   # path to TLS private key  (e.g. /certs/spark-01.ts.net.key)
+  # min_tls_version: "1.3"  # "1.3" (default) or "1.2". Floor for inbound + outbound TLS.
+                            # In hardened builds this is the enforced minimum; lower to "1.2"
+                            # only to support clients/backends on lagging infrastructure.
   transport:
     max_idle_conns: 100          # total idle connections across all backends
     max_idle_conns_per_host: 20  # idle connections kept per backend
