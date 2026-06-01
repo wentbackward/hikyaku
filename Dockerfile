@@ -1,5 +1,9 @@
 FROM golang:1.26-alpine AS builder
 ARG VERSION=dev
+# BUILD_TAGS selects the build variant. Empty (default) = regular/inspect build.
+# Pass BUILD_TAGS=hardened to compile the hardened variant (TLS enforcement,
+# memory hygiene, stripped telemetry — see docs/security.md).
+ARG BUILD_TAGS=""
 WORKDIR /app
 COPY go.mod go.sum ./
 # BuildKit cache mounts persist Go's module and build caches across
@@ -11,7 +15,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go mod tidy && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.Version=${VERSION}" -o hikyaku ./cmd/hikyaku
+    go mod tidy && CGO_ENABLED=0 GOOS=linux go build -tags "${BUILD_TAGS}" -ldflags="-s -w -X main.Version=${VERSION}" -o hikyaku ./cmd/hikyaku
 # Pre-create /capture so the default sig_message_capture.output_folder works
 # when the container runs as a non-root UID. Owned by the runtime UID/GID.
 RUN mkdir -p /rootfs/capture && chown -R 65532:65532 /rootfs
