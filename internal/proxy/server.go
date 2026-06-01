@@ -50,13 +50,38 @@ type Server struct {
 	balancer     *balancer.Balancer              // nil if no groups configured
 	loopDetector *loopDetector                   // loop detection state
 
-	transport     *http.Transport          // shared connection pool for all backends
+	transport     http.RoundTripper        // shared outbound transport (default *http.Transport; override via WithTransportFactory)
 	mu            sync.RWMutex             // guards semaphores
 	semaphores    map[string]chan struct{} // per-backend concurrency limiter (nil entry = unlimited)
 	bufferedBytes atomic.Int64             // bytes currently held in proxy buffers
 }
 
-func New(version, buildMode string, cfg *config.Config, metrics *telemetry.Metrics, j *journal.Journal) *Server {
+// TransportFactory builds the outbound RoundTripper used for all backend
+// requests. The default build supplies a standard *http.Transport; the pro
+// layer injects its own (RA-TLS attested transport, mTLS, cert pinning, …) via
+// WithTransportFactory. This is the primary extension seam for pro.
+type TransportFactory interface {
+	NewTransport(cfg *config.Config) http.RoundTripper
+}
+
+// Option customizes a Server at construction. Existing callers pass none and
+// get the default behavior unchanged; pro callers pass options to inject seams.
+type Option func(*Server)
+
+// WithTransportFactory replaces the default outbound transport with one built
+// by f. A nil factory or a nil transport from f leaves the default in place.
+func WithTransportFactory(f TransportFactory) Option {
+	return func(s *Server) {
+		if f == nil {
+			return
+		}
+		if rt := f.NewTransport(s.cfg.Load()); rt != nil {
+			s.transport = rt
+		}
+	}
+}
+
+func New(version, buildMode string, cfg *config.Config, metrics *telemetry.Metrics, j *journal.Journal, opts ...Option) *Server {
 	tc := cfg.Server.Transport
 	s := &Server{
 		version:   version,
@@ -80,6 +105,11 @@ func New(version, buildMode string, cfg *config.Config, metrics *telemetry.Metri
 	s.loopDetector = &loopDetector{state: make(map[string]*loopEntry)}
 	if len(cfg.Groups) > 0 {
 		s.balancer = balancer.New(cfg)
+	}
+	// Apply options last so they can override defaults (e.g. the transport).
+	// cfg is already stored, so options may read s.cfg.Load().
+	for _, o := range opts {
+		o(s)
 	}
 	return s
 }
