@@ -10,11 +10,14 @@
 package hikyaku
 
 import (
+	"crypto/tls"
 	"net/http"
 
 	"github.com/wentbackward/hikyaku/internal/config"
 	"github.com/wentbackward/hikyaku/internal/journal"
+	"github.com/wentbackward/hikyaku/internal/logger"
 	"github.com/wentbackward/hikyaku/internal/proxy"
+	"github.com/wentbackward/hikyaku/internal/sectls"
 	"github.com/wentbackward/hikyaku/internal/telemetry"
 )
 
@@ -63,4 +66,22 @@ func InitTelemetry() (*Metrics, http.Handler, error) {
 // pass nil to New to disable journaling.
 func NewJournal(otlpEndpoint string) (*Journal, error) {
 	return journal.New(otlpEndpoint)
+}
+
+// ApplyLogLevel applies the configured log verbosity (and the LOG_LEVEL env
+// override), honoring the hardened build's level cap. Embedders must call this
+// at startup — and again after a config reload — to reproduce cmd/hikyaku's
+// logging behavior exactly. Without it, the hardened build's verbosity cap is
+// not enforced for the embedding binary.
+func ApplyLogLevel(cfg *Config) {
+	logger.Apply(cfg.Server.LogLevel)
+}
+
+// ClientTLSConfig builds the outbound (proxy→backend) TLS config for the given
+// minimum version: nil in inspect builds (Go defaults) and a pinned floor in
+// hardened builds. Pass cfg.MinTLS(). Use it when constructing outbound HTTP
+// clients (e.g. startup backend probes) so they honor the same TLS floor the
+// hardened proxy enforces on live traffic.
+func ClientTLSConfig(minVer uint16) *tls.Config {
+	return sectls.ClientConfig(minVer)
 }
