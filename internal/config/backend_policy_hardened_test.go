@@ -28,14 +28,34 @@ func TestHardenedBackendPolicy_OpenAIRequiresHTTPS(t *testing.T) {
 func TestHardenedListenPolicy_RequiresTLS(t *testing.T) {
 	noTLS := &Config{}
 	noTLS.Server.AllowPlaintext = true // must be ignored in hardened
-	if err := hardenedListenPolicy(noTLS); err == nil {
+	if err := hardenedListenPolicy(noTLS, listenPolicy{}); err == nil {
 		t.Error("hardened build must refuse plaintext even with allow_plaintext: true")
 	}
 
 	withTLS := &Config{}
 	withTLS.Server.TLS = TLSConfig{Cert: "/x.crt", Key: "/x.key"}
-	if err := hardenedListenPolicy(withTLS); err != nil {
+	if err := hardenedListenPolicy(withTLS, listenPolicy{}); err != nil {
 		t.Errorf("hardened build with gateway TLS should pass, got %v", err)
+	}
+
+	// An embedder-supplied runtime certificate (e.g. attested RA-TLS) satisfies
+	// the mandatory-TLS requirement without cert/key files.
+	extTLS := &Config{}
+	if err := hardenedListenPolicy(extTLS, listenPolicy{externalGatewayTLS: true}); err != nil {
+		t.Errorf("hardened build with external gateway TLS should pass, got %v", err)
+	}
+}
+
+func TestHardenedListenPolicy_ExternalTLSViaValidate(t *testing.T) {
+	// The full public path: no cert files, no allow_plaintext, but the embedder
+	// asserts a runtime cert — must pass in hardened.
+	c := &Config{}
+	if err := c.ValidateListenPolicy(WithExternalGatewayTLS()); err != nil {
+		t.Errorf("hardened ValidateListenPolicy with WithExternalGatewayTLS should pass, got %v", err)
+	}
+	// Without the assertion it must still fail closed (no TLS, no opt-in honored).
+	if err := c.ValidateListenPolicy(); err == nil {
+		t.Error("hardened ValidateListenPolicy without TLS/assertion must be rejected")
 	}
 }
 

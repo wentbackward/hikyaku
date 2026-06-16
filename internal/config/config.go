@@ -593,14 +593,21 @@ func (c *Config) HasExplicitDefault() bool {
 //
 // Call from main after Load so startup fails fast with a clear message
 // rather than silently serving plaintext.
-func (c *Config) ValidateListenPolicy() error {
+func (c *Config) ValidateListenPolicy(opts ...ListenPolicyOption) error {
+	var pol listenPolicy
+	for _, opt := range opts {
+		opt(&pol)
+	}
+
 	// Hardened builds refuse plaintext outright, ignoring allow_plaintext.
-	if err := hardenedListenPolicy(c); err != nil {
+	if err := hardenedListenPolicy(c, pol); err != nil {
 		return err
 	}
 
 	// Gateway — always network-facing, always requires TLS or explicit opt-in.
-	gatewayTLS := c.Server.TLS.Cert != "" && c.Server.TLS.Key != ""
+	// An embedder supplying a runtime certificate (e.g. attested RA-TLS via
+	// GetCertificate) satisfies the TLS requirement without cert/key files.
+	gatewayTLS := pol.externalGatewayTLS || (c.Server.TLS.Cert != "" && c.Server.TLS.Key != "")
 	if !gatewayTLS && !c.Server.AllowPlaintext {
 		return fmt.Errorf("server: refusing to start without TLS. " +
 			"Set server.tls.cert + server.tls.key for HTTPS, or " +

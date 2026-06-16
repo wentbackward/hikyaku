@@ -63,6 +63,29 @@ backends:
 	}
 }
 
+func TestListenPolicy_ExternalGatewayTLSSatisfiesPolicy(t *testing.T) {
+	// No cert/key files and no allow_plaintext, but the embedder asserts it
+	// serves a runtime-supplied (e.g. attested RA-TLS) certificate — must pass
+	// without forcing the operator to set the misleading allow_plaintext flag.
+	path := writeTemp(t, `
+backends:
+  - id: a
+    type: openai
+    base_url: "http://localhost"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.ValidateListenPolicy(WithExternalGatewayTLS()); err != nil {
+		t.Errorf("external gateway TLS should satisfy policy without allow_plaintext: %v", err)
+	}
+	// Sanity: without the assertion the same config is still rejected.
+	if err := cfg.ValidateListenPolicy(); err == nil {
+		t.Error("plaintext gateway without allow_plaintext or external TLS should be rejected")
+	}
+}
+
 func TestListenPolicy_MetricsLoopbackIsFine(t *testing.T) {
 	path := writeTemp(t, `
 server:

@@ -10,7 +10,7 @@ import (
 func TestInspectListenPolicy_NoOp(t *testing.T) {
 	c := &Config{}
 	c.Server.AllowPlaintext = true
-	if err := hardenedListenPolicy(c); err != nil {
+	if err := hardenedListenPolicy(c, listenPolicy{}); err != nil {
 		t.Errorf("inspect build hardenedListenPolicy should be a no-op, got %v", err)
 	}
 }

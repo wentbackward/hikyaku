@@ -37,7 +37,21 @@ type (
 	// TransportFactory builds the outbound RoundTripper for backend requests —
 	// the primary seam for pro transports (RA-TLS, mTLS, pinning).
 	TransportFactory = proxy.TransportFactory
+	// ListenPolicyOption configures Config.ValidateListenPolicy for embedders that
+	// supply TLS material at runtime (see WithExternalGatewayTLS).
+	ListenPolicyOption = config.ListenPolicyOption
 )
+
+// WithExternalGatewayTLS asserts the embedder serves the gateway listener with a
+// TLS certificate it supplies at runtime — e.g. an attested RA-TLS cert produced
+// via tls.Config.GetCertificate, which has no server.tls.cert/key file path — so
+// Config.ValidateListenPolicy accepts it in both inspect and hardened builds.
+// Pass it ONLY from the code path that actually wires such a certificate; the
+// proxy's own binary never sets it, so secure-by-default rules are unchanged for
+// ordinary deployments.
+func WithExternalGatewayTLS() ListenPolicyOption {
+	return config.WithExternalGatewayTLS()
+}
 
 // New constructs a proxy Server. Equivalent to proxy.New; pass options such as
 // WithTransportFactory to inject pro seams.

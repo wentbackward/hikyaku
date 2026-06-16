@@ -13,11 +13,12 @@ import (
 // use an https:// base_url. It runs at the explicit ValidateListenPolicy gate
 // (startup + SIGHUP reload), keeping Load() purely structural — a hardened
 // binary refuses to ever serve or forward cleartext on the OpenAI lane.
-func hardenedListenPolicy(c *Config) error {
-	gatewayTLS := c.Server.TLS.Cert != "" && c.Server.TLS.Key != ""
+func hardenedListenPolicy(c *Config, pol listenPolicy) error {
+	gatewayTLS := pol.externalGatewayTLS || (c.Server.TLS.Cert != "" && c.Server.TLS.Key != "")
 	if !gatewayTLS {
-		return fmt.Errorf("hardened build: server.tls.cert + server.tls.key are mandatory; " +
-			"allow_plaintext is ignored in hardened builds")
+		return fmt.Errorf("hardened build: gateway TLS is mandatory — set server.tls.cert + " +
+			"server.tls.key, or supply a runtime/attested certificate via the embedding API " +
+			"(see WithExternalGatewayTLS); allow_plaintext is ignored in hardened builds")
 	}
 	// Metrics: if enabled and not loopback, it too must use TLS.
 	p := &c.Telemetry.Prometheus
