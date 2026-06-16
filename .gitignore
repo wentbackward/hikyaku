@@ -1,6 +1,6 @@
 bin/
 config.yaml
-config/
+/config/
 .env
 scripts/.env.*
 !scripts/.env.example
