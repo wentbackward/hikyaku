@@ -51,6 +51,7 @@ type Server struct {
 	loopDetector *loopDetector                   // loop detection state
 
 	transport     http.RoundTripper        // shared outbound transport (default *http.Transport; override via WithTransportFactory)
+	usageObserver UsageObserver            // nil unless set via WithUsageObserver (pro accounting seam)
 	mu            sync.RWMutex             // guards semaphores
 	semaphores    map[string]chan struct{} // per-backend concurrency limiter (nil entry = unlimited)
 	bufferedBytes atomic.Int64             // bytes currently held in proxy buffers
@@ -78,6 +79,46 @@ func WithTransportFactory(f TransportFactory) Option {
 		if rt := f.NewTransport(s.cfg.Load()); rt != nil {
 			s.transport = rt
 		}
+	}
+}
+
+// UsageEvent describes one completed request's token usage, delivered to a
+// UsageObserver. Core already computes these counts for its Prometheus metrics;
+// the observer exposes them per-request so an embedder (the pro control plane)
+// can meter usage per route and per caller. Ctx is the inbound request context,
+// so an embedder can recover values it stashed there in middleware (e.g. an
+// authenticated principal). It fires once per request on both the streaming and
+// non-streaming lanes, including error responses (with zero tokens).
+type UsageEvent struct {
+	Ctx              context.Context
+	RequestID        string
+	VirtualModel     string // the route the caller requested
+	RealModel        string // the upstream model name
+	Backend          string // resolved backend id
+	BackendType      string // "openai" | "anthropic" | "ollama"
+	PromptTokens     int64
+	CompletionTokens int64
+	Streamed         bool
+	Status           int
+	Duration         time.Duration
+}
+
+// UsageObserver receives a UsageEvent once per completed request. It runs on the
+// response path (in the reverse-proxy ModifyResponse / stream-close callback), so
+// it must not block; offload any real work to a queue. This is the per-request
+// accounting seam for the pro control plane; core itself never sets one.
+type UsageObserver func(UsageEvent)
+
+// WithUsageObserver registers o to receive a UsageEvent per completed request.
+// A nil observer leaves core's behavior unchanged.
+func WithUsageObserver(o UsageObserver) Option {
+	return func(s *Server) { s.usageObserver = o }
+}
+
+// emitUsage delivers ev to the registered observer, if any.
+func (s *Server) emitUsage(ev UsageEvent) {
+	if s.usageObserver != nil {
+		s.usageObserver(ev)
 	}
 }
 
@@ -1076,6 +1117,16 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 					s.bufferedBytes.Add(-bytesHeld)
 					s.metrics.RequestBodyBytesBuffered.Record(metricsCtx, float64(s.bufferedBytes.Load()))
 					parser.recordFinal()
+					var promptTok, completionTok int64
+					if ssep != nil {
+						promptTok, completionTok = ssep.promptToks, ssep.completionToks
+					}
+					s.emitUsage(UsageEvent{
+						Ctx: reqCtx, RequestID: rid, VirtualModel: virtualModel, RealModel: realModel,
+						Backend: backendID, BackendType: backendType,
+						PromptTokens: promptTok, CompletionTokens: completionTok,
+						Streamed: true, Status: status, Duration: time.Since(t0),
+					})
 					elapsed := time.Since(t0).Seconds()
 					s.metrics.ActiveRequests.Add(metricsCtx, -1, telemetry.BackendAttrs(backendID, realModel))
 					s.metrics.RequestDuration.Record(metricsCtx, elapsed, telemetry.Attrs(backendID, realModel, statusStr))
@@ -1158,9 +1209,16 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 				logger.Request("[%s] upstream error body: %s", rid, string(data)[:min(len(data), 1024)])
 			}
 
+			var promptTok, completionTok int64
 			if resp.StatusCode == http.StatusOK {
-				extractNonStreamingUsage(data, backendID, realModel, backendType, s.metrics, metricsCtx)
+				promptTok, completionTok = extractNonStreamingUsage(data, backendID, realModel, backendType, s.metrics, metricsCtx)
 			}
+			s.emitUsage(UsageEvent{
+				Ctx: reqCtx, RequestID: rid, VirtualModel: virtualModel, RealModel: realModel,
+				Backend: backendID, BackendType: backendType,
+				PromptTokens: promptTok, CompletionTokens: completionTok,
+				Streamed: false, Status: resp.StatusCode, Duration: time.Since(t0),
+			})
 
 			// L4: log non-streaming response content
 			if logger.Get() >= logger.LevelContent {
@@ -1410,10 +1468,10 @@ func detectProtocol(r *http.Request) string {
 	return "openai"
 }
 
-func extractNonStreamingUsage(data []byte, backendID, model, backendType string, m *telemetry.Metrics, ctx context.Context) {
+func extractNonStreamingUsage(data []byte, backendID, model, backendType string, m *telemetry.Metrics, ctx context.Context) (promptTokens, completionTokens int64) {
 	var resp map[string]interface{}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return
+		return 0, 0
 	}
 	attrs := telemetry.BackendAttrs(backendID, model)
 
@@ -1426,13 +1484,16 @@ func extractNonStreamingUsage(data []byte, backendID, model, backendType string,
 
 	if usage, ok := resp["usage"].(map[string]interface{}); ok {
 		if v, _ := usage[promptKey].(float64); v > 0 {
-			m.PromptTokens.Add(ctx, int64(v), attrs)
-			m.PromptTokensPerRequest.Record(ctx, int64(v), attrs)
+			promptTokens = int64(v)
+			m.PromptTokens.Add(ctx, promptTokens, attrs)
+			m.PromptTokensPerRequest.Record(ctx, promptTokens, attrs)
 		}
 		if v, _ := usage[completionKey].(float64); v > 0 {
-			m.CompletionTokens.Add(ctx, int64(v), attrs)
+			completionTokens = int64(v)
+			m.CompletionTokens.Add(ctx, completionTokens, attrs)
 		}
 	}
+	return promptTokens, completionTokens
 }
 
 // logNonStreamingResponse extracts and logs the assistant's text content from a non-streaming response.
