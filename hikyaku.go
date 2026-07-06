@@ -40,6 +40,11 @@ type (
 	// ListenPolicyOption configures Config.ValidateListenPolicy for embedders that
 	// supply TLS material at runtime (see WithExternalGatewayTLS).
 	ListenPolicyOption = config.ListenPolicyOption
+	// UsageEvent is delivered per completed request to a UsageObserver — the
+	// per-request accounting seam for pro control planes (metering per route/caller).
+	UsageEvent = proxy.UsageEvent
+	// UsageObserver receives a UsageEvent per completed request (see WithUsageObserver).
+	UsageObserver = proxy.UsageObserver
 )
 
 // WithExternalGatewayTLS asserts the embedder serves the gateway listener with a
@@ -63,6 +68,15 @@ func New(version, buildMode string, cfg *Config, metrics *Metrics, j *Journal, o
 // RA-TLS transport in the pro layer).
 func WithTransportFactory(f TransportFactory) Option {
 	return proxy.WithTransportFactory(f)
+}
+
+// WithUsageObserver registers a per-request usage callback — the accounting seam
+// the pro control plane uses to meter token usage per route and per caller. Core
+// already computes these counts for its metrics; the observer surfaces them per
+// request (with the request context, so an embedder can recover a principal it
+// set in middleware). A nil observer leaves core's behavior unchanged.
+func WithUsageObserver(o UsageObserver) Option {
+	return proxy.WithUsageObserver(o)
 }
 
 // LoadConfig reads and validates a config.yaml.
