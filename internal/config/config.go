@@ -154,8 +154,42 @@ func (h HeadersOp) IsZero() bool {
 	return len(h.Add) == 0 && len(h.Remove) == 0 && len(h.Rename) == 0
 }
 
+// AliasList holds alternative virtual-model names for a route. It accepts
+// either a YAML list (alias: [a, b]) or a single scalar (alias: a). A scalar
+// containing whitespace is rejected with a hint, since it almost certainly
+// means someone wrote space-separated names expecting a list.
+type AliasList []string
+
+func (a *AliasList) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.SequenceNode:
+		var out []string
+		if err := node.Decode(&out); err != nil {
+			return err
+		}
+		*a = out
+		return nil
+	case yaml.ScalarNode:
+		var v string
+		if err := node.Decode(&v); err != nil {
+			return err
+		}
+		if v == "" {
+			*a = nil
+			return nil
+		}
+		if strings.ContainsAny(v, " \t") {
+			return fmt.Errorf("alias %q looks like multiple names — use a YAML list: alias: [a, b]", v)
+		}
+		*a = AliasList{v}
+		return nil
+	}
+	return fmt.Errorf("alias: expected a string or a list of strings")
+}
+
 type Route struct {
 	VirtualModel     string                 `yaml:"virtual_model"`
+	Alias            AliasList              `yaml:"alias"` // additional names that resolve to this route
 	Backend          string                 `yaml:"backend"`
 	BackendGroup     string                 `yaml:"backend_group"` // LB group reference; mutually exclusive with backend:
 	RealModel        string                 `yaml:"real_model"`
@@ -252,6 +286,9 @@ func Load(path string) (*Config, error) {
 			r.Clamp = make(map[string]interface{})
 		}
 		cfg.routeByModel[r.VirtualModel] = r
+		for _, a := range r.Alias {
+			cfg.routeByModel[a] = r
+		}
 	}
 
 	return &cfg, nil
@@ -541,6 +578,21 @@ func validateRoutes(routes []Route, backendIDs map[string]bool) error {
 			return fmt.Errorf("route %q: system_prompt may set at most one of prepend/append/replace", r.VirtualModel)
 		}
 	}
+
+	// Aliases are checked after all virtual_models are registered so a
+	// collision is caught regardless of route order in the file.
+	for i := range routes {
+		r := &routes[i]
+		for _, a := range r.Alias {
+			if a == "" {
+				return fmt.Errorf("route %q: empty alias", r.VirtualModel)
+			}
+			if seen[a] {
+				return fmt.Errorf("route %q: alias %q collides with an existing virtual_model or alias", r.VirtualModel, a)
+			}
+			seen[a] = true
+		}
+	}
 	return nil
 }
 
@@ -638,11 +690,13 @@ func isLoopbackHost(h string) bool {
 	return strings.HasPrefix(h, "127.")
 }
 
-// VirtualModels returns all configured virtual model names.
+// VirtualModels returns all configured virtual model names, including
+// route aliases — every name a request may use in its "model" field.
 func (c *Config) VirtualModels() []string {
 	names := make([]string, 0, len(c.Routes))
 	for i := range c.Routes {
 		names = append(names, c.Routes[i].VirtualModel)
+		names = append(names, c.Routes[i].Alias...)
 	}
 	return names
 }

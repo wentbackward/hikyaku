@@ -283,3 +283,45 @@ func messagesWithParts(role string, parts []interface{}) []interface{} {
 		map[string]interface{}{"role": role, "content": parts},
 	}
 }
+
+func TestResolve_Alias(t *testing.T) {
+	cfg := mustConfig(t, `
+backends:
+  - id: fast
+    type: openai
+    base_url: "http://localhost:3009/v1"
+routes:
+  - virtual_model: canon
+    backend: fast
+    real_model: "qwen-9b"
+    alias: [nick, "team/nick"]
+    defaults:
+      temperature: 0.7
+  - virtual_model: bare
+    backend: fast
+    alias: [bare-alt]
+`)
+	r := New(cfg)
+
+	// Alias resolves identically to the canonical name, defaults included.
+	res, err := r.Resolve("team/nick", map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("Resolve alias: %v", err)
+	}
+	if res.RealModel != "qwen-9b" || res.Backend.ID != "fast" {
+		t.Errorf("alias resolution: real=%q backend=%q", res.RealModel, res.Backend.ID)
+	}
+	if res.Params["temperature"] != 0.7 {
+		t.Errorf("alias must inherit route defaults: %v", res.Params)
+	}
+
+	// With no real_model, an alias request sends the route's CANONICAL name
+	// upstream — never the alias, which the upstream does not know.
+	res, err = r.Resolve("bare-alt", map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("Resolve bare-alt: %v", err)
+	}
+	if res.RealModel != "bare" {
+		t.Errorf("real model for alias without real_model = %q, want canonical \"bare\"", res.RealModel)
+	}
+}

@@ -9,6 +9,7 @@
 
 ## Routing & Virtual Models
 - **Virtual models** — same underlying model, multiple names with different parameter profiles
+- **Route aliases** — `alias: [a, b]` gives one route multiple resolvable names, listed in `/v1/models`
 - **Three-layer param merge** — `defaults < caller < clamp`
 - **Auto-routing** — inspect request body to pick text vs vision sub-route
 - **Passthrough unrouted** — forward unknown model names to default backend

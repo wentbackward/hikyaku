@@ -98,9 +98,12 @@ func (r *Router) resolve(modelName string, body map[string]interface{}, depth in
 
 	params := mergeParams(route.Defaults, body, route.Clamp)
 
+	// Fall back to the route's canonical name, not the requested one: when
+	// the request arrived via an alias, the upstream only knows the model
+	// the route actually names. Identical for non-alias requests.
 	realModel := route.RealModel
 	if realModel == "" {
-		realModel = modelName
+		realModel = route.VirtualModel
 	}
 
 	return &Resolution{

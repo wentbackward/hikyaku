@@ -342,12 +342,15 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		if route.AutoRoute != nil {
 			continue // skip auto-route entries; they resolve to real routes
 		}
-		data = append(data, modelEntry{
-			ID:      route.VirtualModel,
-			Object:  "model",
-			Created: 0,
-			OwnedBy: "hikyaku",
-		})
+		names := append([]string{route.VirtualModel}, route.Alias...)
+		for _, name := range names {
+			data = append(data, modelEntry{
+				ID:      name,
+				Object:  "model",
+				Created: 0,
+				OwnedBy: "hikyaku",
+			})
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"object": "list", "data": data})

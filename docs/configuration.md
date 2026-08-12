@@ -261,6 +261,22 @@ routes:
 
 An explicit `virtual_model` inside the map value overrides the map key. Both formats can be used interchangeably.
 
+### Aliases
+
+A route may declare `alias` — additional names that resolve to the same route, with the same backend, parameter profile, and everything else:
+
+```yaml
+routes:
+  my-model:
+    backend: my-vllm
+    real_model: "Qwen/Qwen3.5-9B"
+    alias: [my-model-1, my-model-2, "lovely/my-lovely-model"]
+    defaults:
+      temperature: 1.0
+```
+
+`alias` takes a YAML list (`[a, b]` or one `- name` per line) or a single name. Aliases appear in `/v1/models` alongside the canonical name and must be unique across the whole config — an alias may not collide with any `virtual_model` or another route's alias. If the route has no `real_model`, a request via an alias sends the route's canonical `virtual_model` upstream (the upstream never sees the alias). Metrics, journal, and usage events record the name the caller actually used, as with `auto_route`.
+
 ### Virtual models
 
 A virtual model is a named personality layered over a real model. Multiple virtual models can point to the same underlying model with different parameter profiles:

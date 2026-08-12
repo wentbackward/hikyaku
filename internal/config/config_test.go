@@ -1006,3 +1006,129 @@ backends:
 		t.Errorf("expected yaml-related error, got: %v", err)
 	}
 }
+
+func TestLoad_Alias_ListForm(t *testing.T) {
+	path := writeTemp(t, `
+backends:
+  - id: b1
+    type: openai
+    base_url: "http://localhost"
+routes:
+  my-model:
+    backend: b1
+    real_model: "Qwen/Qwen3-27B"
+    alias: [my-model-1, my-model-2, "lovely/my-lovely-model"]
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, name := range []string{"my-model", "my-model-1", "my-model-2", "lovely/my-lovely-model"} {
+		r, ok := cfg.Route(name)
+		if !ok {
+			t.Fatalf("route lookup by %q failed", name)
+		}
+		if r.VirtualModel != "my-model" {
+			t.Errorf("lookup %q resolved to %q, want my-model", name, r.VirtualModel)
+		}
+	}
+	models := cfg.VirtualModels()
+	if len(models) != 4 {
+		t.Errorf("VirtualModels = %v, want 4 names", models)
+	}
+}
+
+func TestLoad_Alias_ScalarForm(t *testing.T) {
+	path := writeTemp(t, `
+backends:
+  - id: b1
+    type: openai
+    base_url: "http://localhost"
+routes:
+  - virtual_model: m
+    backend: b1
+    alias: m-alt
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r, ok := cfg.Route("m-alt"); !ok || r.VirtualModel != "m" {
+		t.Fatalf("scalar alias lookup failed: ok=%v", ok)
+	}
+}
+
+func TestLoad_Alias_ScalarWithSpacesRejected(t *testing.T) {
+	path := writeTemp(t, `
+backends:
+  - id: b1
+    type: openai
+    base_url: "http://localhost"
+routes:
+  - virtual_model: m
+    backend: b1
+    alias: m-1 m-2
+`)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "YAML list") {
+		t.Fatalf("space-separated scalar alias must be rejected with a list hint, got: %v", err)
+	}
+}
+
+func TestLoad_Alias_CollidesWithVirtualModel(t *testing.T) {
+	// The colliding route appears BEFORE the aliased one — the check must
+	// still catch it (aliases validated after all virtual_models are seen).
+	path := writeTemp(t, `
+backends:
+  - id: b1
+    type: openai
+    base_url: "http://localhost"
+routes:
+  - virtual_model: taken
+    backend: b1
+  - virtual_model: m
+    backend: b1
+    alias: [taken]
+`)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "collides") {
+		t.Fatalf("alias colliding with virtual_model must be rejected, got: %v", err)
+	}
+}
+
+func TestLoad_Alias_DuplicateAcrossRoutes(t *testing.T) {
+	path := writeTemp(t, `
+backends:
+  - id: b1
+    type: openai
+    base_url: "http://localhost"
+routes:
+  - virtual_model: a
+    backend: b1
+    alias: [shared]
+  - virtual_model: b
+    backend: b1
+    alias: [shared]
+`)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "collides") {
+		t.Fatalf("duplicate alias across routes must be rejected, got: %v", err)
+	}
+}
+
+func TestLoad_Alias_EmptyRejected(t *testing.T) {
+	path := writeTemp(t, `
+backends:
+  - id: b1
+    type: openai
+    base_url: "http://localhost"
+routes:
+  - virtual_model: m
+    backend: b1
+    alias: [""]
+`)
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "empty alias") {
+		t.Fatalf("empty alias must be rejected, got: %v", err)
+	}
+}
