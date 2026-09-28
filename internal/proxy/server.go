@@ -1504,6 +1504,8 @@ func detectProtocol(r *http.Request) string {
 //   - openai:    usage.prompt_tokens / usage.completion_tokens
 //   - anthropic: usage.input_tokens / usage.output_tokens plus the two cache
 //     classes usage.cache_read_input_tokens / usage.cache_creation_input_tokens
+//   - ollama:    top-level prompt_eval_count / eval_count (no "usage" object;
+//     /api/embed carries only prompt_eval_count)
 //
 // A body that does not parse, or carries no counts, yields all zeros.
 func extractNonStreamingUsage(data []byte, backendID, model, backendType string, m *telemetry.Metrics, ctx context.Context) usageCounts {
@@ -1521,6 +1523,11 @@ func extractNonStreamingUsage(data []byte, backendID, model, backendType string,
 			completion: jsonCount(usage, "output_tokens"),
 			cacheRead:  jsonCount(usage, "cache_read_input_tokens"),
 			cacheWrite: jsonCount(usage, "cache_creation_input_tokens"),
+		}
+	case "ollama":
+		counts = usageCounts{
+			prompt:     jsonCount(resp, "prompt_eval_count"),
+			completion: jsonCount(resp, "eval_count"),
 		}
 	default:
 		counts = usageCounts{

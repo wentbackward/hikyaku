@@ -272,3 +272,60 @@ func TestWithUsageObserver_Streaming_Anthropic_CacheTokens(t *testing.T) {
 			ev.PromptTokens, ev.CompletionTokens, ev.CacheReadTokens, ev.CacheWriteTokens)
 	}
 }
+
+// Ollama reports its counts at the top level of the response object (not
+// under "usage"): prompt_eval_count is the prompt, eval_count the output.
+func TestWithUsageObserver_NonStreaming_Ollama_Chat(t *testing.T) {
+	var events []UsageEvent
+	s, backend := usageServer(t, "ollama", map[string]interface{}{
+		"model":             "real-m",
+		"message":           map[string]interface{}{"role": "assistant", "content": "hi"},
+		"done":              true,
+		"prompt_eval_count": 11,
+		"eval_count":        3,
+	}, func(ev UsageEvent) { events = append(events, ev) })
+	defer backend.Close()
+
+	rec := laneRequest(t, s, "/api/chat", map[string]interface{}{
+		"model":    "m",
+		"stream":   false,
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(events) != 1 {
+		t.Fatalf("observer fired %d times, want exactly 1", len(events))
+	}
+	ev := events[0]
+	if ev.BackendType != "ollama" || ev.Streamed {
+		t.Errorf("BackendType=%q Streamed=%v, want ollama/false", ev.BackendType, ev.Streamed)
+	}
+	if ev.PromptTokens != 11 || ev.CompletionTokens != 3 || ev.CacheReadTokens != 0 || ev.CacheWriteTokens != 0 {
+		t.Errorf("got %d/%d cache %d/%d, want 11/3 cache 0/0",
+			ev.PromptTokens, ev.CompletionTokens, ev.CacheReadTokens, ev.CacheWriteTokens)
+	}
+}
+
+// Embeddings carry only prompt_eval_count; there is no output count.
+func TestWithUsageObserver_NonStreaming_Ollama_Embed(t *testing.T) {
+	var events []UsageEvent
+	s, backend := usageServer(t, "ollama", map[string]interface{}{
+		"model":             "real-m",
+		"embeddings":        []interface{}{[]float64{0.1}},
+		"prompt_eval_count": 9,
+	}, func(ev UsageEvent) { events = append(events, ev) })
+	defer backend.Close()
+
+	rec := laneRequest(t, s, "/api/embed", map[string]interface{}{"model": "m", "input": "hi"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(events) != 1 {
+		t.Fatalf("observer fired %d times, want exactly 1", len(events))
+	}
+	ev := events[0]
+	if ev.PromptTokens != 9 || ev.CompletionTokens != 0 {
+		t.Errorf("tokens = %d/%d, want 9/0", ev.PromptTokens, ev.CompletionTokens)
+	}
+}
