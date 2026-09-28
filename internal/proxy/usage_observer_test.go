@@ -45,24 +45,24 @@ routes:
 	return srv, backend
 }
 
-// laneRequest POSTs body to path through the handler that serves that path on
-// the real mux, so each test exercises the same entry point a client would.
+// laneRequest POSTs body to path through the mux RegisterRoutes builds, so
+// each test exercises exactly the handler (and the per-endpoint proxyOpts)
+// that a client hitting that path would reach. Dispatching through the real
+// routing table, rather than a hand-maintained path→handler map, means a
+// test cannot silently exercise a neighboring lane's handler. The helpers'
+// configs set no server.api_key, so bearerAuth passes the request through.
 func laneRequest(t *testing.T, s *Server, path string, body map[string]interface{}) *httptest.ResponseRecorder {
 	t.Helper()
 	raw, _ := json.Marshal(body)
 	req := httptest.NewRequest("POST", path, bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	switch path {
-	case "/v1/chat/completions", "/v1/messages":
-		s.handleProxy(rec, req)
-	case "/api/chat", "/api/generate":
-		s.handleOllamaChat(rec, req)
-	case "/api/embed", "/api/embeddings":
-		s.handleOllamaEmbed(rec, req)
-	default:
-		t.Fatalf("laneRequest: no handler mapped for %s", path)
+	mux := http.NewServeMux()
+	s.RegisterRoutes(mux)
+	if _, pattern := mux.Handler(req); pattern == "" {
+		t.Fatalf("laneRequest: no route registered for %s", path)
 	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
 	return rec
 }
 
