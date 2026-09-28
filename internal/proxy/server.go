@@ -387,6 +387,13 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 type proxyOpts struct {
 	pathOverride string // if set, replaces the incoming request path (e.g. "/v1/completions")
 	protocol     string // if set, skips auto-detection (e.g. "openai" for completions)
+	// streamByDefault marks an endpoint whose upstream streams unless the
+	// caller sends stream:false (Ollama's /api/chat and /api/generate). An
+	// omitted "stream" field then takes the streaming response path, so the
+	// NDJSON is passed through unbuffered and its final object is parsed for
+	// token counts. The request body is not modified — the upstream already
+	// applies the same default.
+	streamByDefault bool
 }
 
 // handleProxy is the main entry point for chat completion and Anthropic requests.
@@ -454,6 +461,9 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	// ── Resolve model → backend ────────────────────────────────────────────
 	modelName, _ := body["model"].(string)
 	isStreaming, _ := body["stream"].(bool)
+	if _, present := body["stream"]; !present && opts.streamByDefault {
+		isStreaming = true
+	}
 
 	var backend *config.Backend
 	var lbGroup, lbAffKey string // affinity group/key for pin invalidation on failure

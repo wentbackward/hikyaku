@@ -170,8 +170,8 @@ Probe and health-check paths are always treated as absolute (they replace `base_
 
 | Path | Purpose |
 |---|---|
-| `/api/chat` | chat completion (streaming by default) |
-| `/api/generate` | prompt completion (streaming by default) |
+| `/api/chat` | chat completion (streaming by default: an omitted `stream` field streams, as Ollama itself does; send `stream: false` for one JSON object) |
+| `/api/generate` | prompt completion (streaming by default, likewise) |
 | `/api/embed` | embeddings (newer path) |
 | `/api/embeddings` | embeddings (legacy path) |
 | `/api/tags` | model list, forwarded to the first `ollama` backend |

@@ -300,3 +300,79 @@ routes:
 		t.Fatalf("config with type: ollama should load: %v", err)
 	}
 }
+
+// Ollama's /api/chat and /api/generate stream unless the caller sends
+// stream:false, so an omitted field must take the streaming path: the NDJSON
+// flows through unbuffered, TTFT is recorded, and the counts on the final
+// object reach the UsageEvent. /api/embed never streams and is unaffected.
+func TestOllama_OmittedStreamFieldIsStreaming(t *testing.T) {
+	ndjson := strings.Join([]string{
+		`{"model":"real-m","message":{"role":"assistant","content":"Hel"},"done":false}`,
+		`{"model":"real-m","message":{"role":"assistant","content":"lo"},"done":false}`,
+		`{"model":"real-m","message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":11,"eval_count":3}`,
+	}, "\n") + "\n"
+	for _, path := range []string{"/api/chat", "/api/generate"} {
+		t.Run(path, func(t *testing.T) {
+			var events []UsageEvent
+			s, backend := streamingUsageServer(t, "ollama", "application/x-ndjson", ndjson,
+				func(ev UsageEvent) { events = append(events, ev) })
+			defer backend.Close()
+
+			body := map[string]interface{}{"model": "m", "prompt": "hi",
+				"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}}}
+			rec := laneRequest(t, s, path, body) // no "stream" key
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+			}
+			if rec.Body.String() != ndjson {
+				t.Fatalf("stream body altered:\n%s", rec.Body.String())
+			}
+			if len(events) != 1 {
+				t.Fatalf("observer fired %d times, want 1", len(events))
+			}
+			ev := events[0]
+			if !ev.Streamed {
+				t.Errorf("omitted stream field on %s must be treated as streaming (Ollama's default)", path)
+			}
+			if ev.PromptTokens != 11 || ev.CompletionTokens != 3 {
+				t.Errorf("tokens = %d/%d, want 11/3", ev.PromptTokens, ev.CompletionTokens)
+			}
+		})
+	}
+
+	t.Run("/api/embed stays non-streaming", func(t *testing.T) {
+		var events []UsageEvent
+		s, backend := usageServer(t, "ollama", map[string]interface{}{
+			"model": "real-m", "embeddings": []interface{}{[]float64{0.1}}, "prompt_eval_count": 9,
+		}, func(ev UsageEvent) { events = append(events, ev) })
+		defer backend.Close()
+		rec := laneRequest(t, s, "/api/embed", map[string]interface{}{"model": "m", "input": "hi"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		if len(events) != 1 || events[0].Streamed || events[0].PromptTokens != 9 {
+			t.Fatalf("events = %+v, want one non-streamed event with 9 prompt tokens", events)
+		}
+	})
+}
+
+// An explicit stream:false on /api/chat is honored: the response is buffered
+// and parsed as one object, as before.
+func TestOllama_ExplicitStreamFalseIsNonStreaming(t *testing.T) {
+	var events []UsageEvent
+	s, backend := usageServer(t, "ollama", map[string]interface{}{
+		"model": "real-m", "message": map[string]interface{}{"role": "assistant", "content": "hi"},
+		"done": true, "prompt_eval_count": 11, "eval_count": 3,
+	}, func(ev UsageEvent) { events = append(events, ev) })
+	defer backend.Close()
+	rec := laneRequest(t, s, "/api/chat", map[string]interface{}{
+		"model": "m", "stream": false,
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(events) != 1 || events[0].Streamed || events[0].PromptTokens != 11 || events[0].CompletionTokens != 3 {
+		t.Fatalf("events = %+v, want one non-streamed event with 11/3 tokens", events)
+	}
+}

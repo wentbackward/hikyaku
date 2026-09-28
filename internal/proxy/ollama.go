@@ -20,23 +20,25 @@ import (
 // speaking Ollama native can only reach `type: ollama` backends, and the
 // operator is responsible for matching virtual models to the right backend.
 
-// handleOllamaChat forwards /api/chat to an ollama-type backend.
+// handleOllamaChat forwards /api/chat to an ollama-type backend. Ollama
+// streams this endpoint unless the caller sends stream:false, so an omitted
+// field is treated as streaming.
 func (s *Server) handleOllamaChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	s.proxyRequest(w, r, proxyOpts{protocol: "ollama"})
+	s.proxyRequest(w, r, proxyOpts{protocol: "ollama", streamByDefault: true})
 }
 
 // handleOllamaGenerate forwards /api/generate (completion-style) to an
-// ollama-type backend.
+// ollama-type backend. Streams by default, like /api/chat.
 func (s *Server) handleOllamaGenerate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	s.proxyRequest(w, r, proxyOpts{protocol: "ollama"})
+	s.proxyRequest(w, r, proxyOpts{protocol: "ollama", streamByDefault: true})
 }
 
 // handleOllamaEmbed serves both /api/embed (newer) and /api/embeddings
