@@ -12,9 +12,10 @@ import (
 	"github.com/wentbackward/hikyaku/internal/telemetry"
 )
 
-// usageServer stands up a backend that returns the given JSON body and a proxy
-// wired with a UsageObserver capturing every event.
-func usageServer(t *testing.T, respBody map[string]interface{}, obs UsageObserver) (srv *Server, backend *httptest.Server) {
+// usageServer stands up a backend of the given type that returns respBody as
+// JSON for every request, and a proxy wired with a UsageObserver capturing every
+// event. Route "m" resolves to backend "be" / real model "real-m".
+func usageServer(t *testing.T, backendType string, respBody map[string]interface{}, obs UsageObserver) (srv *Server, backend *httptest.Server) {
 	t.Helper()
 	backend = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -25,14 +26,14 @@ server:
   allow_plaintext: true
 backends:
   - id: be
-    type: openai
-    base_url: "%s/v1"
+    type: %s
+    base_url: "%s"
     timeout_seconds: 30
 routes:
   - virtual_model: m
     backend: be
     real_model: real-m
-`, backend.URL)
+`, backendType, backend.URL)
 	cfg, err := config.Load(writeTestConfig(t, yaml))
 	if err != nil {
 		backend.Close()
@@ -43,22 +44,38 @@ routes:
 	return srv, backend
 }
 
+// laneRequest POSTs body to path through the handler that serves that path on
+// the real mux, so each test exercises the same entry point a client would.
+func laneRequest(t *testing.T, s *Server, path string, body map[string]interface{}) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest("POST", path, bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	switch path {
+	case "/v1/chat/completions", "/v1/messages":
+		s.handleProxy(rec, req)
+	case "/api/chat", "/api/generate":
+		s.handleOllamaChat(rec, req)
+	case "/api/embed", "/api/embeddings":
+		s.handleOllamaEmbed(rec, req)
+	default:
+		t.Fatalf("laneRequest: no handler mapped for %s", path)
+	}
+	return rec
+}
+
 func chatRequest(t *testing.T, s *Server) *httptest.ResponseRecorder {
 	t.Helper()
-	body, _ := json.Marshal(map[string]interface{}{
+	return laneRequest(t, s, "/v1/chat/completions", map[string]interface{}{
 		"model":    "m",
 		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
 	})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	s.handleProxy(rec, req)
-	return rec
 }
 
 func TestWithUsageObserver_NonStreaming_FiresWithRouteAndTokens(t *testing.T) {
 	var events []UsageEvent
-	s, backend := usageServer(t, map[string]interface{}{
+	s, backend := usageServer(t, "openai", map[string]interface{}{
 		"id": "x", "object": "chat.completion",
 		"choices": []interface{}{map[string]interface{}{
 			"index": 0, "finish_reason": "stop",
@@ -106,4 +123,70 @@ func TestWithUsageObserver_NilIsSafe(t *testing.T) {
 		t.Fatal("nil observer should leave usageObserver nil")
 	}
 	s.emitUsage(UsageEvent{}) // must be a no-op, not a panic
+}
+
+// Anthropic reports cached prompt tokens as separate classes: input_tokens
+// EXCLUDES them, so each class must reach the observer unfolded for the
+// control plane to price it.
+func TestWithUsageObserver_NonStreaming_Anthropic_CacheTokens(t *testing.T) {
+	var events []UsageEvent
+	s, backend := usageServer(t, "anthropic", map[string]interface{}{
+		"id": "m1", "type": "message", "model": "claude",
+		"content": []interface{}{map[string]interface{}{"type": "text", "text": "hi"}},
+		"usage": map[string]interface{}{
+			"input_tokens": 7, "output_tokens": 5,
+			"cache_read_input_tokens": 300, "cache_creation_input_tokens": 40,
+		},
+	}, func(ev UsageEvent) { events = append(events, ev) })
+	defer backend.Close()
+
+	rec := laneRequest(t, s, "/v1/messages", map[string]interface{}{
+		"model":      "m",
+		"max_tokens": 16,
+		"messages":   []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(events) != 1 {
+		t.Fatalf("observer fired %d times, want exactly 1", len(events))
+	}
+	ev := events[0]
+	if ev.BackendType != "anthropic" || ev.Streamed {
+		t.Errorf("BackendType=%q Streamed=%v, want anthropic/false", ev.BackendType, ev.Streamed)
+	}
+	if ev.PromptTokens != 7 || ev.CompletionTokens != 5 {
+		t.Errorf("tokens = %d/%d, want 7/5", ev.PromptTokens, ev.CompletionTokens)
+	}
+	if ev.CacheReadTokens != 300 || ev.CacheWriteTokens != 40 {
+		t.Errorf("cache tokens = read %d / write %d, want 300/40", ev.CacheReadTokens, ev.CacheWriteTokens)
+	}
+}
+
+// OpenAI has no cache classes on this seam: both must stay zero, not be
+// inferred from prompt_tokens_details or folded into PromptTokens.
+func TestWithUsageObserver_NonStreaming_OpenAI_CacheTokensZero(t *testing.T) {
+	var events []UsageEvent
+	s, backend := usageServer(t, "openai", map[string]interface{}{
+		"choices": []interface{}{map[string]interface{}{
+			"index": 0, "finish_reason": "stop",
+			"message": map[string]interface{}{"role": "assistant", "content": "ok"},
+		}},
+		"usage": map[string]interface{}{
+			"prompt_tokens": 11, "completion_tokens": 7,
+			"prompt_tokens_details": map[string]interface{}{"cached_tokens": 8},
+		},
+	}, func(ev UsageEvent) { events = append(events, ev) })
+	defer backend.Close()
+
+	if rec := chatRequest(t, s); rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(events) != 1 {
+		t.Fatalf("observer fired %d times, want exactly 1", len(events))
+	}
+	ev := events[0]
+	if ev.PromptTokens != 11 || ev.CompletionTokens != 7 || ev.CacheReadTokens != 0 || ev.CacheWriteTokens != 0 {
+		t.Errorf("got %d/%d cache %d/%d, want 11/7 cache 0/0", ev.PromptTokens, ev.CompletionTokens, ev.CacheReadTokens, ev.CacheWriteTokens)
+	}
 }

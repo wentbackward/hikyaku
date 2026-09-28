@@ -96,11 +96,38 @@ type UsageEvent struct {
 	RealModel        string // the upstream model name
 	Backend          string // resolved backend id
 	BackendType      string // "openai" | "anthropic" | "ollama"
-	PromptTokens     int64
-	CompletionTokens int64
+	PromptTokens     int64  // uncached input tokens (Anthropic input_tokens; OpenAI prompt_tokens; Ollama prompt_eval_count)
+	CompletionTokens int64  // output tokens (Anthropic output_tokens; OpenAI completion_tokens; Ollama eval_count)
+	CacheReadTokens  int64  // Anthropic cache_read_input_tokens; 0 elsewhere
+	CacheWriteTokens int64  // Anthropic cache_creation_input_tokens; 0 elsewhere
 	Streamed         bool
 	Status           int
 	Duration         time.Duration
+}
+
+// usageCounts is the per-request token tally a lane parser extracts from an
+// upstream response. The classes are kept separate on purpose: Anthropic's
+// input_tokens EXCLUDES cached tokens, so total input is
+// prompt + cacheRead + cacheWrite, and each class is priced differently.
+// Nothing is folded together here — that is the embedder's decision.
+type usageCounts struct {
+	prompt, completion, cacheRead, cacheWrite int64
+}
+
+// recordTokenMetrics adds c to the per-backend Prometheus token counters and
+// the prompt-tokens-per-request histogram. Zero counts are skipped so an error
+// or count-less response leaves the metrics untouched. The cache classes are
+// not exported to Prometheus (core keeps the documented meaning of
+// llm_prompt_tokens_total: the provider's own prompt/input count).
+func (c usageCounts) recordTokenMetrics(ctx context.Context, m *telemetry.Metrics, backendID, model string) {
+	attrs := telemetry.BackendAttrs(backendID, model)
+	if c.prompt > 0 {
+		m.PromptTokens.Add(ctx, c.prompt, attrs)
+		m.PromptTokensPerRequest.Record(ctx, c.prompt, attrs)
+	}
+	if c.completion > 0 {
+		m.CompletionTokens.Add(ctx, c.completion, attrs)
+	}
 }
 
 // UsageObserver receives a UsageEvent once per completed request. It runs on the
@@ -1212,14 +1239,15 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 				logger.Request("[%s] upstream error body: %s", rid, string(data)[:min(len(data), 1024)])
 			}
 
-			var promptTok, completionTok int64
+			var counts usageCounts
 			if resp.StatusCode == http.StatusOK {
-				promptTok, completionTok = extractNonStreamingUsage(data, backendID, realModel, backendType, s.metrics, metricsCtx)
+				counts = extractNonStreamingUsage(data, backendID, realModel, backendType, s.metrics, metricsCtx)
 			}
 			s.emitUsage(UsageEvent{
 				Ctx: reqCtx, RequestID: rid, VirtualModel: virtualModel, RealModel: realModel,
 				Backend: backendID, BackendType: backendType,
-				PromptTokens: promptTok, CompletionTokens: completionTok,
+				PromptTokens: counts.prompt, CompletionTokens: counts.completion,
+				CacheReadTokens: counts.cacheRead, CacheWriteTokens: counts.cacheWrite,
 				Streamed: false, Status: resp.StatusCode, Duration: time.Since(t0),
 			})
 
@@ -1471,32 +1499,49 @@ func detectProtocol(r *http.Request) string {
 	return "openai"
 }
 
-func extractNonStreamingUsage(data []byte, backendID, model, backendType string, m *telemetry.Metrics, ctx context.Context) (promptTokens, completionTokens int64) {
+// extractNonStreamingUsage parses the token counts out of a buffered
+// non-streaming upstream response, records them on the Prometheus counters and
+// returns them for the UsageEvent. Each lane reports counts in its own shape:
+//
+//   - openai:    usage.prompt_tokens / usage.completion_tokens
+//   - anthropic: usage.input_tokens / usage.output_tokens plus the two cache
+//     classes usage.cache_read_input_tokens / usage.cache_creation_input_tokens
+//
+// A body that does not parse, or carries no counts, yields all zeros.
+func extractNonStreamingUsage(data []byte, backendID, model, backendType string, m *telemetry.Metrics, ctx context.Context) usageCounts {
 	var resp map[string]interface{}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0
-	}
-	attrs := telemetry.BackendAttrs(backendID, model)
-
-	var promptKey, completionKey string
-	if backendType == "anthropic" {
-		promptKey, completionKey = "input_tokens", "output_tokens"
-	} else {
-		promptKey, completionKey = "prompt_tokens", "completion_tokens"
+		return usageCounts{}
 	}
 
-	if usage, ok := resp["usage"].(map[string]interface{}); ok {
-		if v, _ := usage[promptKey].(float64); v > 0 {
-			promptTokens = int64(v)
-			m.PromptTokens.Add(ctx, promptTokens, attrs)
-			m.PromptTokensPerRequest.Record(ctx, promptTokens, attrs)
+	var counts usageCounts
+	usage, _ := resp["usage"].(map[string]interface{})
+	switch backendType {
+	case "anthropic":
+		counts = usageCounts{
+			prompt:     jsonCount(usage, "input_tokens"),
+			completion: jsonCount(usage, "output_tokens"),
+			cacheRead:  jsonCount(usage, "cache_read_input_tokens"),
+			cacheWrite: jsonCount(usage, "cache_creation_input_tokens"),
 		}
-		if v, _ := usage[completionKey].(float64); v > 0 {
-			completionTokens = int64(v)
-			m.CompletionTokens.Add(ctx, completionTokens, attrs)
+	default:
+		counts = usageCounts{
+			prompt:     jsonCount(usage, "prompt_tokens"),
+			completion: jsonCount(usage, "completion_tokens"),
 		}
 	}
-	return promptTokens, completionTokens
+	counts.recordTokenMetrics(ctx, m, backendID, model)
+	return counts
+}
+
+// jsonCount reads a non-negative integer token count from a decoded JSON
+// object; a missing, non-numeric or negative value counts as zero. Reading
+// from a nil map is safe, so callers can pass a missing sub-object through.
+func jsonCount(obj map[string]interface{}, key string) int64 {
+	if v, _ := obj[key].(float64); v > 0 {
+		return int64(v)
+	}
+	return 0
 }
 
 // logNonStreamingResponse extracts and logs the assistant's text content from a non-streaming response.
