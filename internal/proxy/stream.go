@@ -313,10 +313,18 @@ func (p *sseParser) ResponseText() string {
 
 // ── Ollama parser ────────────────────────────────────────────────────────────
 
-// ollamaParser captures the cheap-to-obtain metrics for Ollama-native
-// streaming responses (NDJSON) without actually parsing the body: time to
-// first byte. Token counts are embedded in NDJSON and are left for a future
-// dedicated parser.
+// maxOllamaLineBytes bounds the partial-line buffer the Ollama parser keeps
+// between Read calls. A line longer than this is discarded up to its newline
+// rather than buffered: the parser must never block or grow without bound on
+// a stream it only observes. Ollama's chunks are a few hundred bytes; the
+// final chunk with the counts is well under 1 KiB.
+const maxOllamaLineBytes = 64 * 1024
+
+// ollamaParser extracts telemetry from an Ollama-native streaming response
+// (NDJSON, one JSON object per line) without buffering the body: time to
+// first byte on the first chunk, and the token counts Ollama places on its
+// final object (prompt_eval_count / eval_count). Bytes still flow straight to
+// the client; the parser only observes them.
 type ollamaParser struct {
 	backendID string
 	model     string
@@ -324,31 +332,118 @@ type ollamaParser struct {
 	metrics   *telemetry.Metrics
 	ctx       context.Context
 
-	ttftDone bool
+	ttftDone   bool
+	t0FirstTok time.Time // when the first chunk arrived (for gen speed)
+	lineBuf    []byte    // partial line between Read calls, ≤ maxOllamaLineBytes
+	discarding bool      // skipping an oversized line up to its newline
+
+	promptToks     int64
+	completionToks int64
 }
 
 func newOllamaParser(backendID, model string, t0 time.Time, m *telemetry.Metrics, ctx context.Context) *ollamaParser {
 	return &ollamaParser{backendID: backendID, model: model, t0: t0, metrics: m, ctx: ctx}
 }
 
-// feed records TTFT on the first non-empty chunk and otherwise ignores the
-// stream content — Ollama's NDJSON format is passed through unparsed.
+// feed records TTFT on the first non-empty chunk and scans complete NDJSON
+// lines for token counts. Read boundaries need not align with lines: a partial
+// line is carried to the next call (bounded by maxOllamaLineBytes), and a
+// chunk may hold several lines.
 func (p *ollamaParser) feed(data []byte) {
-	if !p.ttftDone && len(data) > 0 {
+	if len(data) == 0 {
+		return
+	}
+	if !p.ttftDone {
 		elapsed := time.Since(p.t0).Seconds()
 		p.metrics.TTFT.Record(p.ctx, elapsed, telemetry.BackendAttrs(p.backendID, p.model))
 		p.ttftDone = true
+		p.t0FirstTok = time.Now()
+	}
+
+	for len(data) > 0 {
+		idx := bytes.IndexByte(data, '\n')
+		if idx == -1 {
+			// No newline in what is left: buffer it, unless that would exceed
+			// the cap — then drop the line and skip to its terminator.
+			if p.discarding {
+				return
+			}
+			if len(p.lineBuf)+len(data) > maxOllamaLineBytes {
+				p.lineBuf = nil
+				p.discarding = true
+				return
+			}
+			p.lineBuf = append(p.lineBuf, data...)
+			return
+		}
+		line := data[:idx]
+		data = data[idx+1:]
+		if p.discarding {
+			p.discarding = false // the oversized line ended here; resume on the next one
+			continue
+		}
+		if len(p.lineBuf)+len(line) > maxOllamaLineBytes {
+			p.lineBuf = nil
+			continue
+		}
+		if len(p.lineBuf) > 0 {
+			line = append(p.lineBuf, line...)
+			p.lineBuf = nil
+		}
+		p.handleLine(line)
 	}
 }
 
-// recordFinal is a no-op for Ollama: there are no accumulated token counts
-// to flush, and request duration is recorded by the non-streaming sibling.
-func (p *ollamaParser) recordFinal() {}
+// handleLine decodes one NDJSON object and captures the token counts if it
+// carries them. Ollama puts the counts only on the final object (done:true)
+// of /api/chat and /api/generate streams, and on the single object /api/embed
+// returns, so "any object that carries them, last wins" covers every shape
+// without depending on the done flag. Lines that are blank or not a JSON
+// object are ignored.
+func (p *ollamaParser) handleLine(line []byte) {
+	line = bytes.TrimSpace(line)
+	if len(line) == 0 {
+		return
+	}
+	var obj struct {
+		PromptEvalCount int64 `json:"prompt_eval_count"`
+		EvalCount       int64 `json:"eval_count"`
+	}
+	if err := json.Unmarshal(line, &obj); err != nil {
+		return
+	}
+	if obj.PromptEvalCount > 0 {
+		p.promptToks = obj.PromptEvalCount
+	}
+	if obj.EvalCount > 0 {
+		p.completionToks = obj.EvalCount
+	}
+}
 
-// usage returns zero counts: Ollama's NDJSON body is not parsed yet, and the
-// protocol has no cache classes.
+// recordFinal parses a final line that arrived without a trailing newline,
+// then records the per-request token metrics and generation speed. Request
+// duration is recorded by the caller, as on the SSE path.
+func (p *ollamaParser) recordFinal() {
+	if len(p.lineBuf) > 0 && !p.discarding {
+		p.handleLine(p.lineBuf)
+	}
+	p.lineBuf = nil
+
+	p.usage().recordTokenMetrics(p.ctx, p.metrics, p.backendID, p.model)
+
+	if p.ttftDone && p.completionToks > 0 {
+		decodeSecs := time.Since(p.t0FirstTok).Seconds()
+		if decodeSecs > 0 {
+			tps := float64(p.completionToks) / decodeSecs
+			p.metrics.GenerationTokensPerSec.Record(p.ctx, tps, telemetry.BackendAttrs(p.backendID, p.model))
+		}
+	}
+}
+
+// usage returns the counts from Ollama's final object. The protocol has no
+// cache classes, so those stay zero.
 func (p *ollamaParser) usage() usageCounts {
-	return usageCounts{}
+	return usageCounts{prompt: p.promptToks, completion: p.completionToks}
 }
 
 // firstDeltaContent returns the text content and reasoning/thinking content

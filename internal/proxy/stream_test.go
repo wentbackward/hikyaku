@@ -253,6 +253,107 @@ func TestOpenAI_UsageHasNoCacheClasses(t *testing.T) {
 	}
 }
 
+// ── Ollama NDJSON ─────────────────────────────────────────────────────────────
+
+func makeOllamaParser(t *testing.T) *ollamaParser {
+	t.Helper()
+	return newOllamaParser("test-backend", "test-model", time.Now(), nullMetrics(t), context.Background())
+}
+
+const ollamaFinalChunk = `{"model":"m","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","total_duration":1,"prompt_eval_count":11,"eval_count":3}`
+
+func TestOllama_TTFTOnFirstChunkAndCountsFromDone(t *testing.T) {
+	p := makeOllamaParser(t)
+	p.feed([]byte(`{"model":"m","message":{"role":"assistant","content":"Hel"},"done":false}` + "\n"))
+	if !p.ttftDone {
+		t.Fatal("ttft should fire on the first chunk")
+	}
+	if got := p.usage(); got != (usageCounts{}) {
+		t.Fatalf("usage before done = %+v, want zeros", got)
+	}
+	p.feed([]byte(`{"model":"m","message":{"role":"assistant","content":"lo"},"done":false}` + "\n"))
+	p.feed([]byte(ollamaFinalChunk + "\n"))
+	p.recordFinal()
+	if got, want := p.usage(), (usageCounts{prompt: 11, completion: 3}); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+}
+
+// Read boundaries do not align with lines: a line may arrive in several
+// pieces, and several lines may arrive in one piece.
+func TestOllama_ChunkedLineDelivery(t *testing.T) {
+	stream := `{"done":false,"message":{"content":"a"}}` + "\n" + ollamaFinalChunk + "\n"
+	for _, size := range []int{1, 7, 64} {
+		p := makeOllamaParser(t)
+		for i := 0; i < len(stream); i += size {
+			end := min(i+size, len(stream))
+			p.feed([]byte(stream[i:end]))
+		}
+		if got, want := p.usage(), (usageCounts{prompt: 11, completion: 3}); got != want {
+			t.Errorf("chunk size %d: usage() = %+v, want %+v", size, got, want)
+		}
+	}
+	p := makeOllamaParser(t)
+	p.feed([]byte(stream))
+	if got, want := p.usage(), (usageCounts{prompt: 11, completion: 3}); got != want {
+		t.Errorf("single chunk: usage() = %+v, want %+v", got, want)
+	}
+}
+
+// Windows line endings and blank lines are tolerated; a final line without a
+// trailing newline is still parsed when the stream closes.
+func TestOllama_CRLFAndUnterminatedFinalLine(t *testing.T) {
+	p := makeOllamaParser(t)
+	p.feed([]byte(`{"done":false}` + "\r\n\r\n" + ollamaFinalChunk))
+	if got := p.usage(); got != (usageCounts{}) {
+		t.Fatalf("unterminated line must not be parsed early, got %+v", got)
+	}
+	p.recordFinal()
+	if got, want := p.usage(), (usageCounts{prompt: 11, completion: 3}); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+}
+
+// A partial line is buffered only up to maxOllamaLineBytes; beyond that the
+// line is discarded to its newline and parsing resumes on the next line.
+func TestOllama_OversizedLineIsDroppedNotBuffered(t *testing.T) {
+	p := makeOllamaParser(t)
+	huge := `{"done":true,"prompt_eval_count":999,"eval_count":999,"pad":"` + strings.Repeat("x", maxOllamaLineBytes)
+	for i := 0; i < len(huge); i += 4096 {
+		end := min(i+4096, len(huge))
+		p.feed([]byte(huge[i:end]))
+		if len(p.lineBuf) > maxOllamaLineBytes {
+			t.Fatalf("line buffer grew to %d bytes, cap is %d", len(p.lineBuf), maxOllamaLineBytes)
+		}
+	}
+	if len(p.lineBuf) != 0 {
+		t.Fatalf("oversized partial line should have been dropped, %d bytes still buffered", len(p.lineBuf))
+	}
+	// Tail of the oversized line, then its newline, then a well-formed line.
+	p.feed([]byte(`"}` + "\n" + ollamaFinalChunk + "\n"))
+	if got, want := p.usage(), (usageCounts{prompt: 11, completion: 3}); got != want {
+		t.Errorf("usage() = %+v, want %+v (oversized line must be skipped, next line parsed)", got, want)
+	}
+}
+
+func TestOllama_MalformedLinesIgnored(t *testing.T) {
+	p := makeOllamaParser(t)
+	p.feed([]byte("not json\n[1,2,3]\n" + `{"done":true,"prompt_eval_count":"11"}` + "\n" + ollamaFinalChunk + "\n"))
+	if got, want := p.usage(), (usageCounts{prompt: 11, completion: 3}); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+}
+
+// /api/embed never streams, but a client may still send stream:true; the one
+// object Ollama returns carries prompt_eval_count without done.
+func TestOllama_CountsWithoutDoneFlag(t *testing.T) {
+	p := makeOllamaParser(t)
+	p.feed([]byte(`{"model":"m","embeddings":[[0.1]],"prompt_eval_count":9}` + "\n"))
+	if got, want := p.usage(), (usageCounts{prompt: 9}); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+}
+
 // ── interceptedBody ───────────────────────────────────────────────────────────
 
 func TestInterceptedBody_ReadsThrough(t *testing.T) {

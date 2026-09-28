@@ -329,3 +329,37 @@ func TestWithUsageObserver_NonStreaming_Ollama_Embed(t *testing.T) {
 		t.Errorf("tokens = %d/%d, want 9/0", ev.PromptTokens, ev.CompletionTokens)
 	}
 }
+
+func TestWithUsageObserver_Streaming_Ollama_NDJSON(t *testing.T) {
+	var events []UsageEvent
+	ndjson := strings.Join([]string{
+		`{"model":"real-m","message":{"role":"assistant","content":"Hel"},"done":false}`,
+		`{"model":"real-m","message":{"role":"assistant","content":"lo"},"done":false}`,
+		`{"model":"real-m","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":11,"eval_count":3}`,
+	}, "\n") + "\n"
+	s, backend := streamingUsageServer(t, "ollama", "application/x-ndjson", ndjson,
+		func(ev UsageEvent) { events = append(events, ev) })
+	defer backend.Close()
+
+	rec := laneRequest(t, s, "/api/chat", map[string]interface{}{
+		"model": "m", "stream": true,
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != ndjson {
+		t.Fatalf("stream body altered:\n%s", rec.Body.String())
+	}
+	if len(events) != 1 {
+		t.Fatalf("observer fired %d times, want exactly 1", len(events))
+	}
+	ev := events[0]
+	if !ev.Streamed || ev.BackendType != "ollama" || ev.Status != http.StatusOK {
+		t.Errorf("Streamed=%v BackendType=%q Status=%d", ev.Streamed, ev.BackendType, ev.Status)
+	}
+	if ev.PromptTokens != 11 || ev.CompletionTokens != 3 || ev.CacheReadTokens != 0 || ev.CacheWriteTokens != 0 {
+		t.Errorf("got %d/%d cache %d/%d, want 11/3 cache 0/0",
+			ev.PromptTokens, ev.CompletionTokens, ev.CacheReadTokens, ev.CacheWriteTokens)
+	}
+}

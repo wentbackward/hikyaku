@@ -200,7 +200,7 @@ routes:
 
 **No translation.** The proxy does not reshape messages, and does not translate between Ollama's `/api/chat` and OpenAI's `/v1/chat/completions` — a client speaking Ollama native can only reach `ollama` backends, and vice versa. If you point an OpenAI-speaking client at a non-TLS Ollama endpoint, configure it against Ollama's own OpenAI-compat layer (`http://host:11434/v1`) as a `type: openai` backend, at the cost of Ollama's implicit re-interpretation of temperature and system prompt.
 
-**Metrics.** Request count, duration, active-requests gauge, and TTFT are all recorded. Token counts (`prompt_eval_count` / `eval_count`) are embedded in Ollama's NDJSON stream and not parsed in this release.
+**Metrics.** Request count, duration, active-requests gauge, TTFT (first byte of the stream), token counts and generation speed are all recorded. Token counts come from Ollama's own `prompt_eval_count` / `eval_count` — read from the response object on non-streaming requests and from the final (`done: true`) object of the NDJSON stream on streaming ones — and feed the same `llm_prompt_tokens_total` / `llm_completion_tokens_total` counters as the other lanes. The stream is observed line by line, never buffered.
 
 ### Authentication
 
