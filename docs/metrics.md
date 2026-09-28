@@ -17,6 +17,29 @@ All metrics are exported via OpenTelemetry with a Prometheus exporter. Default e
 | `hikyaku_affinity_cache_entries` | Gauge | — | Number of cached affinity pins |
 | `hikyaku_request_body_bytes_buffered` | Gauge | — | Bytes held in proxy buffers awaiting responses |
 
+## Token counters
+
+`llm_prompt_tokens_total`, `llm_completion_tokens_total` and
+`llm_prompt_tokens_per_request` carry the provider's own counts, taken from the
+response (or, for streams, from the final usage-bearing event or object):
+
+| Backend type | Prompt / input | Completion / output |
+|---|---|---|
+| `openai` | `usage.prompt_tokens` | `usage.completion_tokens` |
+| `anthropic` | `usage.input_tokens` | `usage.output_tokens` |
+| `ollama` | `prompt_eval_count` | `eval_count` (chat, generate and embed lanes) |
+
+Anthropic's `input_tokens` **excludes** prompt-cache traffic, and the cache
+classes (`cache_read_input_tokens`, `cache_creation_input_tokens`) are
+deliberately **not** exported to Prometheus: `llm_prompt_tokens_total` keeps
+its documented meaning (the provider's uncached prompt count) rather than
+silently changing to a total that mixes three differently-priced classes. The
+per-class figures are delivered per request to an embedder through the
+`WithUsageObserver` seam (`UsageEvent.PromptTokens`, `CacheReadTokens`,
+`CacheWriteTokens`), where they can be priced and aggregated per principal.
+OpenAI's `prompt_tokens_details.cached_tokens` is a subset of `prompt_tokens`
+(already counted) and is not reported separately.
+
 ## Labels
 
 - **`backend`** — the backend ID from config (e.g. `my-vllm`, `anthropic`)
