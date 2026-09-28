@@ -197,6 +197,62 @@ func TestAnthropic_FullStream(t *testing.T) {
 	}
 }
 
+func TestAnthropic_CacheTokensFromMessageStart(t *testing.T) {
+	p := makeParser(t, "anthropic")
+	feedLines(p,
+		`data: {"type":"message_start","message":{"id":"m1","usage":{"input_tokens":7,"cache_read_input_tokens":300,"cache_creation_input_tokens":40,"output_tokens":1}}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}`,
+		`data: {"type":"message_stop"}`,
+	)
+	got := p.usage()
+	want := usageCounts{prompt: 7, completion: 5, cacheRead: 300, cacheWrite: 40}
+	if got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+}
+
+// The counts must survive message_stop AND the trailing [DONE] flush — the
+// second flush must not zero what the first one exposed.
+func TestAnthropic_UsageStableAfterDone(t *testing.T) {
+	p := makeParser(t, "anthropic")
+	feedAll(p,
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":7,"cache_read_input_tokens":300,"cache_creation_input_tokens":40}}}`,
+		`data: {"type":"message_delta","usage":{"output_tokens":5}}`,
+		`data: {"type":"message_stop"}`,
+		`data: [DONE]`,
+	)
+	p.recordFinal()
+	if got, want := p.usage(), (usageCounts{prompt: 7, completion: 5, cacheRead: 300, cacheWrite: 40}); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+}
+
+// A stream without cache usage reports zero cache classes, not stale state.
+func TestAnthropic_UsageWithoutCacheFields(t *testing.T) {
+	p := makeParser(t, "anthropic")
+	feedLines(p,
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":25}}}`,
+		`data: {"type":"message_delta","usage":{"output_tokens":14}}`,
+		`data: {"type":"message_stop"}`,
+	)
+	if got, want := p.usage(), (usageCounts{prompt: 25, completion: 14}); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+}
+
+func TestOpenAI_UsageHasNoCacheClasses(t *testing.T) {
+	p := makeParser(t, "openai")
+	feedLines(p,
+		`data: {"choices":[{"delta":{"content":"Hi"},"index":0}]}`,
+		`data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":64}}}`,
+		`data: [DONE]`,
+	)
+	if got, want := p.usage(), (usageCounts{prompt: 100, completion: 50}); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+}
+
 // ── interceptedBody ───────────────────────────────────────────────────────────
 
 func TestInterceptedBody_ReadsThrough(t *testing.T) {

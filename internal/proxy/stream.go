@@ -18,10 +18,25 @@ const maxContentCapture = 32768 // 32KB cap for L4 response capture
 // streamParser is the minimum contract interceptedBody needs from a protocol
 // parser: bytes flow in via feed() in read order; recordFinal() is called
 // once when the stream closes and should emit per-request summary metrics.
+// Every parser is also a usageSource so the stream-close path can fill the
+// UsageEvent without knowing which lane it is on.
 type streamParser interface {
 	feed(data []byte)
 	recordFinal()
+	usageSource
 }
+
+// usageSource exposes the token counts a parser has accumulated so far. It is
+// read once, after recordFinal, on stream close.
+type usageSource interface {
+	usage() usageCounts
+}
+
+// Both concrete parsers must satisfy the accessor the emit site relies on.
+var (
+	_ usageSource = (*sseParser)(nil)
+	_ usageSource = (*ollamaParser)(nil)
+)
 
 // ── SSE parser ────────────────────────────────────────────────────────────────
 
@@ -42,12 +57,18 @@ type sseParser struct {
 	// Token accumulation
 	promptToks     int64
 	completionToks int64
+	cacheReadToks  int64 // Anthropic cache_read_input_tokens; 0 on OpenAI
+	cacheWriteToks int64 // Anthropic cache_creation_input_tokens; 0 on OpenAI
 	thinkChars     int64 // length of thinking/reasoning content seen
 	contentChars   int64 // length of regular text content seen
 
-	// Anthropic accumulates token counts across events
+	// Anthropic accumulates token counts across events (message_start carries
+	// the input classes, message_delta the output count) until the flush on
+	// message_stop / [DONE] moves them into the fields above.
 	anthropicInputTokens  int64
 	anthropicOutputTokens int64
+	anthropicCacheRead    int64
+	anthropicCacheWrite   int64
 
 	// L4 content capture
 	captureContent bool
@@ -143,11 +164,18 @@ func (p *sseParser) handleOpenAIEvent(evt map[string]interface{}) {
 func (p *sseParser) handleAnthropicEvent(evt map[string]interface{}) {
 	switch evt["type"] {
 	case "message_start":
-		// input_tokens arrive here
+		// input_tokens and the two cache classes arrive here. input_tokens
+		// excludes cached tokens, so each class is kept separately.
 		if msg, ok := evt["message"].(map[string]interface{}); ok {
 			if usage, ok := msg["usage"].(map[string]interface{}); ok {
-				if v, _ := usage["input_tokens"].(float64); v > 0 {
-					p.anthropicInputTokens = int64(v)
+				if v := jsonCount(usage, "input_tokens"); v > 0 {
+					p.anthropicInputTokens = v
+				}
+				if v := jsonCount(usage, "cache_read_input_tokens"); v > 0 {
+					p.anthropicCacheRead = v
+				}
+				if v := jsonCount(usage, "cache_creation_input_tokens"); v > 0 {
+					p.anthropicCacheWrite = v
 				}
 			}
 		}
@@ -187,6 +215,11 @@ func (p *sseParser) handleAnthropicEvent(evt map[string]interface{}) {
 	}
 }
 
+// recordAnthropicTokens flushes the counts accumulated across Anthropic events
+// into the per-stream totals and the Prometheus counters. It runs on
+// message_stop and again on [DONE]; the accumulators are zeroed after each
+// flush so a second flush is a no-op rather than a double count, while the
+// totals it exposes via usage() persist.
 func (p *sseParser) recordAnthropicTokens() {
 	attrs := telemetry.BackendAttrs(p.backendID, p.model)
 	if p.anthropicInputTokens > 0 {
@@ -199,6 +232,19 @@ func (p *sseParser) recordAnthropicTokens() {
 		p.metrics.CompletionTokens.Add(p.ctx, p.anthropicOutputTokens, attrs)
 		p.anthropicOutputTokens = 0
 	}
+	if p.anthropicCacheRead > 0 {
+		p.cacheReadToks = p.anthropicCacheRead
+		p.anthropicCacheRead = 0
+	}
+	if p.anthropicCacheWrite > 0 {
+		p.cacheWriteToks = p.anthropicCacheWrite
+		p.anthropicCacheWrite = 0
+	}
+}
+
+// usage returns the token classes seen on this stream. Call after recordFinal.
+func (p *sseParser) usage() usageCounts {
+	return usageCounts{p.promptToks, p.completionToks, p.cacheReadToks, p.cacheWriteToks}
 }
 
 // recordFinal records per-request summary metrics once the stream is complete.
@@ -298,6 +344,12 @@ func (p *ollamaParser) feed(data []byte) {
 // recordFinal is a no-op for Ollama: there are no accumulated token counts
 // to flush, and request duration is recorded by the non-streaming sibling.
 func (p *ollamaParser) recordFinal() {}
+
+// usage returns zero counts: Ollama's NDJSON body is not parsed yet, and the
+// protocol has no cache classes.
+func (p *ollamaParser) usage() usageCounts {
+	return usageCounts{}
+}
 
 // firstDeltaContent returns the text content and reasoning/thinking content
 // from the first choice delta in an OpenAI-style SSE event.

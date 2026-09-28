@@ -1147,14 +1147,12 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 					s.bufferedBytes.Add(-bytesHeld)
 					s.metrics.RequestBodyBytesBuffered.Record(metricsCtx, float64(s.bufferedBytes.Load()))
 					parser.recordFinal()
-					var promptTok, completionTok int64
-					if ssep != nil {
-						promptTok, completionTok = ssep.promptToks, ssep.completionToks
-					}
+					counts := parser.usage()
 					s.emitUsage(UsageEvent{
 						Ctx: reqCtx, RequestID: rid, VirtualModel: virtualModel, RealModel: realModel,
 						Backend: backendID, BackendType: backendType,
-						PromptTokens: promptTok, CompletionTokens: completionTok,
+						PromptTokens: counts.prompt, CompletionTokens: counts.completion,
+						CacheReadTokens: counts.cacheRead, CacheWriteTokens: counts.cacheWrite,
 						Streamed: true, Status: status, Duration: time.Since(t0),
 					})
 					elapsed := time.Since(t0).Seconds()

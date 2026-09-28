@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/wentbackward/hikyaku/internal/config"
@@ -188,5 +189,86 @@ func TestWithUsageObserver_NonStreaming_OpenAI_CacheTokensZero(t *testing.T) {
 	ev := events[0]
 	if ev.PromptTokens != 11 || ev.CompletionTokens != 7 || ev.CacheReadTokens != 0 || ev.CacheWriteTokens != 0 {
 		t.Errorf("got %d/%d cache %d/%d, want 11/7 cache 0/0", ev.PromptTokens, ev.CompletionTokens, ev.CacheReadTokens, ev.CacheWriteTokens)
+	}
+}
+
+// streamingUsageServer is usageServer's streaming sibling: the backend writes
+// raw body bytes with the given content type, flushing per line so the proxy's
+// stream parser sees chunked delivery.
+func streamingUsageServer(t *testing.T, backendType, contentType, raw string, obs UsageObserver) (srv *Server, backend *httptest.Server) {
+	t.Helper()
+	backend = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", contentType)
+		flusher, _ := w.(http.Flusher)
+		for _, line := range strings.SplitAfter(raw, "\n") {
+			_, _ = w.Write([]byte(line))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}))
+	yaml := fmt.Sprintf(`
+server:
+  allow_plaintext: true
+backends:
+  - id: be
+    type: %s
+    base_url: "%s"
+    timeout_seconds: 30
+routes:
+  - virtual_model: m
+    backend: be
+    real_model: real-m
+`, backendType, backend.URL)
+	cfg, err := config.Load(writeTestConfig(t, yaml))
+	if err != nil {
+		backend.Close()
+		t.Fatalf("config load: %v", err)
+	}
+	metrics, _, _ := telemetry.Init()
+	srv = New("test", "inspect", cfg, metrics, nil, WithUsageObserver(obs))
+	return srv, backend
+}
+
+func TestWithUsageObserver_Streaming_Anthropic_CacheTokens(t *testing.T) {
+	var events []UsageEvent
+	sse := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"m1","usage":{"input_tokens":7,"cache_read_input_tokens":300,"cache_creation_input_tokens":40,"output_tokens":1}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n") + "\n"
+	s, backend := streamingUsageServer(t, "anthropic", "text/event-stream", sse,
+		func(ev UsageEvent) { events = append(events, ev) })
+	defer backend.Close()
+
+	rec := laneRequest(t, s, "/v1/messages", map[string]interface{}{
+		"model": "m", "max_tokens": 16, "stream": true,
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"type":"message_stop"`) {
+		t.Fatalf("stream body not passed through: %s", rec.Body.String())
+	}
+	if len(events) != 1 {
+		t.Fatalf("observer fired %d times, want exactly 1", len(events))
+	}
+	ev := events[0]
+	if !ev.Streamed || ev.BackendType != "anthropic" || ev.Status != http.StatusOK {
+		t.Errorf("Streamed=%v BackendType=%q Status=%d", ev.Streamed, ev.BackendType, ev.Status)
+	}
+	if ev.PromptTokens != 7 || ev.CompletionTokens != 5 || ev.CacheReadTokens != 300 || ev.CacheWriteTokens != 40 {
+		t.Errorf("got %d/%d cache %d/%d, want 7/5 cache 300/40",
+			ev.PromptTokens, ev.CompletionTokens, ev.CacheReadTokens, ev.CacheWriteTokens)
 	}
 }
