@@ -4,6 +4,7 @@ package config
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -15,6 +16,12 @@ import (
 )
 
 var envVarRe = regexp.MustCompile(`\$\{([^}]+)\}`)
+
+// ErrEmptyDocument is returned by Load for a config file with no YAML content
+// (empty, whitespace, or comments only). An empty config is never intentional
+// — it is what a SIGHUP reload sees when it races a non-atomic rewrite of the
+// file — so it is reported explicitly rather than loaded as "no backends".
+var ErrEmptyDocument = errors.New("empty document (no YAML content)")
 
 // ── Schema ────────────────────────────────────────────────────────────────────
 
@@ -248,7 +255,7 @@ func Load(path string) (*Config, error) {
 	// Allows: backends: {foo: {type: openai, ...}}  →  backends: [{id: foo, type: openai, ...}]
 	expanded, err = normalizeMapToList(expanded, "backends", "id")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	expanded, err = normalizeMapToList(expanded, "routes", "virtual_model")
 	if err != nil {
@@ -305,7 +312,12 @@ func normalizeMapToList(yamlText, blockName, keyField string) (string, error) {
 		return yamlText, fmt.Errorf("normalizeMapToList: parse yaml: %w", err)
 	}
 
-	// The root node is a Document node containing a Mapping node
+	// The root node is a Document node containing a Mapping node. An empty
+	// document (empty/whitespace/comment-only file) has no content at all —
+	// never index into it.
+	if len(doc.Content) == 0 {
+		return yamlText, ErrEmptyDocument
+	}
 	root := doc.Content[0]
 	if root.Kind != yaml.MappingNode {
 		return yamlText, nil

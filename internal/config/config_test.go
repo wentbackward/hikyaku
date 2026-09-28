@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1130,5 +1131,42 @@ routes:
 	_, err := Load(path)
 	if err == nil || !strings.Contains(err.Error(), "empty alias") {
 		t.Fatalf("empty alias must be rejected, got: %v", err)
+	}
+}
+
+// TestLoad_EmptyDocumentIsAnError pins that a config with no YAML content is
+// refused with ErrEmptyDocument — and, above all, does not panic (v0.5.5
+// indexed the document's first node unguarded, which killed embedders that
+// reloaded on SIGHUP while the file was being rewritten).
+func TestLoad_EmptyDocumentIsAnError(t *testing.T) {
+	for name, content := range map[string]string{
+		"empty":         "",
+		"whitespace":    "  \n\n   \n",
+		"comments only": "# nothing here\n# still nothing\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeTemp(t, content))
+			if !errors.Is(err, ErrEmptyDocument) {
+				t.Fatalf("Load(%q): err = %v, want ErrEmptyDocument", content, err)
+			}
+			if !strings.Contains(err.Error(), "parse ") {
+				t.Fatalf("error should name the file: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoad_NonMappingRootIsAnError: a document whose root is a scalar or a
+// sequence is not a config either; it must fail cleanly, not panic.
+func TestLoad_NonMappingRootIsAnError(t *testing.T) {
+	for name, content := range map[string]string{
+		"scalar":   "just a string\n",
+		"sequence": "- a\n- b\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeTemp(t, content)); err == nil {
+				t.Fatalf("Load(%q) must fail", content)
+			}
+		})
 	}
 }
