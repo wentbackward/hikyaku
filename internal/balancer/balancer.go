@@ -14,11 +14,26 @@ import (
 // Balancer coordinates backend state, health checking, and selection
 // for all groups in a config. One Balancer per Server.
 type Balancer struct {
-	groups map[string]*Group
-	hc     *hcClient
-	ac     *aliveChecker
-	done   chan struct{}
-	wg     sync.WaitGroup
+	groups    map[string]*Group
+	transport http.RoundTripper // outbound transport for every probe; nil = the probe clients' own defaults
+	hc        *hcClient
+	ac        *aliveChecker
+	done      chan struct{}
+	wg        sync.WaitGroup
+}
+
+// Option customizes a Balancer at construction.
+type Option func(*Balancer)
+
+// WithTransport makes every probe the balancer sends — health checks, alive
+// probes and metrics scrapes — go through rt, the server's outbound
+// RoundTripper. A probe must see a backend exactly as live traffic does: with
+// the same client certificate, CA bundle, certificate pins or attested leg an
+// embedder's TransportFactory supplies, a backend that only that transport can
+// reach is healthy to the balancer, not just to the proxy. A nil rt leaves the
+// probe clients building their own transports, as they do without the option.
+func WithTransport(rt http.RoundTripper) Option {
+	return func(b *Balancer) { b.transport = rt }
 }
 
 // Group holds the state for one load-balanced backend group.
@@ -83,17 +98,22 @@ func backendIDs(backends []*config.Backend) []string {
 }
 
 // New creates a Balancer from the config and starts background goroutines.
-func New(cfg *config.Config) *Balancer {
+// Options are applied before the probe clients are built, so a WithTransport
+// governs the synchronous startup scrape as well as every later probe.
+func New(cfg *config.Config, opts ...Option) *Balancer {
 	// Seed the per-process affinity key (no-op in inspect builds). Guarded by
 	// sync.Once internally so SIGHUP reloads don't re-key and break affinity.
 	seedAffinityKey()
 
 	b := &Balancer{
 		groups: make(map[string]*Group, len(cfg.Groups)),
-		hc:     newHCClient(cfg),
-		ac:     newAliveChecker(),
 		done:   make(chan struct{}),
 	}
+	for _, o := range opts {
+		o(b)
+	}
+	b.hc = newHCClient(cfg, b.transport)
+	b.ac = newAliveChecker(b.transport)
 
 	for name, grpCfg := range cfg.Groups {
 		states := make(map[string]*BackendState, len(cfg.Backends))
@@ -382,7 +402,7 @@ func (b *Balancer) runAliveCheck(job *aliveJob) {
 			return
 		case <-ticker.C:
 			// Skip if backend is unhealthy and retry delay hasn't elapsed
-			if !b.isBackendHealthy(job.id) && !b.shouldRetry(job.id, job.retryDelaySec) {
+			if !b.IsBackendHealthy(job.id) && !b.shouldRetry(job.id, job.retryDelaySec) {
 				continue
 			}
 
@@ -415,7 +435,7 @@ func (b *Balancer) runScrapeAndHealth(job *scrapeJob) {
 			return
 		case <-ticker.C:
 			// Skip if backend is unhealthy and retry delay hasn't elapsed
-			if !b.isBackendHealthy(job.id) && !b.shouldRetry(job.id, job.retryDelaySec) {
+			if !b.IsBackendHealthy(job.id) && !b.shouldRetry(job.id, job.retryDelaySec) {
 				continue
 			}
 			b.doScrape(job)
@@ -482,7 +502,7 @@ func (b *Balancer) runHealthCheck(job *healthJob) {
 
 		case <-ticker.C:
 			// Skip if backend is unhealthy and retry delay hasn't elapsed
-			if !b.isBackendHealthy(job.id) && !b.shouldRetry(job.id, job.retryDelaySec) {
+			if !b.IsBackendHealthy(job.id) && !b.shouldRetry(job.id, job.retryDelaySec) {
 				continue
 			}
 
@@ -653,8 +673,9 @@ func (b *Balancer) InvalidatePin(groupName, key string) {
 	}
 }
 
-// isBackendHealthy checks if the backend is currently healthy.
-func (b *Balancer) isBackendHealthy(id string) bool {
+// IsBackendHealthy reports whether the backend with the given id is currently
+// marked healthy. An id that belongs to no group reports false.
+func (b *Balancer) IsBackendHealthy(id string) bool {
 	for _, grp := range b.groups {
 		if st, ok := grp.States[id]; ok {
 			return st.IsHealthy()

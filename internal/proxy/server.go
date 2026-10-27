@@ -217,15 +217,24 @@ func New(version, buildMode string, cfg *config.Config, metrics *telemetry.Metri
 	s.applyCaptureConfig(cfg)
 	s.applyLoopSamplerConfig(cfg)
 	logConfigDeprecations(cfg)
-	if len(cfg.Groups) > 0 {
-		s.balancer = balancer.New(cfg)
-	}
-	// Apply options last so they can override defaults (e.g. the transport).
-	// cfg is already stored, so options may read s.cfg.Load().
+	// Apply options before anything that depends on them: the balancer's probes
+	// go through the outbound transport an option may replace. cfg is already
+	// stored, so options may read s.cfg.Load().
 	for _, o := range opts {
 		o(s)
 	}
+	if len(cfg.Groups) > 0 {
+		s.balancer = s.newBalancer(cfg)
+	}
 	return s
+}
+
+// newBalancer builds the balancer for cfg with its probes on the server's
+// outbound transport — the one live traffic uses, whether core's default or a
+// TransportFactory's — so a backend that only that transport can reach (mTLS,
+// private CA, pins) is healthy to the balancer exactly when it is to the proxy.
+func (s *Server) newBalancer(cfg *config.Config) *balancer.Balancer {
+	return balancer.New(cfg, balancer.WithTransport(s.transport))
 }
 
 // applyCaptureConfig builds (or rebuilds) the capture handle from cfg. An init
@@ -297,17 +306,19 @@ func (s *Server) Reload(cfg *config.Config) {
 	s.applyLoopSamplerConfig(cfg)
 	logConfigDeprecations(cfg)
 
-	// Swap balancer on reload
+	// Swap balancer on reload; the new one probes through the same outbound
+	// transport as before (a factory's transport is reconfigured in place by the
+	// embedder, never replaced).
 	if s.balancer != nil {
 		old := s.balancer
 		if len(cfg.Groups) > 0 {
-			s.balancer = balancer.New(cfg)
+			s.balancer = s.newBalancer(cfg)
 		} else {
 			s.balancer = nil
 		}
 		old.Stop()
 	} else if len(cfg.Groups) > 0 {
-		s.balancer = balancer.New(cfg)
+		s.balancer = s.newBalancer(cfg)
 	}
 
 	log.Printf("[reload] %d backends, %d routes", len(cfg.Backends), len(cfg.Routes))

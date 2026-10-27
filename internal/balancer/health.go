@@ -13,13 +13,19 @@ import (
 	"github.com/wentbackward/hikyaku/internal/sectls"
 )
 
-// hcClient is the HTTP client used for health probes.
+// hcClient is the HTTP client used for health probes and metrics scrapes.
 type hcClient struct {
 	transport http.RoundTripper
 }
 
-// newHCClient creates an HTTP client tuned for health probes.
-func newHCClient(cfg *config.Config) *hcClient {
+// newHCClient creates an HTTP client for health probes. It sends through rt,
+// the server's outbound transport, when one is given; otherwise it builds its
+// own transport tuned for probes, with the config's pool settings and the
+// build's TLS floor.
+func newHCClient(cfg *config.Config, rt http.RoundTripper) *hcClient {
+	if rt != nil {
+		return &hcClient{transport: rt}
+	}
 	tc := cfg.Server.Transport
 	return &hcClient{
 		transport: &http.Transport{

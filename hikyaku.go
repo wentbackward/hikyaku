@@ -77,7 +77,12 @@ func New(version, buildMode string, cfg *Config, metrics *Metrics, j *Journal, o
 }
 
 // WithTransportFactory injects a custom outbound transport (e.g. an attested
-// RA-TLS transport in the pro layer).
+// RA-TLS transport in the pro layer). The transport carries every proxy→backend
+// request: live traffic and the load balancer's health, alive and metrics
+// probes alike, so a backend only that transport can reach (mTLS, private CA,
+// pins) is healthy to the balancer exactly when it is reachable by the proxy.
+// The factory is called once, at construction; an embedder that changes policy
+// on reload reconfigures the transport it returned in place.
 func WithTransportFactory(f TransportFactory) Option {
 	return proxy.WithTransportFactory(f)
 }

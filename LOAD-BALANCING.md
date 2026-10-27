@@ -389,7 +389,14 @@ func pickLeastLoaded(pool []*BackendState) *BackendState {
 
 ## Health and recovery model
 
-The proxy tracks three independent signals per backend:
+The proxy tracks three independent signals per backend. Every probe below —
+alive probes, health checks and metrics scrapes — is sent through the
+server's outbound transport, the same `http.RoundTripper` that carries live
+requests to the backend (core's default, or the one an embedder injects with
+`WithTransportFactory`). A backend that needs a client certificate, a private
+CA or a certificate pin on the live leg is therefore probed with that same
+material, and is healthy to the balancer exactly when it is reachable by the
+proxy.
 
 ### 1. Alive (OR-based, per-group, disabled by default)
 

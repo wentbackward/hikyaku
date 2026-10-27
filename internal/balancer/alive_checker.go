@@ -16,11 +16,13 @@ type aliveChecker struct {
 	client *http.Client
 }
 
-// newAliveChecker creates a new alive checker with the given config.
-func newAliveChecker() *aliveChecker {
+// newAliveChecker creates a new alive checker. Probes are sent through rt, the
+// server's outbound transport; a nil rt means Go's default transport, as before.
+func newAliveChecker(rt http.RoundTripper) *aliveChecker {
 	return &aliveChecker{
 		client: &http.Client{
-			Timeout: 10 * time.Second, // max timeout for any probe
+			Transport: rt,
+			Timeout:   10 * time.Second, // max timeout for any probe
 		},
 	}
 }
