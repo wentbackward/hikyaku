@@ -45,6 +45,8 @@ Standard Go `net/http` transport with system CA bundle. Any backend `base_url` s
 - **OpenAI lane must be encrypted.** Any `type: openai` backend must have an `https://` base_url; an `http://` openai backend is rejected at startup. (The ollama and anthropic lanes are not constrained — local ollama/vLLM over `http://localhost` still works.)
 - **Minimum TLS version** is pinned to `server.min_tls_version` (default 1.3) on the shared outbound transport. `http://` backends are unaffected — they never perform a handshake — so this hardens any HTTPS backend without breaking local plaintext ones.
 
+The load balancer's health, alive and metrics probes are sent through the same shared outbound transport as live requests — the same TLS floor, the same `TransportFactory` an embedder injects, and no `HTTP_PROXY` consultation — so a backend is healthy to the balancer exactly when the proxy can reach it.
+
 ### TLS with Tailscale
 
 Tailscale can issue a real (Let's Encrypt-backed) certificate for a node's MagicDNS name, which the proxy then terminates directly. **Compose does not provision this for you** — it only mounts files that already exist. The hardened build *requires* a working cert (you cannot terminate TLS at Tailscale and forward plaintext to hikyaku — hardened rejects plaintext), so the cert must be on disk and readable by the container.

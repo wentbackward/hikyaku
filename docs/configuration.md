@@ -547,6 +547,8 @@ The proxy uses multiple independent signals to determine backend health. Operato
 
 This is the primary health signal. A backend that serves messages is alive, regardless of what any probe says.
 
+Every probe below (health, alive, metrics scrape) uses the proxy's shared outbound transport — the same TLS floor and the same `TransportFactory`-supplied transport as live requests, with `HTTP_PROXY` not consulted, as for live traffic — so a backend that needs a client certificate, a private CA or a pin on the live leg is probed with that same material.
+
 **Health probes (GET).** Periodic GET requests to a configurable path (default: `models`, resolving to `{base_url}models`). Lightweight — no tokens consumed, no KV cache pressure. Marks backends unhealthy after `unhealthy_after` consecutive failures (default: 3). Can be disabled entirely with `health_check.enabled: false`.
 
 **Alive probes (OR-based, per-group).** More invasive checks that validate the full inference pipeline. Configured per-group under `groups.<name>.monitoring.alive`. Disabled by default — must be explicitly enabled. Two probe types:
