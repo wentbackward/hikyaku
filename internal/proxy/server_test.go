@@ -1534,6 +1534,32 @@ func TestCapture_ServerFilterGatesEveryWindow(t *testing.T) {
 	}
 }
 
+// With no window armed the server filter is never consulted: the request
+// snapshot is not built and the gate does not run on the hot path.
+func TestCapture_ServerFilterNotConsultedWithoutWindow(t *testing.T) {
+	var calls atomic.Int64
+	s, backend := newTestServer(t, nil, WithCaptureFilter(func(capture.Request) bool {
+		calls.Add(1)
+		return true
+	}))
+	defer backend.Close()
+	dir := enableCapture(t, s, 2)
+	captureChat(t, s, "test-model", nil)
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("server filter ran %d time(s) with no window armed, want 0", n)
+	}
+	s.Capture().Arm()
+	captureChat(t, s, "test-model", nil)
+	captureChat(t, s, "test-model", nil)
+	captureChat(t, s, "test-model", nil) // window spent: not consulted again
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("server filter ran %d time(s) across an armed window of 2, want 2", n)
+	}
+	if files := listCaptureFiles(t, dir); len(files) != 2 {
+		t.Fatalf("expected 2 capture files, got %d", len(files))
+	}
+}
+
 // A window armed programmatically with a filter sees the resolved route,
 // backend, path, method, the inbound headers and the request context (where
 // an embedder's middleware leaves the principal), and captures only matches.

@@ -875,7 +875,9 @@ func (s *Server) startCapture(r *http.Request, rid string, t0 time.Time,
 	rawBody, resolvedBody []byte,
 ) *captureCtx {
 	c := s.capture.Load()
-	if c == nil {
+	if c == nil || c.Remaining() <= 0 {
+		// No window armed (or the window is spent): nothing to reserve, so
+		// the request snapshot is not built and the server filter never runs.
 		return nil
 	}
 	req := capture.Request{
