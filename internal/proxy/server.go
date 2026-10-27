@@ -54,6 +54,7 @@ type Server struct {
 	usageObserver UsageObserver            // nil unless set via WithUsageObserver (pro accounting seam)
 	captureGate   captureGate              // server-level capture filter (WithCaptureFilter); fieldless in hardened builds
 	mu            sync.RWMutex             // guards semaphores
+	reloadMu      sync.Mutex               // serializes Reload / ApplyConfig (balancer swap)
 	semaphores    map[string]chan struct{} // per-backend concurrency limiter (nil entry = unlimited)
 	bufferedBytes atomic.Int64             // bytes currently held in proxy buffers
 }
@@ -297,9 +298,34 @@ func (s *Server) Balancer() *balancer.Balancer {
 	return s.balancer
 }
 
+// ApplyConfig is the programmatic counterpart of a SIGHUP reload for
+// embedders: it runs the same gate cmd/hikyaku runs before Reload — the
+// listen policy, with the embedder's options (an embedder serving a runtime
+// certificate passes config.WithExternalGatewayTLS, as it does at startup) —
+// and, only if that passes, swaps cfg in atomically with Reload. A rejected
+// cfg (nil, or failing the policy) returns the reason and leaves the live
+// config, router, balancer and semaphores exactly as they were. cfg must come
+// from config.Load or config.Parse, which validate its structure; the log
+// level is the embedder's to apply afterwards (logger.Apply), as on SIGHUP.
+// Concurrent calls, and calls concurrent with Reload, are serialized.
+func (s *Server) ApplyConfig(cfg *config.Config, opts ...config.ListenPolicyOption) error {
+	if cfg == nil {
+		return errors.New("apply config: nil config")
+	}
+	if err := cfg.ValidateListenPolicy(opts...); err != nil {
+		return err
+	}
+	s.Reload(cfg)
+	return nil
+}
+
 // Reload atomically swaps in a new config and router.
-// In-flight requests continue with the old config.
+// In-flight requests continue with the old config. Reloads are serialized
+// (the balancer swap is not atomic on its own), so a SIGHUP racing an
+// ApplyConfig cannot interleave.
 func (s *Server) Reload(cfg *config.Config) {
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
 	s.rtr.Store(router.New(cfg))
 	s.cfg.Store(cfg)
 	s.buildSemaphores(cfg)

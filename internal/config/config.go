@@ -146,7 +146,7 @@ func (s SystemPromptOp) IsZero() bool {
 // an operator rename Authorization → X-Original-Auth, then add a new
 // Authorization, in one block.
 //
-// Header names are case-insensitive (Go's http.Header normalises them).
+// Header names are case-insensitive (Go's http.Header normalizes them).
 // Add overwrites any existing value at that name. Remove drops the header
 // entirely. Rename copies the existing values to the new name and deletes
 // the original; if the destination already exists, it is replaced.
@@ -243,20 +243,36 @@ type Config struct {
 
 // ── Loader ────────────────────────────────────────────────────────────────────
 
+// Load reads path and parses it with Parse; errors name the file.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
+	return parse(raw, path)
+}
 
+// Parse runs Load's whole pipeline on YAML bytes that did not come from a
+// file: ${ENV_VAR} expansion, map→list normalization of backends/routes, port
+// expansion, defaults, validation and indexing. It is the seam for embedders
+// that receive a config over an API (the pro layer's config editor) and must
+// validate it exactly as a SIGHUP reload of the same bytes would. An empty
+// document is ErrEmptyDocument, as with Load.
+func Parse(raw []byte) (*Config, error) {
+	return parse(raw, "config")
+}
+
+// parse is Load and Parse: source names the input in parse errors (the file
+// path for Load, "config" for bytes).
+func parse(raw []byte, source string) (*Config, error) {
 	// Expand ${ENV_VAR} before parsing
 	expanded := expandEnvVars(string(raw))
 
 	// Normalize map-formatted backends/routes to list format.
 	// Allows: backends: {foo: {type: openai, ...}}  →  backends: [{id: foo, type: openai, ...}]
-	expanded, err = normalizeMapToList(expanded, "backends", "id")
+	expanded, err := normalizeMapToList(expanded, "backends", "id")
 	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+		return nil, fmt.Errorf("parse %s: %w", source, err)
 	}
 	expanded, err = normalizeMapToList(expanded, "routes", "virtual_model")
 	if err != nil {

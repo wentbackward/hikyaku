@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1166,6 +1167,84 @@ func TestLoad_NonMappingRootIsAnError(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if _, err := Load(writeTemp(t, content)); err == nil {
 				t.Fatalf("Load(%q) must fail", content)
+			}
+		})
+	}
+}
+
+// ── Parse (the in-memory half of Load, for embedders that receive YAML bytes
+// rather than a path — e.g. a config-editing API) ──────────────────────────
+
+func TestParse_MatchesLoadForTheSameBytes(t *testing.T) {
+	t.Setenv("HIKYAKU_TEST_PARSE_KEY", "from-env")
+	raw := `
+server:
+  api_key: "${HIKYAKU_TEST_PARSE_KEY}"
+  allow_plaintext: true
+backends:
+  openai-local:
+    type: openai
+    base_url: "http://localhost:8000/v1"
+routes:
+  m:
+    backend: openai-local
+    real_model: real-m
+    alias: [m-alias]
+`
+	fromFile, err := Load(writeTemp(t, raw))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	fromBytes, err := Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if fromBytes.Server.APIKey != "from-env" {
+		t.Fatalf("Parse must expand ${ENV} like Load: api_key = %q", fromBytes.Server.APIKey)
+	}
+	if _, ok := fromBytes.Backend("openai-local"); !ok {
+		t.Fatal("Parse must normalize map-format backends and index them")
+	}
+	if r, ok := fromBytes.Route("m-alias"); !ok || r.VirtualModel != "m" {
+		t.Fatal("Parse must normalize map-format routes and index aliases")
+	}
+	if !reflect.DeepEqual(fromFile, fromBytes) {
+		t.Fatalf("Parse and Load disagree for the same bytes:\n load=%+v\nparse=%+v", fromFile, fromBytes)
+	}
+}
+
+func TestParse_EmptyDocumentIsAnError(t *testing.T) {
+	for name, content := range map[string]string{
+		"empty":         "",
+		"whitespace":    "  \n\n   \n",
+		"comments only": "# nothing here\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse([]byte(content)); !errors.Is(err, ErrEmptyDocument) {
+				t.Fatalf("Parse(%q): err = %v, want ErrEmptyDocument", content, err)
+			}
+		})
+	}
+}
+
+func TestParse_RejectsWhatLoadRejects(t *testing.T) {
+	cases := map[string]struct{ raw, want string }{
+		"non-mapping root":         {"- a\n- b\n", ""},
+		"unparsable":               {"server: [not: a: mapping", "parse config"},
+		"route to unknown backend": {"backends:\n  - id: b\n    type: openai\n    base_url: \"http://localhost\"\nroutes:\n  - virtual_model: m\n    backend: nope\n", "nope"},
+		"backend without type":     {"backends:\n  - id: b\n    base_url: \"http://localhost\"\n", "type"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := Parse([]byte(tc.raw))
+			if err == nil {
+				t.Fatalf("Parse accepted %q: %+v", tc.raw, cfg)
+			}
+			if tc.want != "" && !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want it to mention %q", err, tc.want)
+			}
+			if _, lerr := Load(writeTemp(t, tc.raw)); lerr == nil {
+				t.Fatalf("Load accepted what Parse rejected (%v)", err)
 			}
 		})
 	}
