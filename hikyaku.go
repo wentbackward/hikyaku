@@ -32,12 +32,6 @@ import (
 	"github.com/wentbackward/hikyaku/internal/telemetry"
 )
 
-// Server.ApplyConfig (exported on the aliased type) is the write half of the
-// config seam: it runs the SIGHUP gate — Config.ValidateListenPolicy with the
-// ListenPolicyOptions the embedder uses at startup — and then the atomic swap
-// Server.Reload performs; a rejected config leaves the live one untouched.
-// Call ApplyLogLevel afterwards, as after a SIGHUP.
-//
 // Core types, exposed as aliases so external callers can name them without
 // importing internal/ (the alias identity means values flow through unchanged).
 type (
@@ -155,7 +149,14 @@ func LoadConfig(path string) (*Config, error) {
 // config file, and the verdict is the one a SIGHUP reload of those bytes would
 // give. The bytes are not kept; an embedder that wants the file to carry the
 // operator's text verbatim (comments included) stores the submitted bytes
-// itself. The write half is Server.ApplyConfig.
+// itself.
+//
+// The write half is Server.ApplyConfig (a method of the aliased Server type):
+// it runs the SIGHUP gate — Config.ValidateListenPolicy with the
+// ListenPolicyOptions the embedder uses at startup — and then the atomic swap
+// Server.Reload performs, the two serialized under one lock; a rejected config
+// leaves the live one untouched. Call ApplyLogLevel afterwards, as after a
+// SIGHUP.
 func ParseConfig(raw []byte) (*Config, error) {
 	return config.Parse(raw)
 }

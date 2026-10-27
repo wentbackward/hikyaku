@@ -307,15 +307,19 @@ func (s *Server) Balancer() *balancer.Balancer {
 // config, router, balancer and semaphores exactly as they were. cfg must come
 // from config.Load or config.Parse, which validate its structure; the log
 // level is the embedder's to apply afterwards (logger.Apply), as on SIGHUP.
-// Concurrent calls, and calls concurrent with Reload, are serialized.
+// Concurrent calls, and calls concurrent with Reload, are serialized: the
+// gate and the swap run under one lock, so two ApplyConfig calls can never
+// interleave between their verdicts and their swaps.
 func (s *Server) ApplyConfig(cfg *config.Config, opts ...config.ListenPolicyOption) error {
 	if cfg == nil {
 		return errors.New("apply config: nil config")
 	}
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
 	if err := cfg.ValidateListenPolicy(opts...); err != nil {
 		return err
 	}
-	s.Reload(cfg)
+	s.reload(cfg)
 	return nil
 }
 
@@ -326,6 +330,11 @@ func (s *Server) ApplyConfig(cfg *config.Config, opts ...config.ListenPolicyOpti
 func (s *Server) Reload(cfg *config.Config) {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
+	s.reload(cfg)
+}
+
+// reload is Reload for a caller holding reloadMu.
+func (s *Server) reload(cfg *config.Config) {
 	s.rtr.Store(router.New(cfg))
 	s.cfg.Store(cfg)
 	s.buildSemaphores(cfg)
