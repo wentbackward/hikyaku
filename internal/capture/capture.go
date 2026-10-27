@@ -2,7 +2,9 @@
 //
 // Disabled by default. A SIGUSR1 to the proxy process arms a bounded capture
 // window: the next N proxied requests are each written as one JSON file to
-// the configured output folder, then the window closes automatically.
+// the configured output folder, then the window closes automatically. An
+// embedder can also arm a window programmatically (ArmWith) with its own
+// count and a Filter that selects which requests the window records.
 //
 // The feature is never on unless explicitly enabled in config AND an output
 // folder is set — there is no default folder to guard against bodies landing
@@ -11,9 +13,11 @@ package capture
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -34,12 +38,46 @@ type Config struct {
 	MaxMessages  int
 }
 
-// Capture manages a bounded, SIGUSR1-armed capture window.
-// A nil *Capture is safe at every call site.
+// Request describes one proxied request to a Filter: the resolved route and
+// backend, the inbound method, path and headers, and the request context.
+// It never carries a body — a filter decides whether to capture, it does not
+// inspect content. Header is the live inbound header map and must be treated
+// as read-only. Context is the request's context, where an embedder's
+// middleware may have left values of its own (a principal, say) that only it
+// can read back.
+type Request struct {
+	Method       string
+	Path         string
+	VirtualModel string
+	RealModel    string
+	Backend      string
+	Protocol     string
+	Streaming    bool
+	Header       http.Header
+	Context      context.Context
+}
+
+// Filter decides whether a request is recorded by the window it belongs to.
+// It runs on the request path, so it must be cheap and must not block. A
+// request a Filter rejects is not captured and does not consume a slot.
+type Filter func(Request) bool
+
+// Capture manages a bounded capture window, armed by SIGUSR1 (Arm) or
+// programmatically (ArmWith). A nil *Capture is safe at every call site.
 type Capture struct {
 	outputFolder string
 	maxMessages  int32 // bounded at construction so atomic.Int32 operations are always safe
-	remaining    atomic.Int32
+	window       atomic.Pointer[window]
+}
+
+// window is one armed capture window: its size, the slots still open and
+// the filter (nil = every request) that selects what it records. Arming
+// swaps in a fresh window atomically, so a Reserve racing an Arm counts
+// against exactly one of them.
+type window struct {
+	total     int32
+	filter    Filter
+	remaining atomic.Int32
 }
 
 // MaxAllowedMessages is the upper bound for MaxMessages — both a sanity cap on
@@ -70,30 +108,94 @@ func (c *Capture) MaxMessages() int {
 	return int(c.maxMessages)
 }
 
-// Arm opens a capture window for the next MaxMessages requests. Calling Arm
-// again re-arms to the full window. Returns the window size.
+// Arm opens a capture window for the next MaxMessages requests, with no
+// filter — the SIGUSR1 behavior. Calling Arm again re-arms to the full
+// window (and drops any filter a previous ArmWith set). Returns the window
+// size.
 func (c *Capture) Arm() int {
+	return c.ArmWith(0, nil)
+}
+
+// ArmWith opens a capture window of n requests that match filter (nil =
+// every request). n <= 0 means the configured max_messages; n above
+// MaxAllowedMessages is clamped to it — a programmatic window is bounded by
+// the sanity cap, not by the configured size. Arming replaces any open
+// window. Returns the size of the window opened (0 on a nil handle).
+func (c *Capture) ArmWith(n int, filter Filter) int {
 	if c == nil {
 		return 0
 	}
-	c.remaining.Store(c.maxMessages)
-	return int(c.maxMessages)
+	if n <= 0 {
+		n = int(c.maxMessages)
+	}
+	if n > MaxAllowedMessages {
+		n = MaxAllowedMessages
+	}
+	w := &window{total: int32(n), filter: filter}
+	w.remaining.Store(w.total)
+	c.window.Store(w)
+	return n
 }
 
-// Reserve atomically claims one capture slot. Returns nil if the window is
-// closed (no remaining slots).
-func (c *Capture) Reserve() *Slot {
+// Disarm closes the open window, if any: nothing further is captured until
+// the next Arm or ArmWith.
+func (c *Capture) Disarm() {
+	if c == nil {
+		return
+	}
+	c.window.Store(nil)
+}
+
+// Remaining reports how many slots the open window still has (0 when no
+// window is open).
+func (c *Capture) Remaining() int {
+	if c == nil {
+		return 0
+	}
+	w := c.window.Load()
+	if w == nil {
+		return 0
+	}
+	if n := w.remaining.Load(); n > 0 {
+		return int(n)
+	}
+	return 0
+}
+
+// WindowSize reports the size of the open window (0 when none is open).
+func (c *Capture) WindowSize() int {
+	if c == nil {
+		return 0
+	}
+	w := c.window.Load()
+	if w == nil {
+		return 0
+	}
+	return int(w.total)
+}
+
+// Reserve atomically claims one capture slot for req. Returns nil if no
+// window is open, the window is exhausted, or the window's filter rejects
+// req — in which case no slot is consumed.
+func (c *Capture) Reserve(req Request) *Slot {
 	if c == nil {
 		return nil
 	}
+	w := c.window.Load()
+	if w == nil || w.remaining.Load() <= 0 {
+		return nil
+	}
+	if w.filter != nil && !w.filter(req) {
+		return nil
+	}
 	for {
-		n := c.remaining.Load()
+		n := w.remaining.Load()
 		if n <= 0 {
 			return nil
 		}
-		if c.remaining.CompareAndSwap(n, n-1) {
-			seq := int(c.maxMessages - n + 1)
-			return &Slot{folder: c.outputFolder, seq: seq, total: int(c.maxMessages)}
+		if w.remaining.CompareAndSwap(n, n-1) {
+			seq := int(w.total - n + 1)
+			return &Slot{folder: c.outputFolder, seq: seq, total: int(w.total)}
 		}
 	}
 }

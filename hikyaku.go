@@ -4,7 +4,17 @@
 // packages directly (Go forbids cross-module internal imports).
 //
 // It re-exports the minimal surface needed to construct and run a proxy, plus
-// the extension seams (TransportFactory) that pro implementations plug into.
+// the extension seams that pro implementations plug into:
+//
+//   - TransportFactory / WithTransportFactory — the outbound transport;
+//   - WithExternalGatewayTLS — a runtime (attested) inbound certificate;
+//   - UsageObserver / WithUsageObserver — per-request usage accounting;
+//   - CaptureFilter / WithCaptureFilter and the Capture handle — the
+//     message-capture seam: a server-level filter that gates every capture
+//     window, and programmatic arming of a bounded, filtered window on
+//     Server.Capture (inspect builds; compiled out in hardened, where the
+//     symbols remain as no-ops so an embedder builds in both).
+//
 // Everything here is a thin alias or pass-through to internal packages; the
 // behavior is identical to running cmd/hikyaku.
 package hikyaku
@@ -13,6 +23,7 @@ import (
 	"crypto/tls"
 	"net/http"
 
+	"github.com/wentbackward/hikyaku/internal/capture"
 	"github.com/wentbackward/hikyaku/internal/config"
 	"github.com/wentbackward/hikyaku/internal/journal"
 	"github.com/wentbackward/hikyaku/internal/logger"
@@ -47,6 +58,21 @@ type (
 	UsageObserver = proxy.UsageObserver
 	// EndReason classifies how a response ended (UsageEvent.EndReason).
 	EndReason = proxy.EndReason
+	// Capture is the message-capture handle Server.Capture returns: nil when
+	// capture is not configured (always nil in hardened builds). Its methods
+	// are nil-safe. Arm opens the configured window with no filter (what
+	// SIGUSR1 does); ArmWith(n, filter) opens a window of n requests (0 = the
+	// configured max_messages, clamped to MaxCaptureMessages) recording only
+	// those the filter admits; Disarm closes it; Remaining and WindowSize
+	// report the open window; OutputFolder is where files land.
+	Capture = capture.Capture
+	// CaptureRequest is what a CaptureFilter sees for one proxied request:
+	// method, path, resolved virtual/real model, backend, protocol, streaming,
+	// the inbound headers (read-only) and the request context — never a body.
+	CaptureRequest = capture.Request
+	// CaptureFilter decides whether a request is recorded; it runs on the
+	// request path and must be cheap. A rejected request consumes no slot.
+	CaptureFilter = capture.Filter
 )
 
 // UsageEvent.EndReason values. A streamed response's Status is 200 however it
@@ -58,6 +84,10 @@ const (
 	EndUpstreamError    = proxy.EndUpstreamError    // reading the upstream stream failed
 	EndStreamLoopAbort  = proxy.EndStreamLoopAbort  // stream loop detection ended it; see UsageEvent.LoopChannel
 )
+
+// MaxCaptureMessages is the largest capture window ArmWith opens (counts
+// above it are clamped); embedders validate operator input against it.
+const MaxCaptureMessages = capture.MaxAllowedMessages
 
 // WithExternalGatewayTLS asserts the embedder serves the gateway listener with a
 // TLS certificate it supplies at runtime — e.g. an attested RA-TLS cert produced
@@ -94,6 +124,16 @@ func WithTransportFactory(f TransportFactory) Option {
 // set in middleware). A nil observer leaves core's behavior unchanged.
 func WithUsageObserver(o UsageObserver) Option {
 	return proxy.WithUsageObserver(o)
+}
+
+// WithCaptureFilter installs a server-level capture filter that gates every
+// capture window — armed by SIGUSR1 or by Capture.ArmWith — in addition to
+// the window's own filter: a request it rejects is neither recorded nor
+// counted. nil leaves capture unchanged. In hardened builds the option is a
+// no-op (capture is compiled out). Pair it with Server.Capture().ArmWith to
+// let an operator arm "the next N requests for route R by principal P".
+func WithCaptureFilter(f CaptureFilter) Option {
+	return proxy.WithCaptureFilter(f)
 }
 
 // LoadConfig reads and validates a config.yaml.

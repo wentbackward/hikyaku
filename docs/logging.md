@@ -170,6 +170,15 @@ One file per request: `{YYYYMMDDTHHMMSS.sssZ}-{request_id}.json`, mode `0600`.
 - Per-response capture is capped at 5 MB; over-cap bodies set `response.truncated: true`.
 - `Authorization`, `x-api-key`, `Cookie`, `Set-Cookie`, and `Proxy-Authorization` headers are redacted.
 
+### Programmatic arming and filters (embedders)
+
+SIGUSR1 is the only trigger in `cmd/hikyaku`. A program that embeds the proxy through the root `hikyaku` facade (the pro layer) has two more:
+
+- `Server.Capture()` returns the `*hikyaku.Capture` handle (nil when capture is not configured; every method is nil-safe). `ArmWith(n, filter)` opens a window of `n` requests (`0` = the configured `max_messages`; clamped to `hikyaku.MaxCaptureMessages`, 10000) that records only the requests `filter` admits — a `hikyaku.CaptureFilter`, `func(hikyaku.CaptureRequest) bool`, which sees the method, path, resolved virtual and real model, backend, protocol, streaming flag, the inbound headers (read-only) and the request context, never a body. A rejected request is not recorded and does not consume a slot. `Disarm()` closes the window; `Remaining()` and `WindowSize()` report it. `Arm()` (what SIGUSR1 calls) is `ArmWith(0, nil)`: the configured window, every request.
+- `hikyaku.WithCaptureFilter(f)` installs a server-level filter that gates **every** window, SIGUSR1's included, in addition to the window's own filter — the embedder's policy ("never capture route X").
+
+Both run on the request path and must be cheap. In the hardened build (`-tags hardened`) the whole feature is compiled out: `Capture()` is always nil, `WithCaptureFilter` is a no-op and a filter never runs; the symbols remain so one embedder source builds both variants.
+
 ### Notes
 
 - Errors (semaphore rejection, upstream failures) also write a capture file with `response.error` set — the slot isn't wasted on failed requests.

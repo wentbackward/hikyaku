@@ -52,6 +52,7 @@ type Server struct {
 
 	transport     http.RoundTripper        // shared outbound transport (default *http.Transport; override via WithTransportFactory)
 	usageObserver UsageObserver            // nil unless set via WithUsageObserver (pro accounting seam)
+	captureGate   captureGate              // server-level capture filter (WithCaptureFilter); fieldless in hardened builds
 	mu            sync.RWMutex             // guards semaphores
 	semaphores    map[string]chan struct{} // per-backend concurrency limiter (nil entry = unlimited)
 	bufferedBytes atomic.Int64             // bytes currently held in proxy buffers
@@ -877,7 +878,21 @@ func (s *Server) startCapture(r *http.Request, rid string, t0 time.Time,
 	if c == nil {
 		return nil
 	}
-	slot := c.Reserve()
+	req := capture.Request{
+		Method:       r.Method,
+		Path:         r.URL.Path,
+		VirtualModel: virtualModel,
+		RealModel:    realModel,
+		Backend:      backendID,
+		Protocol:     protocol,
+		Streaming:    streaming,
+		Header:       r.Header,
+		Context:      r.Context(),
+	}
+	if !s.captureGate.allowed(req) {
+		return nil
+	}
+	slot := c.Reserve(req)
 	if slot == nil {
 		return nil
 	}

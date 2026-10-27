@@ -70,7 +70,14 @@ func TestNilSafe(t *testing.T) {
 	if c.Arm() != 0 {
 		t.Error("nil.Arm() should return 0")
 	}
-	if c.Reserve() != nil {
+	if c.ArmWith(3, nil) != 0 {
+		t.Error("nil.ArmWith() should return 0")
+	}
+	c.Disarm()
+	if c.Remaining() != 0 || c.WindowSize() != 0 {
+		t.Error("nil.Remaining()/WindowSize() should be 0")
+	}
+	if c.Reserve(Request{}) != nil {
 		t.Error("nil.Reserve() should return nil")
 	}
 
@@ -87,17 +94,17 @@ func TestArmAndReserve_RespectsMax(t *testing.T) {
 	}
 
 	// Before Arm, window is closed.
-	if s := c.Reserve(); s != nil {
+	if s := c.Reserve(Request{}); s != nil {
 		t.Error("Reserve should return nil before Arm")
 	}
 
 	c.Arm()
 	for i := 0; i < 3; i++ {
-		if s := c.Reserve(); s == nil {
+		if s := c.Reserve(Request{}); s == nil {
 			t.Errorf("reserve %d should succeed", i+1)
 		}
 	}
-	if s := c.Reserve(); s != nil {
+	if s := c.Reserve(Request{}); s != nil {
 		t.Error("4th reserve should fail — window is exhausted")
 	}
 }
@@ -105,13 +112,13 @@ func TestArmAndReserve_RespectsMax(t *testing.T) {
 func TestArm_RearmsAfterExhaustion(t *testing.T) {
 	c, _ := New(Config{Enabled: true, OutputFolder: t.TempDir(), MaxMessages: 2})
 	c.Arm()
-	c.Reserve()
-	c.Reserve()
-	if c.Reserve() != nil {
+	c.Reserve(Request{})
+	c.Reserve(Request{})
+	if c.Reserve(Request{}) != nil {
 		t.Fatal("should be exhausted")
 	}
 	c.Arm()
-	if c.Reserve() == nil {
+	if c.Reserve(Request{}) == nil {
 		t.Error("should be re-armed after second Arm")
 	}
 }
@@ -127,7 +134,7 @@ func TestReserve_ConcurrentSafe(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if c.Reserve() != nil {
+			if c.Reserve(Request{}) != nil {
 				mu.Lock()
 				reserved++
 				mu.Unlock()
@@ -144,7 +151,7 @@ func TestWrite_FileContents(t *testing.T) {
 	dir := t.TempDir()
 	c, _ := New(Config{Enabled: true, OutputFolder: dir, MaxMessages: 1})
 	c.Arm()
-	slot := c.Reserve()
+	slot := c.Reserve(Request{})
 	if slot == nil {
 		t.Fatal("expected slot")
 	}
@@ -213,7 +220,7 @@ func TestWrite_FilePermissions(t *testing.T) {
 	dir := t.TempDir()
 	c, _ := New(Config{Enabled: true, OutputFolder: dir, MaxMessages: 1})
 	c.Arm()
-	slot := c.Reserve()
+	slot := c.Reserve(Request{})
 
 	p := Payload{RequestID: "x", Timestamp: time.Now().UTC().Format(time.RFC3339Nano)}
 	if err := slot.Write(p); err != nil {
@@ -257,5 +264,130 @@ func TestCappedBuffer(t *testing.T) {
 	}
 	if b.String() != "hello worl" {
 		t.Errorf("truncated buffer mutated: got %q", b.String())
+	}
+}
+
+// ── Programmatic arming and filters (the embedder seam) ──────────────────────
+
+func TestArmWith_FilterSkipsNonMatchingWithoutConsuming(t *testing.T) {
+	c, _ := New(Config{Enabled: true, OutputFolder: t.TempDir(), MaxMessages: 2})
+	onlyRouteA := func(r Request) bool { return r.VirtualModel == "a" }
+	if n := c.ArmWith(2, onlyRouteA); n != 2 {
+		t.Fatalf("ArmWith = %d, want 2", n)
+	}
+	// Non-matching requests never consume a slot, however many arrive.
+	for i := 0; i < 10; i++ {
+		if s := c.Reserve(Request{VirtualModel: "b"}); s != nil {
+			t.Fatalf("request %d for route b must not be captured", i)
+		}
+	}
+	if c.Remaining() != 2 {
+		t.Fatalf("Remaining = %d after non-matching traffic, want 2", c.Remaining())
+	}
+	for i := 0; i < 2; i++ {
+		if c.Reserve(Request{VirtualModel: "a"}) == nil {
+			t.Fatalf("matching request %d must be captured", i)
+		}
+	}
+	if c.Reserve(Request{VirtualModel: "a"}) != nil {
+		t.Fatal("window must close after the count is reached")
+	}
+	if c.Remaining() != 0 {
+		t.Fatalf("Remaining = %d, want 0", c.Remaining())
+	}
+}
+
+func TestArmWith_CountDefaultsAndClamps(t *testing.T) {
+	c, _ := New(Config{Enabled: true, OutputFolder: t.TempDir(), MaxMessages: 4})
+	if n := c.ArmWith(0, nil); n != 4 {
+		t.Errorf("ArmWith(0) = %d, want the configured window 4", n)
+	}
+	if n := c.ArmWith(-7, nil); n != 4 {
+		t.Errorf("ArmWith(-7) = %d, want the configured window 4", n)
+	}
+	if n := c.ArmWith(9, nil); n != 9 || c.WindowSize() != 9 || c.Remaining() != 9 {
+		t.Errorf("ArmWith(9) = %d (window %d, remaining %d), want 9: a programmatic window is not bound by max_messages", n, c.WindowSize(), c.Remaining())
+	}
+	if n := c.ArmWith(MaxAllowedMessages+1, nil); n != MaxAllowedMessages {
+		t.Errorf("ArmWith(max+1) = %d, want the clamp %d", n, MaxAllowedMessages)
+	}
+}
+
+func TestArm_IsTheConfiguredWindowWithoutFilter(t *testing.T) {
+	c, _ := New(Config{Enabled: true, OutputFolder: t.TempDir(), MaxMessages: 2})
+	c.ArmWith(5, func(Request) bool { return false })
+	// SIGUSR1 re-arms the configured window and drops any filter: every
+	// request is captured again, exactly as before the seam existed.
+	if n := c.Arm(); n != 2 {
+		t.Fatalf("Arm = %d, want 2", n)
+	}
+	if c.Reserve(Request{VirtualModel: "anything"}) == nil {
+		t.Fatal("Arm must capture everything (no filter)")
+	}
+}
+
+func TestDisarm_ClosesWindow(t *testing.T) {
+	c, _ := New(Config{Enabled: true, OutputFolder: t.TempDir(), MaxMessages: 5})
+	c.Arm()
+	c.Disarm()
+	if c.Reserve(Request{}) != nil {
+		t.Fatal("Reserve must fail after Disarm")
+	}
+	if c.Remaining() != 0 || c.WindowSize() != 0 {
+		t.Fatalf("Remaining/WindowSize = %d/%d after Disarm, want 0/0", c.Remaining(), c.WindowSize())
+	}
+	c.Arm()
+	if c.Reserve(Request{}) == nil {
+		t.Fatal("re-arm after Disarm must work")
+	}
+}
+
+func TestRemaining_ReportsTheOpenWindow(t *testing.T) {
+	c, _ := New(Config{Enabled: true, OutputFolder: t.TempDir(), MaxMessages: 3})
+	if c.Remaining() != 0 || c.WindowSize() != 0 {
+		t.Fatal("no window before Arm")
+	}
+	c.Arm()
+	c.Reserve(Request{})
+	if c.Remaining() != 2 || c.WindowSize() != 3 {
+		t.Fatalf("Remaining/WindowSize = %d/%d, want 2/3", c.Remaining(), c.WindowSize())
+	}
+}
+
+func TestSlot_SequenceCountsWithinTheArmedWindow(t *testing.T) {
+	c, _ := New(Config{Enabled: true, OutputFolder: t.TempDir(), MaxMessages: 2})
+	c.ArmWith(3, nil)
+	for want := 1; want <= 3; want++ {
+		s := c.Reserve(Request{})
+		if s == nil || s.seq != want || s.total != 3 {
+			t.Fatalf("slot %d = %+v, want seq %d of 3", want, s, want)
+		}
+	}
+}
+
+func TestReserve_FilterConcurrentSafe(t *testing.T) {
+	c, _ := New(Config{Enabled: true, OutputFolder: t.TempDir(), MaxMessages: 1})
+	c.ArmWith(50, func(r Request) bool { return r.Backend == "yes" })
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	reserved := 0
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			b := "no"
+			if i%2 == 0 {
+				b = "yes"
+			}
+			if c.Reserve(Request{Backend: b}) != nil {
+				mu.Lock()
+				reserved++
+				mu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+	if reserved != 50 {
+		t.Errorf("concurrent filtered reserve: got %d slots, want exactly 50", reserved)
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wentbackward/hikyaku/internal/capture"
 	"github.com/wentbackward/hikyaku/internal/config"
 	"github.com/wentbackward/hikyaku/internal/telemetry"
 )
@@ -29,16 +30,16 @@ type capturedRequest struct {
 
 // newTestServer creates a Server with a fake backend that captures the
 // forwarded request and returns a canned response based on the endpoint hit.
-func newTestServer(t *testing.T, capture *capturedRequest) (srv *Server, backend *httptest.Server) {
+func newTestServer(t *testing.T, captured *capturedRequest, opts ...Option) (srv *Server, backend *httptest.Server) {
 	t.Helper()
 
 	backend = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		var body map[string]interface{}
 		json.Unmarshal(raw, &body)
-		if capture != nil {
-			capture.Path = r.URL.Path
-			capture.Body = body
+		if captured != nil {
+			captured.Path = r.URL.Path
+			captured.Body = body
 		}
 
 		isStreaming, _ := body["stream"].(bool)
@@ -124,7 +125,7 @@ func newTestServer(t *testing.T, capture *capturedRequest) (srv *Server, backend
 	}
 
 	metrics, _, _ := telemetry.Init()
-	s := New("test", "inspect", cfg, metrics, nil)
+	s := New("test", "inspect", cfg, metrics, nil, opts...)
 
 	return s, backend
 }
@@ -1475,5 +1476,118 @@ func TestCheckEmptyMessages_Integration_AllowsClean(t *testing.T) {
 	msgs := capReq.Body["messages"].([]interface{})
 	if len(msgs) != 3 {
 		t.Errorf("expected 3 messages (none dropped), got %d", len(msgs))
+	}
+}
+
+// ── Capture filters (the embedder seam) ──────────────────────────────────────
+
+type captureCtxKey struct{}
+
+func captureChat(t *testing.T, s *Server, model string, ctx context.Context) {
+	t.Helper()
+	body, _ := json.Marshal(map[string]interface{}{
+		"model":    model,
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+	})
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Embedder", "seen")
+	if ctx != nil {
+		req = req.WithContext(ctx)
+	}
+	rec := httptest.NewRecorder()
+	s.handleProxy(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d", rec.Code)
+	}
+}
+
+func enableCapture(t *testing.T, s *Server, maxMessages int) string {
+	t.Helper()
+	dir := t.TempDir()
+	cfg := s.Config()
+	cfg.SigMessageCapture = config.SigMessageCaptureConfig{Enabled: true, OutputFolder: dir, MaxMessages: maxMessages}
+	s.Reload(cfg)
+	if s.Capture() == nil {
+		t.Fatal("capture should be enabled after reload")
+	}
+	return dir
+}
+
+// A server-level filter (WithCaptureFilter) gates every window, including one
+// armed by SIGUSR1 (Arm): requests it rejects are neither written nor counted.
+func TestCapture_ServerFilterGatesEveryWindow(t *testing.T) {
+	s, backend := newTestServer(t, nil, WithCaptureFilter(func(r capture.Request) bool {
+		return r.VirtualModel == "never-routed"
+	}))
+	defer backend.Close()
+	dir := enableCapture(t, s, 2)
+	s.Capture().Arm()
+	for i := 0; i < 3; i++ {
+		captureChat(t, s, "test-model", nil)
+	}
+	if files := listCaptureFiles(t, dir); len(files) != 0 {
+		t.Fatalf("server filter rejected every request, yet %d files were written", len(files))
+	}
+	if s.Capture().Remaining() != 2 {
+		t.Fatalf("rejected requests consumed slots: remaining %d, want 2", s.Capture().Remaining())
+	}
+}
+
+// A window armed programmatically with a filter sees the resolved route,
+// backend, path, method, the inbound headers and the request context (where
+// an embedder's middleware leaves the principal), and captures only matches.
+func TestCapture_ArmWithFilterSeesRouteBackendPathAndContext(t *testing.T) {
+	s, backend := newTestServer(t, nil)
+	defer backend.Close()
+	dir := enableCapture(t, s, 1)
+
+	var seen []capture.Request
+	var mu sync.Mutex
+	n := s.Capture().ArmWith(5, func(r capture.Request) bool {
+		mu.Lock()
+		seen = append(seen, r)
+		mu.Unlock()
+		principal, _ := r.Context.Value(captureCtxKey{}).(string)
+		return principal == "alice"
+	})
+	if n != 5 {
+		t.Fatalf("ArmWith = %d, want 5 (not bound by max_messages=1)", n)
+	}
+	captureChat(t, s, "test-model", context.WithValue(context.Background(), captureCtxKey{}, "bob"))
+	captureChat(t, s, "test-model", context.WithValue(context.Background(), captureCtxKey{}, "alice"))
+
+	files := listCaptureFiles(t, dir)
+	if len(files) != 1 {
+		t.Fatalf("expected exactly the matching request captured, got %d files", len(files))
+	}
+	if s.Capture().Remaining() != 4 {
+		t.Fatalf("remaining = %d, want 4", s.Capture().Remaining())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 {
+		t.Fatalf("filter ran %d times, want 2", len(seen))
+	}
+	r := seen[0]
+	if r.Method != "POST" || r.Path != "/v1/chat/completions" || r.VirtualModel != "test-model" ||
+		r.RealModel == "" || r.Backend != s.Config().Backends[0].ID || r.Protocol == "" {
+		t.Fatalf("filter saw %+v", r)
+	}
+	if r.Header.Get("X-Embedder") != "seen" {
+		t.Fatalf("filter must see the inbound headers, got %v", r.Header)
+	}
+}
+
+// A nil filter is "capture everything": the seam changes nothing for a
+// server that does not set it.
+func TestCapture_NilFilterCapturesEverything(t *testing.T) {
+	s, backend := newTestServer(t, nil, WithCaptureFilter(nil))
+	defer backend.Close()
+	dir := enableCapture(t, s, 1)
+	s.Capture().ArmWith(1, nil)
+	captureChat(t, s, "test-model", nil)
+	if files := listCaptureFiles(t, dir); len(files) != 1 {
+		t.Fatalf("got %d files, want 1", len(files))
 	}
 }
