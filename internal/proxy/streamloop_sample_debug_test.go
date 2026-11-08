@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 	"unicode/utf8"
 
 	"github.com/wentbackward/hikyaku/internal/config"
@@ -50,14 +49,11 @@ func sampleFiles(t *testing.T, dir string) []string {
 	return m
 }
 
-func waitForSamples(t *testing.T, dir string, n int) []string {
+// waitSamples waits for the sampler's in-flight writes.
+func waitSamples(t *testing.T, srv *Server) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if f := sampleFiles(t, dir); len(f) >= n || time.Now().After(deadline) {
-			return f
-		}
-		time.Sleep(5 * time.Millisecond)
+	if ls := srv.loopSampler.Load(); ls != nil {
+		ls.pending.Wait()
 	}
 }
 
@@ -74,10 +70,11 @@ func TestStreamLoopSamples_WrittenAndCapped(t *testing.T) {
 	logs := captureLog(t)
 	dir := filepath.Join(t.TempDir(), "samples")
 	up := shadowLoopStream(t)
-	_, ps, _ := newLoopProxy(t, "openai", up.srv.URL, samplesDefenders(dir, 1))
+	srv, ps, _ := newLoopProxy(t, "openai", up.srv.URL, samplesDefenders(dir, 1))
 
 	chat(t, ps.URL)
-	files := waitForSamples(t, dir, 1)
+	waitSamples(t, srv)
+	files := sampleFiles(t, dir)
 	if len(files) != 1 {
 		t.Fatalf("samples = %d, want 1", len(files))
 	}
@@ -103,7 +100,7 @@ func TestStreamLoopSamples_WrittenAndCapped(t *testing.T) {
 
 	// The cap holds: a second trip writes nothing.
 	chat(t, ps.URL)
-	time.Sleep(50 * time.Millisecond)
+	waitSamples(t, srv)
 	if n := len(sampleFiles(t, dir)); n != 1 {
 		t.Errorf("samples after cap = %d, want 1", n)
 	}
@@ -116,9 +113,9 @@ func TestStreamLoopSamples_ExistingFilesCountTowardCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	up := shadowLoopStream(t)
-	_, ps, _ := newLoopProxy(t, "openai", up.srv.URL, samplesDefenders(dir, 1))
+	srv, ps, _ := newLoopProxy(t, "openai", up.srv.URL, samplesDefenders(dir, 1))
 	chat(t, ps.URL)
-	time.Sleep(50 * time.Millisecond)
+	waitSamples(t, srv)
 	if n := len(sampleFiles(t, dir)); n != 1 {
 		t.Errorf("samples = %d, want only the earlier file", n)
 	}
@@ -129,5 +126,48 @@ func TestStreamLoopSamples_NoFolderNoSampler(t *testing.T) {
 	s, err := newLoopSampler(config.StreamLoopSamples{Folder: "", MaxSamples: 100})
 	if s != nil || err != nil {
 		t.Errorf("sampler without folder = %v, %v", s, err)
+	}
+}
+
+// A failed write gives its slot back: max_samples counts samples that exist.
+func TestStreamLoopSamples_FailedWriteDoesNotCount(t *testing.T) {
+	_ = captureLog(t)
+	dir := filepath.Join(t.TempDir(), "samples")
+	s, err := newLoopSampler(config.StreamLoopSamples{Folder: dir, MaxSamples: 1})
+	if err != nil || s == nil {
+		t.Fatalf("sampler: %v %v", s, err)
+	}
+	g := &streamLoopGuard{rid: "r1", route: "coder", backendID: "be"}
+	trip := &loopTrip{channel: loopReasoning, mode: "shadow", trigger: "threshold", window: 2}
+
+	// Make the write fail: the folder path is now a regular file.
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.save(g, trip, []byte("window"), 2000)
+	s.pending.Wait()
+	if n := s.written.Load(); n != 0 {
+		t.Fatalf("failed write still counted: written=%d", n)
+	}
+
+	// Restore the folder: the one allowed sample can still be written.
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s.save(g, trip, []byte("window"), 2000)
+	s.pending.Wait()
+	if n := len(sampleFiles(t, dir)); n != 1 {
+		t.Fatalf("samples after a failed write = %d, want 1", n)
+	}
+	s.save(g, trip, []byte("window"), 2000)
+	s.pending.Wait()
+	if n := len(sampleFiles(t, dir)); n != 1 {
+		t.Errorf("cap not enforced after recovery: %d samples", n)
 	}
 }

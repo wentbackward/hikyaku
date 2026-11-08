@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,7 +31,8 @@ const loopSamplePrefix = "streamloop-"
 type loopSampler struct {
 	folder  string
 	max     int64
-	written atomic.Int64
+	written atomic.Int64   // samples in the folder plus writes in flight
+	pending sync.WaitGroup // writes in flight (tests wait on it)
 }
 
 // newLoopSampler returns nil when samples are not configured.
@@ -80,7 +82,10 @@ func (s *loopSampler) save(g *streamLoopGuard, t *loopTrip, window []byte, windo
 	if s == nil {
 		return
 	}
+	// Reserve a slot; a write that fails gives it back, so the cap counts
+	// samples that exist, not attempts.
 	if s.written.Add(1) > s.max {
+		s.written.Add(-1)
 		return
 	}
 	now := time.Now().UTC()
@@ -92,12 +97,15 @@ func (s *loopSampler) save(g *streamLoopGuard, t *loopTrip, window []byte, windo
 	}
 	name := fmt.Sprintf("%s%s-%s-%s-c%d.json", loopSamplePrefix, now.Format("20060102T150405.000000000Z"), g.rid, rec.Channel, t.choice)
 	path := filepath.Join(s.folder, name)
+	s.pending.Add(1)
 	go func() {
+		defer s.pending.Done()
 		data, err := json.MarshalIndent(rec, "", "  ")
 		if err == nil {
 			err = writeNewFile(path, data)
 		}
 		if err != nil {
+			s.written.Add(-1)
 			log.Printf("[stream_loop] sample write failed for %s: %v", rec.RequestID, err)
 		}
 	}()

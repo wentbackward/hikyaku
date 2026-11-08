@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // The hardened build has no sample writer: with samples.folder configured, a
@@ -39,7 +38,7 @@ func TestStreamLoopSamples_CompiledOutInHardened(t *testing.T) {
 	if n := mr.trips(t, map[string]string{"mode": "shadow"}); n != 1 {
 		t.Fatalf("trips = %d, want 1 (detection itself works in hardened)", n)
 	}
-	time.Sleep(50 * time.Millisecond)
+	// No wait is needed: the hardened build has no background writer at all.
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Errorf("hardened build created or wrote the samples folder (stat err %v)", err)
 	}
