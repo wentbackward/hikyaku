@@ -63,7 +63,7 @@ check: lint test build
 # assertion that tripping-window samples are compiled out of hardened.
 test-hardened:
 	go test -tags hardened -count=1 . ./internal/config/ ./internal/balancer/ ./internal/sectls/ ./cmd/hikyaku/
-	go test -tags hardened -race -count=1 -run 'StreamLoop|IdleTimeoutBody' ./internal/proxy/
+	go test -tags hardened -race -count=1 ./internal/proxy/
 
 # Same as `check` but for the hardened build variant.
 check-hardened: lint-hardened test-hardened
