@@ -40,14 +40,15 @@ func requestID() string {
 
 // Server handles all proxy traffic.
 type Server struct {
-	buildMode string
-	version   string
-	cfg       atomic.Pointer[config.Config]
-	rtr       atomic.Pointer[router.Router]
-	metrics   *telemetry.Metrics
-	journal   *journal.Journal                // nil if journal disabled
-	capture   atomic.Pointer[capture.Capture] // nil value = capture disabled; rebuilt on Reload
-	balancer  *balancer.Balancer              // nil if no groups configured
+	buildMode   string
+	version     string
+	cfg         atomic.Pointer[config.Config]
+	rtr         atomic.Pointer[router.Router]
+	metrics     *telemetry.Metrics
+	journal     *journal.Journal                // nil if journal disabled
+	capture     atomic.Pointer[capture.Capture] // nil value = capture disabled; rebuilt on Reload
+	balancer    *balancer.Balancer              // nil if no groups configured
+	loopSampler atomic.Pointer[loopSampler]     // nil = no stream-loop samples (always nil in hardened); rebuilt on Reload
 
 	transport     http.RoundTripper        // shared outbound transport (default *http.Transport; override via WithTransportFactory)
 	usageObserver UsageObserver            // nil unless set via WithUsageObserver (pro accounting seam)
@@ -169,6 +170,7 @@ func New(version, buildMode string, cfg *config.Config, metrics *telemetry.Metri
 	s.rtr.Store(router.New(cfg))
 	s.buildSemaphores(cfg)
 	s.applyCaptureConfig(cfg)
+	s.applyLoopSamplerConfig(cfg)
 	logConfigDeprecations(cfg)
 	if len(cfg.Groups) > 0 {
 		s.balancer = balancer.New(cfg)
@@ -201,6 +203,26 @@ func (s *Server) applyCaptureConfig(cfg *config.Config) {
 	}
 }
 
+// applyLoopSamplerConfig builds (or rebuilds) the stream-loop sample writer.
+// Like capture, a failure disables the debug feature instead of failing the
+// server.
+func (s *Server) applyLoopSamplerConfig(cfg *config.Config) {
+	sc := cfg.StreamLoopSamples()
+	ls, err := newLoopSampler(sc)
+	if err != nil {
+		log.Printf("[stream_loop] samples disabled: %v", err)
+		ls = nil
+	}
+	s.loopSampler.Store(ls)
+	switch {
+	case sc.Folder == "":
+	case !loopSamplesCompiledIn:
+		log.Printf("[stream_loop] samples.folder is set but window samples are compiled out of this build; nothing is written")
+	case ls != nil:
+		log.Printf("[stream_loop] tripping-window samples: folder=%s max_samples=%d", sc.Folder, sc.MaxSamples)
+	}
+}
+
 // logConfigDeprecations logs each deprecation notice the loader recorded, so
 // an operator sees it once on start and once per reload.
 func logConfigDeprecations(cfg *config.Config) {
@@ -227,6 +249,7 @@ func (s *Server) Reload(cfg *config.Config) {
 	s.cfg.Store(cfg)
 	s.buildSemaphores(cfg)
 	s.applyCaptureConfig(cfg)
+	s.applyLoopSamplerConfig(cfg)
 	logConfigDeprecations(cfg)
 
 	// Swap balancer on reload
@@ -475,6 +498,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	var backend *config.Backend
 	var lbGroup, lbAffKey string // affinity group/key for pin invalidation on failure
 	var realModel string
+	var loopRoute *streamLoopRoute // stream loop detection for this request; nil when not streaming
 
 	cfg := s.cfg.Load()
 	rtr := s.rtr.Load()
@@ -511,10 +535,20 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 		}
 		backend = b
 		realModel = modelName
+		if isStreaming {
+			loopRoute = &streamLoopRoute{cfg: cfg.GetStreamLoopDetection(nil), route: unroutedLoopRoute}
+		}
 		log.Printf("[proxy] no route for %q, passing through to %s (from=%s ua=%s)",
 			modelName, b.ID, r.RemoteAddr, r.UserAgent())
 	} else {
 		realModel = res.RealModel
+		if isStreaming {
+			label := unroutedLoopRoute
+			if res.Route != nil {
+				label = res.Route.VirtualModel // canonical name, not an alias
+			}
+			loopRoute = &streamLoopRoute{cfg: cfg.GetStreamLoopDetection(res.Route), route: label}
+		}
 
 		// ── Request defenders (pre-routing) ────────────────────────────────
 		if short, status, resp, defHeader := checkDefenders(cfg, res.Route, body); short {
@@ -732,7 +766,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	rp := &httputil.ReverseProxy{
 		Transport:      s.transport,
 		Director:       director(targetURL, backend, newBody, opts.pathOverride, routeHeaders(res)),
-		ModifyResponse: s.modifyResponse(rid, backendID, modelName, realModel, r.URL.Path, backend.Type, backend.TimeoutSeconds, isStreaming, t0, metricsCtx, r.Context(), capCtx, lbGroup, lbAffKey, bytesHeld), //nolint:bodyclose // ReverseProxy owns the response body; ModifyResponse wraps or reads-and-restores it, and the framework closes it client-side.
+		ModifyResponse: s.modifyResponse(rid, backendID, modelName, realModel, r.URL.Path, backend.Type, backend.TimeoutSeconds, isStreaming, t0, metricsCtx, r.Context(), capCtx, lbGroup, lbAffKey, bytesHeld, loopRoute), //nolint:bodyclose // ReverseProxy owns the response body; ModifyResponse wraps or reads-and-restores it, and the framework closes it client-side.
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			s.bufferedBytes.Add(-bytesHeld)
 			s.metrics.RequestBodyBytesBuffered.Record(metricsCtx, float64(s.bufferedBytes.Load()))
@@ -1105,7 +1139,7 @@ func logMessageContent(rid string, body map[string]interface{}) {
 
 // modifyResponse returns a ModifyResponse function that instruments the
 // upstream response with telemetry.
-func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, backendType string, timeoutSec int, streaming bool, t0 time.Time, metricsCtx, reqCtx context.Context, capCtx *captureCtx, lbGroup, lbAffKey string, bytesHeld int64) func(*http.Response) error {
+func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, backendType string, timeoutSec int, streaming bool, t0 time.Time, metricsCtx, reqCtx context.Context, capCtx *captureCtx, lbGroup, lbAffKey string, bytesHeld int64, loopRoute *streamLoopRoute) func(*http.Response) error {
 	return func(resp *http.Response) error {
 		statusStr := fmt.Sprintf("%d", resp.StatusCode)
 
@@ -1119,16 +1153,30 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 			// Pick the parser that matches the upstream protocol. SSE parsing
 			// for OpenAI/Anthropic (both use text/event-stream); minimal
 			// first-byte-TTFT for Ollama (NDJSON, not parsed).
+			//
+			// The stream loop guard (nil when detection is off for the route)
+			// rides on the parser, which already decodes every event.
+			guard := newStreamLoopGuard(loopRoute, rid, backendID, s.metrics, metricsCtx, s.loopSampler.Load())
 			var parser streamParser
 			var ssep *sseParser
 			if backendType == "ollama" {
-				parser = newOllamaParser(backendID, realModel, t0, s.metrics, metricsCtx)
+				op := newOllamaParser(backendID, realModel, t0, s.metrics, metricsCtx)
+				op.loop = guard
+				parser = op
 			} else {
 				ssep = newSSEParser(backendID, realModel, backendType, t0, s.metrics, metricsCtx)
 				if logger.Get() >= logger.LevelContent {
 					ssep.captureContent = true
 				}
+				ssep.loop = guard
+				ssep.rid = rid
 				parser = ssep
+			}
+			if guard.canAbort() {
+				// An abort replaces the rest of the body with an error tail,
+				// so an upstream Content-Length would no longer hold.
+				resp.Header.Del("Content-Length")
+				resp.ContentLength = -1
 			}
 			var sseBuf *capture.CappedBuffer
 			var teeWriter io.Writer

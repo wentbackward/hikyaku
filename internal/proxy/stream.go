@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -20,8 +21,13 @@ const maxContentCapture = 32768 // 32KB cap for L4 response capture
 // once when the stream closes and should emit per-request summary metrics.
 // Every parser is also a usageSource so the stream-close path can fill the
 // UsageEvent without knowing which lane it is on.
+//
+// feed normally returns (len(data), nil): forward everything. When the stream
+// loop guard aborts the stream, feed returns how many bytes of data to forward
+// (up to and including the line that tripped) and the protocol-native tail to
+// send in place of the rest; interceptedBody then closes the upstream.
 type streamParser interface {
-	feed(data []byte)
+	feed(data []byte) (forward int, abortTail []byte)
 	recordFinal()
 	usageSource
 }
@@ -74,6 +80,17 @@ type sseParser struct {
 	captureContent bool
 	contentBuf     strings.Builder
 	truncated      bool
+
+	// Stream loop detection (nil = off). The upstream's object/id/model and
+	// the choice indices seen are kept only to shape the abort chunk.
+	loop          *streamLoopGuard
+	loopTrip      *loopTrip
+	aborted       bool
+	rid           string
+	upObject      string
+	upID          string
+	upModel       string
+	choiceIndices []int
 }
 
 func newSSEParser(backendID, model, backendType string, t0 time.Time, m *telemetry.Metrics, ctx context.Context) *sseParser {
@@ -88,51 +105,143 @@ func newSSEParser(backendID, model, backendType string, t0 time.Time, m *telemet
 }
 
 // feed processes a raw chunk of bytes from the upstream SSE stream.
-// It must be called in the order bytes arrive.
-func (p *sseParser) feed(data []byte) {
-	// Prepend any leftover from the previous call
-	if len(p.lineBuf) > 0 {
-		data = append(p.lineBuf, data...)
-		p.lineBuf = nil
+// It must be called in the order bytes arrive. See streamParser for the
+// return values.
+func (p *sseParser) feed(in []byte) (forward int, abortTail []byte) {
+	if p.aborted {
+		return 0, nil
+	}
+	// Prepend any leftover from the previous call. carried bytes were already
+	// forwarded, so cut offsets are reported relative to in.
+	data := in
+	carried := len(p.lineBuf)
+	if carried > 0 {
+		p.lineBuf = append(p.lineBuf, in...)
+		data, p.lineBuf = p.lineBuf, nil
 	}
 
+	pos := 0
 	for {
-		idx := bytes.IndexByte(data, '\n')
+		idx := bytes.IndexByte(data[pos:], '\n')
 		if idx == -1 {
 			// Incomplete line — save for next call
-			if len(data) > 0 {
-				p.lineBuf = append([]byte(nil), data...)
+			if pos < len(data) {
+				p.lineBuf = append([]byte(nil), data[pos:]...)
 			}
-			return
+			return len(in), nil
 		}
-		line := bytes.TrimRight(data[:idx], "\r")
-		data = data[idx+1:]
+		line := bytes.TrimRight(data[pos:pos+idx], "\r")
+		pos += idx + 1
 
-		if !bytes.HasPrefix(line, []byte("data: ")) {
-			continue
-		}
-		payload := line[6:]
-		if bytes.Equal(payload, []byte("[DONE]")) {
-			if p.backendType == "anthropic" {
-				p.recordAnthropicTokens()
-			}
-			continue
-		}
-
-		var evt map[string]interface{}
-		if err := json.Unmarshal(payload, &evt); err != nil {
-			continue
-		}
-
-		if p.backendType == "anthropic" {
-			p.handleAnthropicEvent(evt)
-		} else {
-			p.handleOpenAIEvent(evt)
+		p.handleLine(line)
+		if p.loopTrip != nil {
+			// Forward through the end of the tripping line (its '\n' is in
+			// in, since carried bytes never contain one), drop the rest.
+			p.aborted = true
+			p.lineBuf = nil
+			return pos - carried, p.abortTail()
 		}
 	}
 }
 
+// handleLine processes one complete SSE line.
+func (p *sseParser) handleLine(line []byte) {
+	if !bytes.HasPrefix(line, []byte("data: ")) {
+		return
+	}
+	payload := line[6:]
+	if bytes.Equal(payload, []byte("[DONE]")) {
+		if p.backendType == "anthropic" {
+			p.recordAnthropicTokens()
+		}
+		return
+	}
+
+	var evt map[string]interface{}
+	if err := json.Unmarshal(payload, &evt); err != nil {
+		return
+	}
+
+	if p.backendType == "anthropic" {
+		p.handleAnthropicEvent(evt)
+	} else {
+		p.handleOpenAIEvent(evt)
+	}
+}
+
+// abortTail builds the lane's closing error for the trip.
+func (p *sseParser) abortTail() []byte {
+	if p.backendType == "anthropic" {
+		return anthropicAbortTail(p.loopTrip)
+	}
+	return openAIAbortTail(p.loopTrip, p.upObject, p.upID, p.upModel, p.rid, p.choiceIndices)
+}
+
+// observeOpenAILoop feeds every choice's reasoning and content text to the
+// loop guard. Tool-call arguments (delta.tool_calls) are never read.
+func (p *sseParser) observeOpenAILoop(evt map[string]interface{}) {
+	if p.upObject == "" {
+		p.upObject, _ = evt["object"].(string)
+	}
+	if p.upID == "" {
+		p.upID, _ = evt["id"].(string)
+		p.loop.setUpstreamID(p.upID)
+	}
+	if p.upModel == "" {
+		p.upModel, _ = evt["model"].(string)
+	}
+	choices, _ := evt["choices"].([]interface{})
+	for _, c := range choices {
+		ch, _ := c.(map[string]interface{})
+		if ch == nil {
+			continue
+		}
+		idx := 0
+		if f, ok := ch["index"].(float64); ok {
+			if f < 0 || f >= maxLoopChoices || f != math.Trunc(f) {
+				continue
+			}
+			idx = int(f)
+		}
+		p.noteChoice(idx)
+		var reasoning, content string
+		if delta, ok := ch["delta"].(map[string]interface{}); ok {
+			// vLLM sends reasoning_content; newer servers send reasoning.
+			// Some send both with the same text, so take one.
+			if reasoning, _ = delta["reasoning_content"].(string); reasoning == "" {
+				reasoning, _ = delta["reasoning"].(string)
+			}
+			content, _ = delta["content"].(string)
+		} else {
+			content, _ = ch["text"].(string) // /v1/completions stream
+		}
+		if t := p.loop.observe(idx, loopReasoning, reasoning); t != nil {
+			p.loopTrip = t
+			return
+		}
+		if t := p.loop.observe(idx, loopContent, content); t != nil {
+			p.loopTrip = t
+			return
+		}
+	}
+}
+
+// noteChoice remembers a choice index for the abort chunk (bounded).
+func (p *sseParser) noteChoice(idx int) {
+	for _, i := range p.choiceIndices {
+		if i == idx {
+			return
+		}
+	}
+	if len(p.choiceIndices) < maxLoopChoices {
+		p.choiceIndices = append(p.choiceIndices, idx)
+	}
+}
+
 func (p *sseParser) handleOpenAIEvent(evt map[string]interface{}) {
+	if p.loop != nil {
+		p.observeOpenAILoop(evt)
+	}
 	// TTFT: first chunk with non-empty delta content or reasoning content
 	if !p.ttftDone {
 		if content, think := firstDeltaContent(evt); content != "" || think != "" {
@@ -167,6 +276,9 @@ func (p *sseParser) handleAnthropicEvent(evt map[string]interface{}) {
 		// input_tokens and the two cache classes arrive here. input_tokens
 		// excludes cached tokens, so each class is kept separately.
 		if msg, ok := evt["message"].(map[string]interface{}); ok {
+			if id, _ := msg["id"].(string); id != "" {
+				p.loop.setUpstreamID(id)
+			}
 			if usage, ok := msg["usage"].(map[string]interface{}); ok {
 				if v := jsonCount(usage, "input_tokens"); v > 0 {
 					p.anthropicInputTokens = v
@@ -196,9 +308,15 @@ func (p *sseParser) handleAnthropicEvent(evt map[string]interface{}) {
 			switch dtype {
 			case "thinking_delta":
 				p.thinkChars += int64(len(think))
+				if t := p.loop.observe(0, loopReasoning, think); t != nil {
+					p.loopTrip = t
+				}
 			case "text_delta":
 				p.contentChars += int64(len(text))
 				p.appendContent(text)
+				if t := p.loop.observe(0, loopContent, text); t != nil {
+					p.loopTrip = t
+				}
 			}
 		}
 
@@ -250,6 +368,7 @@ func (p *sseParser) usage() usageCounts {
 // recordFinal records per-request summary metrics once the stream is complete.
 // Called from the interceptedBody onClose callback.
 func (p *sseParser) recordFinal() {
+	p.loop.close()
 	attrs := telemetry.BackendAttrs(p.backendID, p.model)
 
 	// Flush any buffered token counts to totals counters (OpenAI path)
@@ -339,6 +458,10 @@ type ollamaParser struct {
 
 	promptToks     int64
 	completionToks int64
+
+	loop     *streamLoopGuard // nil = loop detection off
+	loopTrip *loopTrip
+	aborted  bool
 }
 
 func newOllamaParser(backendID, model string, t0 time.Time, m *telemetry.Metrics, ctx context.Context) *ollamaParser {
@@ -348,10 +471,14 @@ func newOllamaParser(backendID, model string, t0 time.Time, m *telemetry.Metrics
 // feed records TTFT on the first non-empty chunk and scans complete NDJSON
 // lines for token counts. Read boundaries need not align with lines: a partial
 // line is carried to the next call (bounded by maxOllamaLineBytes), and a
-// chunk may hold several lines.
-func (p *ollamaParser) feed(data []byte) {
+// chunk may hold several lines. See streamParser for the return values.
+func (p *ollamaParser) feed(in []byte) (forward int, abortTail []byte) {
+	if p.aborted {
+		return 0, nil
+	}
+	data := in
 	if len(data) == 0 {
-		return
+		return 0, nil
 	}
 	if !p.ttftDone {
 		elapsed := time.Since(p.t0).Seconds()
@@ -366,15 +493,15 @@ func (p *ollamaParser) feed(data []byte) {
 			// No newline in what is left: buffer it, unless that would exceed
 			// the cap — then drop the line and skip to its terminator.
 			if p.discarding {
-				return
+				return len(in), nil
 			}
 			if len(p.lineBuf)+len(data) > maxOllamaLineBytes {
 				p.lineBuf = nil
 				p.discarding = true
-				return
+				return len(in), nil
 			}
 			p.lineBuf = append(p.lineBuf, data...)
-			return
+			return len(in), nil
 		}
 		line := data[:idx]
 		data = data[idx+1:]
@@ -391,7 +518,14 @@ func (p *ollamaParser) feed(data []byte) {
 			p.lineBuf = nil
 		}
 		p.handleLine(line)
+		if p.loopTrip != nil {
+			// Forward through the end of the tripping line, drop the rest.
+			p.aborted = true
+			p.lineBuf = nil
+			return len(in) - len(data), ollamaAbortTail(p.loopTrip)
+		}
 	}
+	return len(in), nil
 }
 
 // handleLine decodes one NDJSON object and captures the token counts if it
@@ -408,9 +542,28 @@ func (p *ollamaParser) handleLine(line []byte) {
 	var obj struct {
 		PromptEvalCount int64 `json:"prompt_eval_count"`
 		EvalCount       int64 `json:"eval_count"`
+		// Text channels for loop detection: /api/chat carries message.*,
+		// /api/generate carries response/thinking. Tool calls are not read.
+		Message *struct {
+			Content  string `json:"content"`
+			Thinking string `json:"thinking"`
+		} `json:"message"`
+		Response string `json:"response"`
+		Thinking string `json:"thinking"`
 	}
 	if err := json.Unmarshal(line, &obj); err != nil {
 		return
+	}
+	if p.loop != nil && p.loopTrip == nil {
+		thinking, content := obj.Thinking, obj.Response
+		if obj.Message != nil {
+			thinking, content = obj.Message.Thinking, obj.Message.Content
+		}
+		if t := p.loop.observe(0, loopReasoning, thinking); t != nil {
+			p.loopTrip = t
+		} else if t := p.loop.observe(0, loopContent, content); t != nil {
+			p.loopTrip = t
+		}
 	}
 	if obj.PromptEvalCount > 0 {
 		p.promptToks = obj.PromptEvalCount
@@ -424,10 +577,11 @@ func (p *ollamaParser) handleLine(line []byte) {
 // then records the per-request token metrics and generation speed. Request
 // duration is recorded by the caller, as on the SSE path.
 func (p *ollamaParser) recordFinal() {
-	if len(p.lineBuf) > 0 && !p.discarding {
+	if len(p.lineBuf) > 0 && !p.discarding && !p.aborted {
 		p.handleLine(p.lineBuf)
 	}
 	p.lineBuf = nil
+	p.loop.close()
 
 	p.usage().recordTokenMetrics(p.ctx, p.metrics, p.backendID, p.model)
 
@@ -572,6 +726,12 @@ func (b *idleTimeoutBody) Close() error {
 //
 // tee, if non-nil, receives a copy of every byte read. Used by the debug
 // capture feature to record raw streaming bytes.
+//
+// When the parser aborts the stream (stream loop detection), the upstream body
+// is closed at once — the backend sees its client disconnect and frees the
+// slot — and the remaining reads return the parser's protocol-native tail,
+// then io.EOF. Read and Close are called from the one goroutine copying the
+// response, so the abort state needs no locking.
 type interceptedBody struct {
 	io.ReadCloser
 	parser    streamParser
@@ -579,20 +739,59 @@ type interceptedBody struct {
 	onClose   func(error)
 	closeOnce sync.Once
 	readErr   error
+
+	aborted        bool   // the parser cut the stream; serve tail, then EOF
+	tail           []byte // unsent part of the abort tail
+	upstreamClosed bool
 }
 
 func (b *interceptedBody) Read(p []byte) (n int, err error) {
+	if b.aborted {
+		return b.readTail(p)
+	}
 	n, err = b.ReadCloser.Read(p)
 	if err != nil {
 		b.readErr = err
 	}
 	if n > 0 {
-		b.parser.feed(p[:n])
-		if b.tee != nil {
+		fwd, tail := b.parser.feed(p[:n])
+		if tail != nil {
+			b.aborted = true
+			b.tail = tail
+			b.readErr = nil       // the stream ends with our tail, not an upstream error
+			_ = b.closeUpstream() // nothing to do on failure: the stream is over either way
+			n, err = fwd, nil
+		}
+		if b.tee != nil && n > 0 {
 			_, _ = b.tee.Write(p[:n])
+		}
+		if b.aborted && n == 0 {
+			return b.readTail(p)
 		}
 	}
 	return
+}
+
+// readTail serves the abort tail, then io.EOF.
+func (b *interceptedBody) readTail(p []byte) (int, error) {
+	if len(b.tail) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, b.tail)
+	if b.tee != nil {
+		_, _ = b.tee.Write(p[:n])
+	}
+	b.tail = b.tail[n:]
+	return n, nil
+}
+
+// closeUpstream closes the upstream body exactly once.
+func (b *interceptedBody) closeUpstream() error {
+	if b.upstreamClosed {
+		return nil
+	}
+	b.upstreamClosed = true
+	return b.ReadCloser.Close()
 }
 
 func (b *interceptedBody) Close() error {
@@ -601,5 +800,5 @@ func (b *interceptedBody) Close() error {
 			b.onClose(b.readErr)
 		}
 	})
-	return b.ReadCloser.Close()
+	return b.closeUpstream()
 }

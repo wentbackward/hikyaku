@@ -59,8 +59,11 @@ check: lint test build
 # inspect-only features that hardened deliberately compiles out, so they would
 # fail by design. These two packages hold the hardened enforcement assertions
 # (TLS policy, https-only openai backends, keyed affinity hash, log gating).
+# From internal/proxy only the stream loop detection tests run: they hold the
+# assertion that tripping-window samples are compiled out of hardened.
 test-hardened:
 	go test -tags hardened -count=1 ./internal/config/ ./internal/balancer/ ./internal/sectls/ ./cmd/hikyaku/
+	go test -tags hardened -race -count=1 -run 'StreamLoop|IdleTimeoutBody' ./internal/proxy/
 
 # Same as `check` but for the hardened build variant.
 check-hardened: lint-hardened test-hardened
