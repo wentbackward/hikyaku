@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/wentbackward/hikyaku/internal/balancer"
 	"github.com/wentbackward/hikyaku/internal/config"
 	"github.com/wentbackward/hikyaku/internal/telemetry"
 )
@@ -365,6 +366,20 @@ func TestServer_StateGenerationIsConsistent(t *testing.T) {
 		}
 		if (st.bal != nil) != (len(next.Groups) > 0) {
 			t.Fatalf("generation %d: balancer presence %v, groups %d", i, st.bal != nil, len(next.Groups))
+		}
+		for name := range next.Groups {
+			for _, b := range next.Backends {
+				if b.Group == name && !st.bal.IsBackendHealthy(b.ID) {
+					t.Fatalf("generation %d: balancer does not know backend %q of group %q", i, b.ID, name)
+				}
+			}
+			sel, err := st.bal.Select(name, "", &balancer.RequestContext{})
+			if err != nil {
+				t.Fatalf("generation %d: group %q unknown to the balancer: %v", i, name, err)
+			}
+			if bk, ok := st.cfg.Backend(sel.ID); !ok || bk.Group != name {
+				t.Fatalf("generation %d: balancer selected %q, not a member of %q in the generation's config", i, sel.ID, name)
+			}
 		}
 	}
 }
