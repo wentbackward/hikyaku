@@ -639,21 +639,8 @@ groups:
 
 #### Defenders
 
-```yaml
-server:
-  drop_empty_content: true             # refuse (400) requests with empty/null message content
-  defenders:
-    loop_detection:
-      consecutive_threshold: 3
-      window_seconds: 60
-      action: refuse_429
-    zero_content_detection:
-      min_user_content_chars: 10
-      min_total_input_tokens: 1000
-      action: refuse_400
-```
-
-Defenders are **disabled by default**. Each must be explicitly enabled.
+Defenders are configured at the top level (not under `server:`) — see
+[Request defenders](#request-defenders).
 
 #### Metrics retry
 
@@ -661,36 +648,158 @@ If `/metrics` is unavailable at startup, the proxy falls back to health-only mod
 
 ### Request defenders
 
-Pre-routing checks that can short-circuit pathological requests before they reach a backend. Globally configurable, per-route overridable:
+Checks that stop pathological requests or responses before they waste
+tokens. Each has a global default and a per-route override:
 
 ```yaml
 defenders:                      # global defaults
-  loop_detection:
-    enabled: true
-    consecutive_threshold: 3
-    window_seconds: 60
-    action: inject_forcing_message
-    escalate_after: 2
-    escalate_action: refuse_429
   zero_content_detection:
     enabled: true
     min_user_content_chars: 10
     min_total_input_tokens: 2000
     action: refuse_400
+  stream_loop_detection:
+    enabled: true
 
 routes:
-  - virtual_model: gresh-coder
+  - virtual_model: coder
     backend_group: coder-cluster
     real_model: Qwen/Qwen3.6-27B-AWQ-INT4
     defenders:                  # per-route override
-      loop_detection:
+      zero_content_detection:
         enabled: false
 ```
 
-- **Loop detection** — detects repeated identical requests (same affinity key + last user message hash) within a sliding window. Action: inject a forcing message to break the loop, or refuse with 429.
-- **Zero-content detection** — rejects requests where the user content is trivial relative to the total payload size. Prevents burning tokens on empty prompts wrapped in massive system/tool definitions.
+- **Zero-content detection** (pre-routing) — rejects requests where the
+  user content is trivial relative to the total payload size. Prevents
+  burning tokens on empty prompts wrapped in massive system/tool
+  definitions. On unless disabled.
+- **Stream loop detection** (response side) — ends a streamed response
+  whose output has degenerated into repetition. Off unless enabled. See
+  below.
 
-See [LOAD-BALANCING.md](../LOAD-BALANCING.md) for the full design specification.
+The request-repeat `loop_detection` defender has been **removed**: it
+counted identical request bodies across requests and never fired on a
+real loop, which happens inside one streamed response. A config that
+still sets `defenders.loop_detection` (globally, per route or per
+backend) keeps loading; the key is ignored and the proxy logs one
+`[config] DEPRECATED: loop_detection …` line on start and on every
+reload. Delete the key and use `stream_loop_detection`. The old
+defender was on by default, so its removal applies to configs without
+the key too.
+
+#### Stream loop detection
+
+A model can degenerate inside one streamed response and repeat
+near-identical phrases for minutes, holding a backend slot the whole
+time. The proxy measures how well recent output compresses:
+`ratio = len(deflate(window)) / len(window)` over non-overlapping
+windows of `window_chars` characters (Unicode code points). Repetitive
+text compresses well even when no two lines match, so a low ratio means
+a loop. Healthy prose measures about 0.45–0.60; a loop falls toward 0.1.
+
+```yaml
+defenders:
+  stream_loop_detection:
+    enabled: true              # default false: the whole defender is off
+    channels:
+      reasoning:               # thinking / reasoning text
+        mode: abort            # abort | shadow | off
+        window_chars: 2000     # 1–32768 code points per window
+        warmup_windows: 1      # first windows are not measured
+        threshold: 0.40        # a window below this is "low" (0 < t < 1)
+        consecutive_windows: 1 # trip after this many low windows in a row
+        hard_threshold: 0.30   # trip on one window below this (<= threshold)
+      content:                 # the answer text
+        mode: shadow
+        window_chars: 2000
+        warmup_windows: 1
+        threshold: 0.30        # lower: healthy code/JSON compresses well
+        consecutive_windows: 2
+        hard_threshold: 0.20
+    samples:                   # optional, global only; default build only
+      folder: /var/lib/hikyaku/loop-samples
+      max_samples: 100
+
+routes:
+  - virtual_model: coder
+    backend: gpu-01
+    defenders:
+      stream_loop_detection:   # per-route override, field by field
+        channels:
+          reasoning:
+            mode: shadow
+```
+
+The values shown for the channels are the defaults that apply once
+`enabled: true`. Resolution is per field: route, then global, then
+default — a route block that omits `enabled` inherits it, and
+`enabled: false` on a route turns the defender off there.
+
+**Channels.** Measured per response choice, never mixing choices:
+
+| Channel | OpenAI lane | Anthropic lane | Ollama lane |
+|---|---|---|---|
+| `reasoning` | `delta.reasoning_content` / `delta.reasoning` | `thinking_delta` | `message.thinking`, `thinking` |
+| `content` | `delta.content`, `text` (`/v1/completions`) | `text_delta` | `message.content`, `response` |
+
+Tool-call arguments are **never** measured: they are JSON or file
+contents that compress well by nature. Non-streamed responses are not
+measured (the tokens are already spent).
+
+**Modes.**
+
+- `abort` — on a trip the proxy stops forwarding after the event that
+  tripped, closes the upstream request (vLLM aborts a request whose
+  client disconnects, freeing the slot at once), and ends the client's
+  stream with an error in the lane's own format:
+  - OpenAI: a final chunk with `finish_reason: "error"` and
+    `"error": {"type": "degenerate_output", "message": "...",
+    "channel": "reasoning", "ratio": 0.37}`, then `data: [DONE]`.
+  - Anthropic: `event: error` with
+    `{"type": "error", "error": {"type": "degenerate_output", ...}}`.
+  - Ollama: a final `{"error": "...", "error_type": "degenerate_output",
+    "channel": ..., "ratio": ...}` line.
+
+  The proxy does not retry and does not inject any message: the client
+  already received part of the output, so retrying is the client's job
+  (a retry usually hits the warm prefix cache).
+- `shadow` — measure, count and log; the stream is untouched.
+- `off` — the channel is not measured.
+
+A channel trips at most once per choice per stream; in shadow mode it
+keeps recording ratios afterwards.
+
+**Rollout.** The thresholds come from limited data. Start with every
+channel in `shadow`, watch `hikyaku_stream_ratio` per route and channel
+for a week, set `threshold` below the healthy p1 with a margin, then
+switch `reasoning` to `abort`. Keep `content` in `shadow` until its data
+says it is safe — code, JSON and tables compress well when healthy.
+
+**Trip log.** One line per trip, never with response text:
+
+```
+stream_loop_trip route=coder backend=gpu-01 channel=reasoning mode=abort trigger=threshold ratio=0.370 threshold=0.400 window=4 chars_seen=8000 choice=0 request_id=1a2b3c4d upstream_id=chatcmpl-abc
+```
+
+**Samples.** To judge whether trips are real loops, set
+`samples.folder`: each trip (either mode) saves the tripping window and
+its measurements as one JSON file (mode `0600`) in that folder, until
+the folder holds `max_samples` sample files (default 100, maximum
+10000; files from earlier runs count). There is no default folder —
+nothing is written unless you set one. This captures response text, so
+it exists only in the default build: the `hardened` build compiles the
+writer out, accepts the setting, and logs that it is ignored.
+
+**Validation.** The config fails to load on an unknown key inside the
+block, a mode other than `abort|shadow|off`, a threshold outside (0, 1),
+`hard_threshold` above `threshold` (checked on each route's resolved
+values), `window_chars` outside 1–32768, `consecutive_windows < 1`,
+`warmup_windows < 0`, `samples` on a route, or the block on a backend.
+
+Metrics: [Stream loop detection](metrics.md#stream-loop-detection).
+Design and measurements:
+[design/stream-loop-detection.md](design/stream-loop-detection.md).
 
 ## Telemetry
 

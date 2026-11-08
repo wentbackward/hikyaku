@@ -491,6 +491,13 @@ they're available.
 
 ### Loop detection
 
+> **Removed.** This request-repeat defender never fired on a real loop:
+> degenerate output happens inside one streamed response, not across
+> requests. It is replaced by in-stream compression-ratio detection —
+> see [docs/design/stream-loop-detection.md](docs/design/stream-loop-detection.md).
+> The `loop_detection` config key is still accepted and ignored. The
+> design below is kept for history.
+
 **Signal:** the same `(affinity_key, hash(messages[-1].content))` arrives
 ≥ N times within a sliding window. Default N=3, window=60s.
 

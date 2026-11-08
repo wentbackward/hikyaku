@@ -20,7 +20,7 @@ An enterprise grade, highly performant route virtualizer for your infrerence wor
 | **Simple** to deploy in minutes, serve thousands of users with minimal hardawre | **Secure** by default - **protect** your traffic, your API keys and control access |
 | **Curate and Control** approved models | **Reliable** low latency and highly available  |
 | Smart **load-balancing** with KV-cache affinity, ground-truth health, and failover migration | **Inspect** and debug messages to speed up analysis and problem solving  |
-| **Set** and **clamp** sampling parameters to ensure optimal model performance | Deploy **defenders** like loop detector and supress 'zero' messages before they waste valuable tokens |
+| **Set** and **clamp** sampling parameters to ensure optimal model performance | Deploy **defenders** that stop degenerate looping streams and supress 'zero' messages before they waste valuable tokens |
 | **RFC 3986 compliant** URL resolution — no string concatenation, no double-prefix bugs | **Zero-probe mode** — health driven by real traffic alone, no synthetic probes needed |
 
 ## Virtualize

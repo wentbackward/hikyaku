@@ -42,7 +42,7 @@
 - **Log levels 0-4** — from silent to full content inspection
 
 ## Defenders
-- **Loop detection** — catches repeated identical requests from agent retry loops
+- **Stream loop detection** — ends a streamed response that has degenerated into repetition (deflate compression ratio per window, per reasoning/content channel), closing the upstream request to free the backend; shadow mode for calibration. Off by default. The old request-repeat `loop_detection` is removed (key accepted, ignored, deprecation logged)
 - **Zero-content detection** — rejects trivial user content wrapped in massive system/tool defs
 - **Drop empty content** — refuses (400) any request containing messages with nil/empty content. Does not strip or mutate. Opt-in (`server.drop_empty_content: true`). Refusal: "empty messages are blocked by your administrator"
 
