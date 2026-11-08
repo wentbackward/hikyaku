@@ -61,7 +61,7 @@ func (s *Server) handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := s.cfg.Load()
+	cfg := s.state.Load().cfg
 	var backend *config.Backend
 	for i := range cfg.Backends {
 		if cfg.Backends[i].Type == "ollama" {

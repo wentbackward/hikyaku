@@ -42,13 +42,11 @@ func requestID() string {
 type Server struct {
 	buildMode   string
 	version     string
-	cfg         atomic.Pointer[config.Config]
-	rtr         atomic.Pointer[router.Router]
+	state       atomic.Pointer[runtimeState] // config, router and balancer, published together
 	metrics     *telemetry.Metrics
-	journal     *journal.Journal                  // nil if journal disabled
-	capture     atomic.Pointer[capture.Capture]   // nil value = capture disabled; rebuilt on Reload
-	balancer    atomic.Pointer[balancer.Balancer] // nil if no groups configured; swapped by reload, loaded once per request
-	loopSampler atomic.Pointer[loopSampler]       // nil = no stream-loop samples (always nil in hardened); rebuilt on Reload
+	journal     *journal.Journal                // nil if journal disabled
+	capture     atomic.Pointer[capture.Capture] // nil value = capture disabled; rebuilt on Reload
+	loopSampler atomic.Pointer[loopSampler]     // nil = no stream-loop samples (always nil in hardened); rebuilt on Reload
 
 	transport     http.RoundTripper        // shared outbound transport (default *http.Transport; override via WithTransportFactory)
 	usageObserver UsageObserver            // nil unless set via WithUsageObserver (pro accounting seam)
@@ -57,6 +55,17 @@ type Server struct {
 	reloadMu      sync.Mutex               // serializes Reload / ApplyConfig (balancer swap)
 	semaphores    map[string]chan struct{} // per-backend concurrency limiter (nil entry = unlimited)
 	bufferedBytes atomic.Int64             // bytes currently held in proxy buffers
+}
+
+// runtimeState is one immutable generation of the reloadable routing state.
+// reload builds a complete new generation and publishes it with a single
+// atomic swap; a request loads it once and uses that generation throughout,
+// so it never pairs one config with another config's router or balancer (a
+// group or backend id the other side does not know).
+type runtimeState struct {
+	cfg *config.Config
+	rtr *router.Router
+	bal *balancer.Balancer // nil iff cfg has no groups
 }
 
 // TransportFactory builds the outbound RoundTripper used for all backend
@@ -78,7 +87,7 @@ func WithTransportFactory(f TransportFactory) Option {
 		if f == nil {
 			return
 		}
-		if rt := f.NewTransport(s.cfg.Load()); rt != nil {
+		if rt := f.NewTransport(s.state.Load().cfg); rt != nil {
 			s.transport = rt
 		}
 	}
@@ -213,20 +222,21 @@ func New(version, buildMode string, cfg *config.Config, metrics *telemetry.Metri
 			TLSClientConfig:     sectls.ClientConfig(cfg.MinTLS()),
 		},
 	}
-	s.cfg.Store(cfg)
-	s.rtr.Store(router.New(cfg))
+	s.state.Store(&runtimeState{cfg: cfg, rtr: router.New(cfg)})
 	s.buildSemaphores(cfg)
 	s.applyCaptureConfig(cfg)
 	s.applyLoopSamplerConfig(cfg)
 	logConfigDeprecations(cfg)
 	// Apply options before anything that depends on them: the balancer's probes
 	// go through the outbound transport an option may replace. cfg is already
-	// stored, so options may read s.cfg.Load().
+	// stored, so options may read s.state.Load().cfg.
 	for _, o := range opts {
 		o(s)
 	}
 	if len(cfg.Groups) > 0 {
-		s.balancer.Store(s.newBalancer(cfg))
+		st := *s.state.Load()
+		st.bal = s.newBalancer(cfg)
+		s.state.Store(&st)
 	}
 	return s
 }
@@ -295,7 +305,7 @@ func (s *Server) Capture() *capture.Capture {
 
 // Balancer returns the current balancer (may be nil if no groups configured).
 func (s *Server) Balancer() *balancer.Balancer {
-	return s.balancer.Load()
+	return s.state.Load().bal
 }
 
 // ApplyConfig is the programmatic counterpart of a SIGHUP reload for
@@ -335,25 +345,23 @@ func (s *Server) Reload(cfg *config.Config) {
 
 // reload is Reload for a caller holding reloadMu.
 func (s *Server) reload(cfg *config.Config) {
-	s.rtr.Store(router.New(cfg))
-	s.cfg.Store(cfg)
+	// Build the complete next generation, then publish it with one swap. The
+	// new balancer probes through the same outbound transport as before (a
+	// factory's transport is reconfigured in place by the embedder, never
+	// replaced). Requests already running keep their generation and finish on
+	// the balancer they started on; stopping the old balancer only ends its
+	// probes, its in-memory counters stay usable for them.
+	next := &runtimeState{cfg: cfg, rtr: router.New(cfg)}
+	if len(cfg.Groups) > 0 {
+		next.bal = s.newBalancer(cfg)
+	}
 	s.buildSemaphores(cfg)
+	if old := s.state.Swap(next); old != nil && old.bal != nil {
+		old.bal.Stop()
+	}
 	s.applyCaptureConfig(cfg)
 	s.applyLoopSamplerConfig(cfg)
 	logConfigDeprecations(cfg)
-
-	// Swap balancer on reload; the new one probes through the same outbound
-	// transport as before (a factory's transport is reconfigured in place by the
-	// embedder, never replaced).
-	// Requests load the pointer once and finish on the balancer they started
-	// on, so in-flight counts never move between balancers.
-	var next *balancer.Balancer
-	if len(cfg.Groups) > 0 {
-		next = s.newBalancer(cfg)
-	}
-	if old := s.balancer.Swap(next); old != nil {
-		old.Stop()
-	}
 
 	log.Printf("[reload] %d backends, %d routes", len(cfg.Backends), len(cfg.Routes))
 	for i := range cfg.Backends {
@@ -419,7 +427,7 @@ func (s *Server) acquireSemaphore(ctx context.Context, backendID string) (releas
 
 // Config returns the current config (for use by main.go probes etc.)
 func (s *Server) Config() *config.Config {
-	return s.cfg.Load()
+	return s.state.Load().cfg
 }
 
 // RegisterRoutes attaches all proxy endpoints to mux.
@@ -451,7 +459,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 // The compare is constant-time to avoid leaking the token via response timing.
 func (s *Server) bearerAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := s.cfg.Load().Server.APIKey
+		key := s.state.Load().cfg.Server.APIKey
 		if key == "" {
 			next(w, r)
 			return
@@ -475,7 +483,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := s.cfg.Load()
+	cfg := s.state.Load().cfg
 
 	type modelEntry struct {
 		ID      string `json:"id"`
@@ -538,7 +546,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 
 	// ── Read & parse body ──────────────────────────────────────────────────
 	// Cap request body size to avoid OOM on a malicious/misbehaving client.
-	if maxMB := s.cfg.Load().Server.MaxRequestBodyMB; maxMB > 0 {
+	if maxMB := s.state.Load().cfg.Server.MaxRequestBodyMB; maxMB > 0 {
 		r.Body = http.MaxBytesReader(w, r.Body, int64(maxMB)*1024*1024)
 	}
 	rawBody, err := io.ReadAll(r.Body)
@@ -546,7 +554,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			jsonError(w, fmt.Sprintf("request body exceeds max_request_body_mb limit (%d MB)", s.cfg.Load().Server.MaxRequestBodyMB), http.StatusRequestEntityTooLarge)
+			jsonError(w, fmt.Sprintf("request body exceeds max_request_body_mb limit (%d MB)", s.state.Load().cfg.Server.MaxRequestBodyMB), http.StatusRequestEntityTooLarge)
 			return
 		}
 		jsonError(w, "failed to read request body", http.StatusBadRequest)
@@ -590,9 +598,9 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	var realModel string
 	var loopRoute *streamLoopRoute // stream loop detection for this request; nil when not streaming
 
-	cfg := s.cfg.Load()
-	bal := s.balancer.Load() // one balancer for the whole request (Select … CompleteAndDecr)
-	rtr := s.rtr.Load()
+	// One generation for the whole request (route … Select … CompleteAndDecr).
+	st := s.state.Load()
+	cfg, rtr, bal := st.cfg, st.rtr, st.bal
 
 	// Ollama nests sampling params under body["options"]. Flatten them into
 	// body's top level so the router's param merge sees caller-supplied values;
@@ -653,16 +661,16 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 		}
 
 		// LB group: select backend at runtime
-		if res.Group != "" && bal == nil {
-			// A reload that adds groups stores the config before it publishes
-			// the balancer; refuse rather than proxy to no backend.
-			jsonError(w, "no healthy backend available", http.StatusServiceUnavailable)
-			return
-		}
 		if res.Group != "" {
+			// The generation is consistent, so these hold by construction;
+			// refuse rather than dereference nil if that is ever broken.
+			grpCfg := cfg.Groups[res.Group]
+			if bal == nil || grpCfg == nil {
+				jsonError(w, "no healthy backend available", http.StatusServiceUnavailable)
+				return
+			}
 			// Compute affinity key
 			var affKey string
-			grpCfg := cfg.Groups[res.Group]
 			switch grpCfg.Affinity.Key {
 			case "none":
 				// no affinity
@@ -685,9 +693,12 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 				jsonError(w, "no healthy backend available", http.StatusServiceUnavailable)
 				return
 			}
-			if bk, ok := cfg.Backend(selected.ID); ok {
-				backend = bk
+			bk, ok := cfg.Backend(selected.ID)
+			if !ok {
+				jsonError(w, "no healthy backend available", http.StatusServiceUnavailable)
+				return
 			}
+			backend = bk
 			bal.Incr(selected.ID)
 			bal.Dispatch(selected.ID)
 		} else {
@@ -863,7 +874,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	rp := &httputil.ReverseProxy{
 		Transport:      s.transport,
 		Director:       director(targetURL, backend, newBody, opts.pathOverride, routeHeaders(res), loopRoute.guarded()),
-		ModifyResponse: s.modifyResponse(rid, backendID, modelName, realModel, r.URL.Path, backend.Type, backend.TimeoutSeconds, isStreaming, t0, metricsCtx, r.Context(), capCtx, lbGroup, lbAffKey, bal, bytesHeld, loopRoute), //nolint:bodyclose // ReverseProxy owns the response body; ModifyResponse wraps or reads-and-restores it, and the framework closes it client-side.
+		ModifyResponse: s.modifyResponse(rid, backendID, modelName, realModel, r.URL.Path, backend.Type, backend.TimeoutSeconds, isStreaming, t0, metricsCtx, r.Context(), capCtx, lbGroup, lbAffKey, st, bytesHeld, loopRoute), //nolint:bodyclose // ReverseProxy owns the response body; ModifyResponse wraps or reads-and-restores it, and the framework closes it client-side.
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			s.bufferedBytes.Add(-bytesHeld)
 			s.metrics.RequestBodyBytesBuffered.Record(metricsCtx, float64(s.bufferedBytes.Load()))
@@ -1263,7 +1274,8 @@ func logMessageContent(rid string, body map[string]interface{}) {
 
 // modifyResponse returns a ModifyResponse function that instruments the
 // upstream response with telemetry.
-func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, backendType string, timeoutSec int, streaming bool, t0 time.Time, metricsCtx, reqCtx context.Context, capCtx *captureCtx, lbGroup, lbAffKey string, bal *balancer.Balancer, bytesHeld int64, loopRoute *streamLoopRoute) func(*http.Response) error {
+func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, backendType string, timeoutSec int, streaming bool, t0 time.Time, metricsCtx, reqCtx context.Context, capCtx *captureCtx, lbGroup, lbAffKey string, st *runtimeState, bytesHeld int64, loopRoute *streamLoopRoute) func(*http.Response) error {
+	bal := st.bal // the request's generation: the balancer it was counted in on
 	return func(resp *http.Response) error {
 		statusStr := fmt.Sprintf("%d", resp.StatusCode)
 
@@ -1362,7 +1374,7 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 						bal.CompleteAndDecr(backendID, resp.StatusCode == http.StatusOK, isTimeout, 0)
 						// Invalidate pin based on group failover config (5xx always + configured codes)
 						if !isTimeout && lbGroup != "" {
-							if grp, ok := s.cfg.Load().Groups[lbGroup]; ok && grp.ShouldFailoverOnCode(resp.StatusCode) {
+							if grp, ok := st.cfg.Groups[lbGroup]; ok && grp.ShouldFailoverOnCode(resp.StatusCode) {
 								bal.InvalidatePin(lbGroup, lbAffKey)
 							}
 						} else if !isTimeout {
@@ -1406,7 +1418,7 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 				bal.CompleteAndDecr(backendID, resp.StatusCode == http.StatusOK, false, 0)
 				// Invalidate pin based on group failover config (5xx always + configured codes)
 				if lbGroup != "" {
-					if grp, ok := s.cfg.Load().Groups[lbGroup]; ok && grp.ShouldFailoverOnCode(resp.StatusCode) {
+					if grp, ok := st.cfg.Groups[lbGroup]; ok && grp.ShouldFailoverOnCode(resp.StatusCode) {
 						bal.InvalidatePin(lbGroup, lbAffKey)
 					}
 				} else {
