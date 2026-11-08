@@ -6,6 +6,8 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +18,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/wentbackward/hikyaku/internal/config"
 	"github.com/wentbackward/hikyaku/internal/telemetry"
@@ -49,9 +53,15 @@ func captureLog(t *testing.T) *syncBuffer {
 	return buf
 }
 
+// holdOpen, returned by a chunk function, keeps the upstream stream open
+// until the proxy goes away: a stream that must be aborted can never end on
+// its own first, however the bytes are buffered.
+const holdOpen = "\x00hold-open"
+
 // loopUpstream is a fake streaming backend. chunk(i) renders the i-th wire
-// chunk (or "" to end the stream normally). gone is closed when the handler
-// sees its client — the proxy — go away before the stream ended.
+// chunk ("" ends the stream normally, holdOpen waits for the client to leave).
+// gone is closed when the handler sees its client — the proxy — go away
+// before the stream ended.
 type loopUpstream struct {
 	srv  *httptest.Server
 	gone chan struct{}
@@ -77,6 +87,11 @@ func newLoopUpstream(t *testing.T, contentType string, chunk func(i int) string)
 			default:
 			}
 			c := chunk(i)
+			if c == holdOpen {
+				<-r.Context().Done()
+				close(u.gone)
+				return
+			}
 			if c == "" {
 				u.mu.Lock()
 				u.done = true
@@ -92,11 +107,6 @@ func newLoopUpstream(t *testing.T, contentType string, chunk func(i int) string)
 				return
 			}
 			fl.Flush()
-			// Pace the stream a little so an abort lands mid-stream, as with
-			// a real model, rather than after the whole body is buffered.
-			if i%20 == 0 {
-				time.Sleep(time.Millisecond)
-			}
 		}
 	}))
 	t.Cleanup(u.srv.Close)
@@ -111,7 +121,7 @@ func (u *loopUpstream) sentBytes() string {
 
 // newLoopProxy loads a real config pointing route "coder" (alias
 // "coder-alias") at upstream and serves the proxy on a loopback port.
-func newLoopProxy(t *testing.T, backendType, upstreamURL, defenders string) (srv *Server, ps *httptest.Server, mr loopMetricsReader) {
+func newLoopProxy(t *testing.T, backendType, upstreamURL, defenders string, opts ...Option) (srv *Server, ps *httptest.Server, mr loopMetricsReader) {
 	t.Helper()
 	base := upstreamURL + "/v1"
 	if backendType == "ollama" {
@@ -139,7 +149,7 @@ routes:
 	}
 	var m *telemetry.Metrics
 	m, mr = newLoopMetrics(t)
-	srv = New("test", "test", cfg, m, nil)
+	srv = New("test", "test", cfg, m, nil, opts...)
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 	ps = httptest.NewServer(mux)
@@ -181,7 +191,7 @@ func chunked(s string, n int) []string {
 // the upstream connection is closed (the fake backend observes it), and the
 // client gets the lane's native error, then the end of the stream.
 func TestStreamLoopE2E_AbortFreesBackend(t *testing.T) {
-	pieces := chunked(loopText(400000), 40) // 10,000 chunks: far more than the trip needs
+	pieces := chunked(loopText(20000), 40) // 500 chunks, then held open: far more than the trip needs
 	lanes := []struct {
 		name, backendType, contentType, path string
 		req                                  map[string]interface{}
@@ -194,7 +204,7 @@ func TestStreamLoopE2E_AbortFreesBackend(t *testing.T) {
 				"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}}},
 			chunk: func(i int) string {
 				if i >= len(pieces) {
-					return "data: [DONE]\n\n"
+					return holdOpen
 				}
 				return openAIDelta("chatcmpl-up1", 0, map[string]interface{}{"reasoning_content": pieces[i]})
 			},
@@ -226,7 +236,7 @@ func TestStreamLoopE2E_AbortFreesBackend(t *testing.T) {
 				"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}}},
 			chunk: func(i int) string {
 				if i >= len(pieces) {
-					return "event: message_stop\n" + sseEvent(map[string]interface{}{"type": "message_stop"})
+					return holdOpen
 				}
 				return "event: content_block_delta\n" + sseEvent(map[string]interface{}{"type": "content_block_delta", "index": 0,
 					"delta": map[string]interface{}{"type": "thinking_delta", "thinking": pieces[i]}})
@@ -248,7 +258,7 @@ func TestStreamLoopE2E_AbortFreesBackend(t *testing.T) {
 				"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}}},
 			chunk: func(i int) string {
 				if i >= len(pieces) {
-					return `{"done":true}` + "\n"
+					return holdOpen
 				}
 				b, _ := json.Marshal(map[string]interface{}{"message": map[string]interface{}{"role": "assistant", "thinking": pieces[i]}, "done": false})
 				return string(b) + "\n"
@@ -269,7 +279,9 @@ func TestStreamLoopE2E_AbortFreesBackend(t *testing.T) {
 		t.Run(lane.name, func(t *testing.T) {
 			logs := captureLog(t)
 			up := newLoopUpstream(t, lane.contentType, lane.chunk)
-			_, ps, mr := newLoopProxy(t, lane.backendType, up.srv.URL, loopDefendersAbort)
+			events := make(chan UsageEvent, 4)
+			_, ps, mr := newLoopProxy(t, lane.backendType, up.srv.URL, loopDefendersAbort,
+				WithUsageObserver(func(ev UsageEvent) { events <- ev }))
 
 			resp, body := postJSON(t, ps.URL+lane.path, lane.req)
 			if resp.StatusCode != http.StatusOK {
@@ -311,8 +323,25 @@ func TestStreamLoopE2E_AbortFreesBackend(t *testing.T) {
 			if strings.Contains(line, "re-check step") {
 				t.Error("the trip log carries response text")
 			}
+			ev := nextUsage(t, events)
+			if ev.EndReason != EndStreamLoopAbort || ev.LoopChannel != "reasoning" || ev.Status != http.StatusOK || !ev.Streamed {
+				t.Errorf("usage event: end=%q channel=%q status=%d streamed=%v", ev.EndReason, ev.LoopChannel, ev.Status, ev.Streamed)
+			}
 		})
 	}
+}
+
+// nextUsage waits for the next UsageEvent (it fires when the proxy closes
+// the upstream body, which can be just after the client saw EOF).
+func nextUsage(t *testing.T, events <-chan UsageEvent) UsageEvent {
+	t.Helper()
+	select {
+	case ev := <-events:
+		return ev
+	case <-time.After(5 * time.Second):
+		t.Fatal("no UsageEvent")
+	}
+	return UsageEvent{}
 }
 
 // Shadow mode: the stream reaches the client byte for byte, the backend runs
@@ -336,12 +365,13 @@ func TestStreamLoopE2E_ShadowLeavesStreamUntouched(t *testing.T) {
 		}
 		return ""
 	})
+	events := make(chan UsageEvent, 4)
 	_, ps, mr := newLoopProxy(t, "openai", up.srv.URL, `
   stream_loop_detection:
     enabled: true
     channels:
       reasoning:
-        mode: shadow`)
+        mode: shadow`, WithUsageObserver(func(ev UsageEvent) { events <- ev }))
 
 	_, body := postJSON(t, ps.URL+"/v1/chat/completions", map[string]interface{}{
 		"model": "coder", "stream": true,
@@ -360,6 +390,9 @@ func TestStreamLoopE2E_ShadowLeavesStreamUntouched(t *testing.T) {
 	}
 	if n, _ := mr.ratios(t, map[string]string{"route": "coder", "backend": "be", "channel": "reasoning"}); n != 5 {
 		t.Errorf("ratio observations = %d, want 5 (6 windows, 1 warmup)", n)
+	}
+	if ev := nextUsage(t, events); ev.EndReason != EndComplete || ev.LoopChannel != "" || ev.CompletionTokens != 500 {
+		t.Errorf("shadow usage event: end=%q channel=%q completion=%d", ev.EndReason, ev.LoopChannel, ev.CompletionTokens)
 	}
 	if l := logs.String(); !strings.Contains(l, "stream_loop_trip route=coder backend=be channel=reasoning mode=shadow") ||
 		!strings.Contains(l, "upstream_id=chatcmpl-s") || strings.Contains(l, "re-check step") {
@@ -383,7 +416,9 @@ func TestStreamLoopE2E_NonStreamingIsSkipped(t *testing.T) {
 		_, _ = w.Write(sent)
 	}))
 	t.Cleanup(backend.Close)
-	_, ps, mr := newLoopProxy(t, "openai", backend.URL, loopDefendersAbort)
+	events := make(chan UsageEvent, 4)
+	_, ps, mr := newLoopProxy(t, "openai", backend.URL, loopDefendersAbort,
+		WithUsageObserver(func(ev UsageEvent) { events <- ev }))
 
 	resp, body := postJSON(t, ps.URL+"/v1/chat/completions", map[string]interface{}{
 		"model": "coder", "stream": false,
@@ -396,6 +431,9 @@ func TestStreamLoopE2E_NonStreamingIsSkipped(t *testing.T) {
 	}
 	if n := mr.trips(t, nil); n != 0 {
 		t.Errorf("non-streaming response tripped: %d", n)
+	}
+	if ev := nextUsage(t, events); ev.EndReason != EndComplete || ev.Streamed {
+		t.Errorf("non-streaming usage event: end=%q streamed=%v", ev.EndReason, ev.Streamed)
 	}
 }
 
@@ -439,4 +477,188 @@ func TestStreamLoop_DeprecatedLoopDetectionLoggedOnStartAndReload(t *testing.T) 
 	if n := strings.Count(logs.String(), "[config] DEPRECATED: loop_detection"); n != 2 {
 		t.Fatalf("deprecation lines after reload = %d, want 2", n)
 	}
+}
+
+func healthyStream(t *testing.T) func(i int) string {
+	prose := chunked(readFixture(t, "healthy_prose.md"), 40)
+	return func(i int) string {
+		if i < len(prose) {
+			return openAIDelta("c", 0, map[string]interface{}{"content": prose[i]})
+		}
+		return holdOpen
+	}
+}
+
+// A client that leaves mid-stream ends with EndClientDisconnect, and the
+// upstream request is closed too.
+func TestStreamLoopE2E_EndReasonClientDisconnect(t *testing.T) {
+	up := newLoopUpstream(t, "text/event-stream", healthyStream(t))
+	events := make(chan UsageEvent, 4)
+	_, ps, _ := newLoopProxy(t, "openai", up.srv.URL, loopDefendersAbort,
+		WithUsageObserver(func(ev UsageEvent) { events <- ev }))
+
+	raw, _ := json.Marshal(map[string]interface{}{"model": "coder", "stream": true,
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}}})
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, ps.URL+"/v1/chat/completions", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(resp.Body, make([]byte, 100)); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	resp.Body.Close()
+
+	if ev := nextUsage(t, events); ev.EndReason != EndClientDisconnect || ev.LoopChannel != "" {
+		t.Errorf("usage event: end=%q channel=%q", ev.EndReason, ev.LoopChannel)
+	}
+	select {
+	case <-up.gone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream not closed after the client left")
+	}
+}
+
+// An upstream that dies mid-stream ends with EndUpstreamError.
+func TestStreamLoopE2E_EndReasonUpstreamError(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		chunk := openAIDelta("c", 0, map[string]interface{}{"content": "partial"})
+		fmt.Fprintf(buf, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n", len(chunk), chunk)
+		_ = buf.Flush()
+		_ = conn.Close() // no terminating chunk: a truncated body
+	}))
+	t.Cleanup(backend.Close)
+	events := make(chan UsageEvent, 4)
+	_, ps, _ := newLoopProxy(t, "openai", backend.URL, loopDefendersAbort,
+		WithUsageObserver(func(ev UsageEvent) { events <- ev }))
+	raw, _ := json.Marshal(map[string]interface{}{"model": "coder", "stream": true,
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}}})
+	resp, err := http.Post(ps.URL+"/v1/chat/completions", "application/json", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if ev := nextUsage(t, events); ev.EndReason != EndUpstreamError {
+		t.Errorf("usage event: end=%q", ev.EndReason)
+	}
+}
+
+// Guarding asks the upstream for an uncompressed answer: the caller's
+// Accept-Encoding is not forwarded on a guarded stream, and is forwarded
+// unchanged when detection is off. A gzip answer the transport negotiated
+// itself is decoded before the parsers, so it is still measured.
+func TestStreamLoopE2E_AcceptEncodingAndGzip(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	pieces := chunked(loopText(20000), 40)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		ae := r.Header.Get("Accept-Encoding")
+		mu.Lock()
+		seen = append(seen, ae)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		if ae == "gzip" { // only Go's transport asks for exactly "gzip"
+			w.Header().Set("Content-Encoding", "gzip")
+			zw := gzip.NewWriter(w)
+			for _, p := range pieces {
+				_, _ = io.WriteString(zw, openAIDelta("c", 0, map[string]interface{}{"reasoning_content": p}))
+			}
+			_ = zw.Close()
+			return
+		}
+		_, _ = io.WriteString(w, openAIDelta("c", 0, map[string]interface{}{"content": "ok"})+"data: [DONE]\n\n")
+	}))
+	t.Cleanup(backend.Close)
+
+	send := func(ps *httptest.Server) string {
+		raw, _ := json.Marshal(map[string]interface{}{"model": "coder", "stream": true,
+			"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}}})
+		req, _ := http.NewRequest(http.MethodPost, ps.URL+"/v1/chat/completions", bytes.NewReader(raw))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept-Encoding", "br")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return string(b)
+	}
+
+	_, guarded, mr := newLoopProxy(t, "openai", backend.URL, loopDefendersAbort)
+	body := send(guarded)
+	_, plain, _ := newLoopProxy(t, "openai", backend.URL, "  zero_content_detection: {enabled: false}")
+	send(plain)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 || seen[0] == "br" || seen[1] != "br" {
+		t.Fatalf("upstream Accept-Encoding = %q, want [not br, br]", seen)
+	}
+	if !strings.Contains(body, `"type":"degenerate_output"`) {
+		t.Error("a transport-decoded gzip stream was not measured")
+	}
+	if n := mr.trips(t, map[string]string{"mode": "abort"}); n != 1 {
+		t.Errorf("trips = %d, want 1", n)
+	}
+}
+
+// A body that stays encoded (an encoding the transport does not decode)
+// cannot be measured: it passes through unchanged and is counted and logged
+// as unguarded, without text.
+func TestStreamLoopE2E_UnreadableEncodingIsCountedUnguarded(t *testing.T) {
+	logs := captureLog(t)
+	payload := "\x1b\x00opaque-brotli-bytes-" + loopText(5000)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Encoding", "br")
+		_, _ = io.WriteString(w, payload)
+	}))
+	t.Cleanup(backend.Close)
+	_, ps, mr := newLoopProxy(t, "openai", backend.URL, loopDefendersAbort)
+	_, body := postJSON(t, ps.URL+"/v1/chat/completions", map[string]interface{}{"model": "coder", "stream": true,
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}}})
+	if body != payload {
+		t.Error("an unguarded stream was altered")
+	}
+	if n := unguarded(t, mr, map[string]string{"route": "coder", "backend": "be", "reason": "content_encoding"}); n != 1 {
+		t.Errorf("unguarded = %d, want 1", n)
+	}
+	l := logs.String()
+	if strings.Count(l, "stream_loop_unguarded route=coder backend=be reason=content_encoding encoding=br") != 1 {
+		t.Errorf("want one unguarded log line:\n%s", l)
+	}
+	if strings.Contains(l, "re-check step") {
+		t.Error("response text in the log")
+	}
+}
+
+func unguarded(t *testing.T, lr loopMetricsReader, want map[string]string) int64 {
+	t.Helper()
+	var n int64
+	for _, sm := range lr.collect(t).ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "hikyaku_stream_loop_unguarded_total" {
+				continue
+			}
+			for _, dp := range m.Data.(metricdata.Sum[int64]).DataPoints {
+				if attrsMatch(dp.Attributes, want) {
+					n += dp.Value
+				}
+			}
+		}
+	}
+	return n
 }

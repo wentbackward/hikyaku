@@ -742,3 +742,105 @@ func TestStreamLoopLogValueQuotesUnsafeValues(t *testing.T) {
 		t.Errorf("unsafe value not quoted: %s", got)
 	}
 }
+
+// SSE allows "data:" with no space; such a stream is still parsed and
+// guarded, and a "data:" stream's usage is read as before.
+func TestStreamLoopSSE_DataFieldWithoutSpace(t *testing.T) {
+	cfg := enabledLoopCfg()
+	cfg.Reasoning.WarmupWindows = 0
+	p, _ := newGuardedSSEParser(t, "openai", cfg)
+	ev := strings.Replace(openAIDelta("c", 0, map[string]interface{}{"reasoning_content": loopText(2000)}), "data: ", "data:", 1)
+	if _, tail := p.feed([]byte(ev)); tail == nil {
+		t.Fatal(`a "data:" line without a space was not measured`)
+	}
+
+	q := makeParser(t, "openai")
+	q.feed([]byte(`data:{"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}` + "\n\ndata:[DONE]\n\n"))
+	if u := q.usage(); u.prompt != 7 || u.completion != 3 {
+		t.Errorf("usage from data: lines = %+v", u)
+	}
+	for _, line := range []string{"event: x", ": comment", "dat: {}", "id: 1"} {
+		if _, ok := sseData([]byte(line)); ok {
+			t.Errorf("%q parsed as a data field", line)
+		}
+	}
+	if v, _ := sseData([]byte("data:  two spaces")); string(v) != " two spaces" {
+		t.Errorf("only one leading space is stripped, got %q", v)
+	}
+}
+
+// With n > 1, a choice that already sent its finish_reason is not finished a
+// second time by the abort chunk.
+func TestStreamLoopSSE_AbortClosesOnlyOpenChoices(t *testing.T) {
+	cfg := enabledLoopCfg()
+	cfg.Reasoning.WarmupWindows = 0
+	choicesOf := func(tail []byte) []int {
+		var c struct {
+			Choices []struct{ Index int } `json:"choices"`
+		}
+		payload := strings.TrimPrefix(strings.SplitN(string(tail), "\n\n", 2)[0], "\ndata: ")
+		if err := json.Unmarshal([]byte(payload), &c); err != nil {
+			t.Fatal(err)
+		}
+		out := make([]int, 0, len(c.Choices))
+		for _, x := range c.Choices {
+			out = append(out, x.Index)
+		}
+		return out
+	}
+
+	p, _ := newGuardedSSEParser(t, "openai", cfg)
+	in := openAIDelta("c", 0, map[string]interface{}{"content": "a"}) +
+		openAIDelta("c", 1, map[string]interface{}{"content": "b"}) +
+		openAIDelta("c", 2, map[string]interface{}{"content": "c"}) +
+		sseEvent(map[string]interface{}{"id": "c", "choices": []interface{}{
+			map[string]interface{}{"index": 1, "delta": map[string]interface{}{}, "finish_reason": "stop"}}}) +
+		openAIDelta("c", 0, map[string]interface{}{"reasoning_content": loopText(2000)})
+	_, tail := p.feed([]byte(in))
+	if tail == nil {
+		t.Fatal("no trip")
+	}
+	if got := choicesOf(tail); fmt.Sprint(got) != "[0 2]" {
+		t.Errorf("abort closed choices %v, want [0 2] (1 had finished)", got)
+	}
+
+	// The tripping chunk itself carries finish_reason: nothing is left open,
+	// but the error is still reported.
+	p, _ = newGuardedSSEParser(t, "openai", cfg)
+	_, tail = p.feed([]byte(sseEvent(map[string]interface{}{"id": "c", "choices": []interface{}{
+		map[string]interface{}{"index": 0, "delta": map[string]interface{}{"reasoning_content": loopText(2000)}, "finish_reason": "length"}}})))
+	if tail == nil {
+		t.Fatal("no trip")
+	}
+	if got := choicesOf(tail); len(got) != 0 || !strings.Contains(string(tail), `"degenerate_output"`) {
+		t.Errorf("finished tripping choice: choices %v, tail %s", got, tail)
+	}
+}
+
+func TestStreamLoopEndReasonClassification(t *testing.T) {
+	live := context.Background()
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	trip := &loopTrip{channel: loopContent}
+	cases := []struct {
+		trip *loopTrip
+		err  error
+		ctx  context.Context
+		want EndReason
+	}{
+		{trip, nil, live, EndStreamLoopAbort},
+		{trip, io.EOF, gone, EndStreamLoopAbort},
+		{nil, io.EOF, live, EndComplete},
+		{nil, io.EOF, gone, EndComplete},
+		{nil, context.Canceled, gone, EndClientDisconnect},
+		{nil, nil, gone, EndClientDisconnect},
+		{nil, nil, live, EndClientDisconnect}, // copy stopped: client write failed
+		{nil, io.ErrUnexpectedEOF, live, EndUpstreamError},
+		{nil, fmt.Errorf("backend idle timeout (1s)"), live, EndUpstreamError},
+	}
+	for i, c := range cases {
+		if got := streamEndReason(c.trip, c.err, c.ctx); got != c.want {
+			t.Errorf("case %d: got %q, want %q", i, got, c.want)
+		}
+	}
+}

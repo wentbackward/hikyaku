@@ -67,6 +67,11 @@ type streamLoopRoute struct {
 	route string // metric/log label: the route's canonical virtual_model
 }
 
+// guarded reports whether the request's stream will be measured.
+func (sl *streamLoopRoute) guarded() bool {
+	return sl != nil && sl.cfg.Active()
+}
+
 // ── Compression ratio ────────────────────────────────────────────────────────
 
 // deflater is a pooled level-9 raw-deflate writer that only counts its output,
@@ -354,7 +359,8 @@ func (t *loopTrip) errorObject() map[string]interface{} {
 }
 
 // openAIAbortTail ends an OpenAI-compatible SSE stream: one chunk that closes
-// every choice seen with finish_reason "error" and carries the error object,
+// every still-open choice (open) with finish_reason "error" and carries the
+// error object (choices is empty when every choice had already finished),
 // then [DONE]. The leading newline terminates the event the stream was cut
 // after (a spare blank line is harmless in SSE). object, id and model echo the
 // upstream's own chunks; a text_completion stream gets the completions shape.
@@ -364,9 +370,6 @@ func openAIAbortTail(t *loopTrip, object, id, model, rid string, choices []int) 
 	}
 	if id == "" {
 		id = "hikyaku-" + rid
-	}
-	if len(choices) == 0 {
-		choices = []int{t.choice}
 	}
 	cs := make([]interface{}, 0, len(choices))
 	for _, i := range choices {

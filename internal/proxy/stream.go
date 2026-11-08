@@ -29,6 +29,8 @@ const maxContentCapture = 32768 // 32KB cap for L4 response capture
 type streamParser interface {
 	feed(data []byte) (forward int, abortTail []byte)
 	recordFinal()
+	// abortTrip returns the stream loop trip that ended the stream, or nil.
+	abortTrip() *loopTrip
 	usageSource
 }
 
@@ -83,14 +85,21 @@ type sseParser struct {
 
 	// Stream loop detection (nil = off). The upstream's object/id/model and
 	// the choice indices seen are kept only to shape the abort chunk.
-	loop          *streamLoopGuard
-	loopTrip      *loopTrip
-	aborted       bool
-	rid           string
-	upObject      string
-	upID          string
-	upModel       string
-	choiceIndices []int
+	loop     *streamLoopGuard
+	loopTrip *loopTrip
+	aborted  bool
+	rid      string
+	upObject string
+	upID     string
+	upModel  string
+	choices  []loopChoiceState // choices seen, in order (bounded by maxLoopChoices)
+}
+
+// loopChoiceState records whether a choice already sent its finish_reason,
+// so the abort chunk closes only the choices still open.
+type loopChoiceState struct {
+	index    int
+	finished bool
 }
 
 func newSSEParser(backendID, model, backendType string, t0 time.Time, m *telemetry.Metrics, ctx context.Context) *sseParser {
@@ -146,10 +155,10 @@ func (p *sseParser) feed(in []byte) (forward int, abortTail []byte) {
 
 // handleLine processes one complete SSE line.
 func (p *sseParser) handleLine(line []byte) {
-	if !bytes.HasPrefix(line, []byte("data: ")) {
+	payload, ok := sseData(line)
+	if !ok {
 		return
 	}
-	payload := line[6:]
 	if bytes.Equal(payload, []byte("[DONE]")) {
 		if p.backendType == "anthropic" {
 			p.recordAnthropicTokens()
@@ -169,12 +178,37 @@ func (p *sseParser) handleLine(line []byte) {
 	}
 }
 
+// sseData returns the value of an SSE "data" field line. Per the SSE spec the
+// colon may be followed by one optional space ("data: x" and "data:x" carry
+// the same value).
+func sseData(line []byte) ([]byte, bool) {
+	rest, ok := bytes.CutPrefix(line, []byte("data:"))
+	if !ok {
+		return nil, false
+	}
+	return bytes.TrimPrefix(rest, []byte(" ")), true
+}
+
+// abortTrip returns the trip that ended the stream, or nil.
+func (p *sseParser) abortTrip() *loopTrip {
+	if p.aborted {
+		return p.loopTrip
+	}
+	return nil
+}
+
 // abortTail builds the lane's closing error for the trip.
 func (p *sseParser) abortTail() []byte {
 	if p.backendType == "anthropic" {
 		return anthropicAbortTail(p.loopTrip)
 	}
-	return openAIAbortTail(p.loopTrip, p.upObject, p.upID, p.upModel, p.rid, p.choiceIndices)
+	open := make([]int, 0, len(p.choices))
+	for _, c := range p.choices {
+		if !c.finished {
+			open = append(open, c.index)
+		}
+	}
+	return openAIAbortTail(p.loopTrip, p.upObject, p.upID, p.upModel, p.rid, open)
 }
 
 // observeOpenAILoop feeds every choice's reasoning and content text to the
@@ -203,7 +237,13 @@ func (p *sseParser) observeOpenAILoop(evt map[string]interface{}) {
 			}
 			idx = int(f)
 		}
-		p.noteChoice(idx)
+		// A choice that sent its finish_reason is closed even if the same
+		// chunk trips below; the abort chunk must not finish it twice.
+		finished := false
+		if fr, _ := ch["finish_reason"].(string); fr != "" {
+			finished = true
+		}
+		p.noteChoice(idx, finished)
 		var reasoning, content string
 		if delta, ok := ch["delta"].(map[string]interface{}); ok {
 			// vLLM sends reasoning_content; newer servers send reasoning.
@@ -226,15 +266,17 @@ func (p *sseParser) observeOpenAILoop(evt map[string]interface{}) {
 	}
 }
 
-// noteChoice remembers a choice index for the abort chunk (bounded).
-func (p *sseParser) noteChoice(idx int) {
-	for _, i := range p.choiceIndices {
-		if i == idx {
+// noteChoice remembers a choice index, and whether it has finished, for the
+// abort chunk (bounded).
+func (p *sseParser) noteChoice(idx int, finished bool) {
+	for i := range p.choices {
+		if p.choices[i].index == idx {
+			p.choices[i].finished = p.choices[i].finished || finished
 			return
 		}
 	}
-	if len(p.choiceIndices) < maxLoopChoices {
-		p.choiceIndices = append(p.choiceIndices, idx)
+	if len(p.choices) < maxLoopChoices {
+		p.choices = append(p.choices, loopChoiceState{index: idx, finished: finished})
 	}
 }
 
@@ -571,6 +613,14 @@ func (p *ollamaParser) handleLine(line []byte) {
 	if obj.EvalCount > 0 {
 		p.completionToks = obj.EvalCount
 	}
+}
+
+// abortTrip returns the trip that ended the stream, or nil.
+func (p *ollamaParser) abortTrip() *loopTrip {
+	if p.aborted {
+		return p.loopTrip
+	}
+	return nil
 }
 
 // recordFinal parses a final line that arrived without a trailing newline,

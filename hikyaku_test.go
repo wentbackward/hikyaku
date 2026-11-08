@@ -57,3 +57,21 @@ backends:
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux) // exported Server method reachable via the facade alias
 }
+
+// The end-reason values are part of the embedding seam and must not drift.
+func TestFacade_EndReasonValues(t *testing.T) {
+	want := map[hikyaku.EndReason]string{
+		hikyaku.EndComplete:         "complete",
+		hikyaku.EndClientDisconnect: "client_disconnect",
+		hikyaku.EndUpstreamError:    "upstream_error",
+		hikyaku.EndStreamLoopAbort:  "stream_loop_abort",
+	}
+	for got, s := range want {
+		if string(got) != s {
+			t.Errorf("%q != %q", got, s)
+		}
+	}
+	var ev hikyaku.UsageEvent
+	ev.EndReason, ev.LoopChannel = hikyaku.EndStreamLoopAbort, "reasoning"
+	_ = ev
+}

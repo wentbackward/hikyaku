@@ -103,6 +103,51 @@ type UsageEvent struct {
 	Streamed         bool
 	Status           int
 	Duration         time.Duration
+	// EndReason says how the response ended. Status is the upstream's HTTP
+	// status, which is 200 for every streamed response however it ended, so
+	// an aborted or cut-off stream (whose final usage chunk never arrived and
+	// whose token counts are therefore partial or zero) is distinguishable
+	// from a complete one only here. Token counts are never estimated.
+	EndReason EndReason
+	// LoopChannel is the measured channel ("reasoning" or "content") that
+	// tripped when EndReason is EndStreamLoopAbort; empty otherwise.
+	LoopChannel string
+}
+
+// EndReason classifies how a proxied response ended (UsageEvent.EndReason).
+type EndReason string
+
+const (
+	// EndComplete: the upstream response was read to its end. Every
+	// non-streamed response that reached the observer ends this way.
+	EndComplete EndReason = "complete"
+	// EndClientDisconnect: the client went away before the stream ended.
+	EndClientDisconnect EndReason = "client_disconnect"
+	// EndUpstreamError: reading the upstream stream failed (connection
+	// reset, truncated body, idle timeout).
+	EndUpstreamError EndReason = "upstream_error"
+	// EndStreamLoopAbort: stream loop detection ended the stream and closed
+	// the upstream request; LoopChannel names the channel that tripped.
+	EndStreamLoopAbort EndReason = "stream_loop_abort"
+)
+
+// streamEndReason classifies a streamed response at close. readErr is the
+// first error the upstream body returned (io.EOF on a clean end).
+func streamEndReason(trip *loopTrip, readErr error, reqCtx context.Context) EndReason {
+	switch {
+	case trip != nil:
+		return EndStreamLoopAbort
+	case errors.Is(readErr, io.EOF):
+		return EndComplete
+	case reqCtx.Err() != nil:
+		return EndClientDisconnect
+	case readErr != nil:
+		return EndUpstreamError
+	default:
+		// The copy stopped with no upstream end and no read error: the
+		// reverse proxy gave up because writing to the client failed.
+		return EndClientDisconnect
+	}
 }
 
 // usageCounts is the per-request token tally a lane parser extracts from an
@@ -765,7 +810,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 
 	rp := &httputil.ReverseProxy{
 		Transport:      s.transport,
-		Director:       director(targetURL, backend, newBody, opts.pathOverride, routeHeaders(res)),
+		Director:       director(targetURL, backend, newBody, opts.pathOverride, routeHeaders(res), loopRoute.guarded()),
 		ModifyResponse: s.modifyResponse(rid, backendID, modelName, realModel, r.URL.Path, backend.Type, backend.TimeoutSeconds, isStreaming, t0, metricsCtx, r.Context(), capCtx, lbGroup, lbAffKey, bytesHeld, loopRoute), //nolint:bodyclose // ReverseProxy owns the response body; ModifyResponse wraps or reads-and-restores it, and the framework closes it client-side.
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			s.bufferedBytes.Add(-bytesHeld)
@@ -917,7 +962,15 @@ func safeHeaders(h http.Header) map[string]string {
 // director returns an httputil.ReverseProxy Director that rewrites the request
 // for the given backend. If pathOverride is non-empty, it replaces the request
 // path (used by completions/embeddings to force the backend path).
-func director(target *url.URL, backend *config.Backend, body []byte, pathOverride string, routeHeaders config.HeadersOp) func(*http.Request) {
+//
+// identityResponse drops the caller's Accept-Encoding so the upstream answers
+// uncompressed (Go's transport may still negotiate gzip itself and then
+// decodes it transparently). Stream loop detection sets it: the lane parsers
+// read the response bytes, and they cannot read a compressed body. It is
+// applied before the header operations, so an operator who sets
+// Accept-Encoding on a backend or route keeps that setting (the stream is
+// then counted as unguarded if the answer comes back encoded).
+func director(target *url.URL, backend *config.Backend, body []byte, pathOverride string, routeHeaders config.HeadersOp, identityResponse bool) func(*http.Request) {
 	return func(req *http.Request) {
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
@@ -954,6 +1007,9 @@ func director(target *url.URL, backend *config.Backend, body []byte, pathOverrid
 		req.ContentLength = int64(len(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Del("Transfer-Encoding")
+		if identityResponse {
+			req.Header.Del("Accept-Encoding")
+		}
 
 		// Header manipulation: backend-level first (infrastructure), then
 		// route-level (request-specific) so route wins on conflict.
@@ -1157,6 +1213,17 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 			// The stream loop guard (nil when detection is off for the route)
 			// rides on the parser, which already decodes every event.
 			guard := newStreamLoopGuard(loopRoute, rid, backendID, s.metrics, metricsCtx, s.loopSampler.Load())
+			if guard != nil {
+				// The parsers read plain bytes. A body the transport left
+				// compressed cannot be measured: say so instead of failing
+				// open silently.
+				if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+					s.metrics.StreamLoopUnguarded.Add(metricsCtx, 1, telemetry.StreamLoopUnguardedAttrs(loopRoute.route, backendID, "content_encoding"))
+					log.Printf("stream_loop_unguarded route=%s backend=%s reason=content_encoding encoding=%s request_id=%s",
+						logValue(loopRoute.route), logValue(backendID), logValue(enc), rid)
+					guard = nil
+				}
+			}
 			var parser streamParser
 			var ssep *sseParser
 			if backendType == "ollama" {
@@ -1194,12 +1261,18 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 					s.metrics.RequestBodyBytesBuffered.Record(metricsCtx, float64(s.bufferedBytes.Load()))
 					parser.recordFinal()
 					counts := parser.usage()
+					trip := parser.abortTrip()
+					var loopChannel string
+					if trip != nil {
+						loopChannel = trip.channel.String()
+					}
 					s.emitUsage(UsageEvent{
 						Ctx: reqCtx, RequestID: rid, VirtualModel: virtualModel, RealModel: realModel,
 						Backend: backendID, BackendType: backendType,
 						PromptTokens: counts.prompt, CompletionTokens: counts.completion,
 						CacheReadTokens: counts.cacheRead, CacheWriteTokens: counts.cacheWrite,
 						Streamed: true, Status: status, Duration: time.Since(t0),
+						EndReason: streamEndReason(trip, readErr, reqCtx), LoopChannel: loopChannel,
 					})
 					elapsed := time.Since(t0).Seconds()
 					s.metrics.ActiveRequests.Add(metricsCtx, -1, telemetry.BackendAttrs(backendID, realModel))
@@ -1293,6 +1366,7 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 				PromptTokens: counts.prompt, CompletionTokens: counts.completion,
 				CacheReadTokens: counts.cacheRead, CacheWriteTokens: counts.cacheWrite,
 				Streamed: false, Status: resp.StatusCode, Duration: time.Since(t0),
+				EndReason: EndComplete,
 			})
 
 			// L4: log non-streaming response content

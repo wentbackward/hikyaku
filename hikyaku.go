@@ -45,6 +45,18 @@ type (
 	UsageEvent = proxy.UsageEvent
 	// UsageObserver receives a UsageEvent per completed request (see WithUsageObserver).
 	UsageObserver = proxy.UsageObserver
+	// EndReason classifies how a response ended (UsageEvent.EndReason).
+	EndReason = proxy.EndReason
+)
+
+// UsageEvent.EndReason values. A streamed response's Status is 200 however it
+// ended; only EndReason tells a complete stream from a cut-off one, whose token
+// counts are partial or zero (core never estimates them).
+const (
+	EndComplete         = proxy.EndComplete         // read to its end
+	EndClientDisconnect = proxy.EndClientDisconnect // the client went away mid-stream
+	EndUpstreamError    = proxy.EndUpstreamError    // reading the upstream stream failed
+	EndStreamLoopAbort  = proxy.EndStreamLoopAbort  // stream loop detection ended it; see UsageEvent.LoopChannel
 )
 
 // WithExternalGatewayTLS asserts the embedder serves the gateway listener with a

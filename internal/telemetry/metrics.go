@@ -27,6 +27,7 @@ type Metrics struct {
 	RequestBodyBytesBuffered metric.Float64Gauge
 	StreamRatio              metric.Float64Histogram // stream loop detection: deflate ratio per evaluated window
 	StreamLoopTrips          metric.Int64Counter     // stream loop detection: trips by mode
+	StreamLoopUnguarded      metric.Int64Counter     // stream loop detection: guarded streams that could not be measured
 }
 
 // StreamRatioBuckets are the hikyaku_stream_ratio bucket boundaries: 0.10 to
@@ -158,6 +159,13 @@ func New(provider metric.MeterProvider) (*Metrics, error) {
 		return nil, err
 	}
 
+	loopUnguarded, err := meter.Int64Counter("hikyaku_stream_loop_unguarded_total",
+		metric.WithDescription("Stream loop detection: streams on a guarded route that could not be measured, by reason"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Metrics{
 		RequestDuration:          reqDur,
 		TTFT:                     ttft,
@@ -173,6 +181,7 @@ func New(provider metric.MeterProvider) (*Metrics, error) {
 		RequestBodyBytesBuffered: bufferedBytes,
 		StreamRatio:              streamRatio,
 		StreamLoopTrips:          loopTrips,
+		StreamLoopUnguarded:      loopUnguarded,
 	}, nil
 }
 
@@ -209,5 +218,15 @@ func StreamLoopTripAttrs(route, backend, channel, mode string) metric.Measuremen
 		attribute.String("backend", backend),
 		attribute.String("channel", channel),
 		attribute.String("mode", mode),
+	)
+}
+
+// StreamLoopUnguardedAttrs returns the label set for
+// hikyaku_stream_loop_unguarded_total.
+func StreamLoopUnguardedAttrs(route, backend, reason string) metric.MeasurementOption {
+	return metric.WithAttributes(
+		attribute.String("route", route),
+		attribute.String("backend", backend),
+		attribute.String("reason", reason),
 	)
 }
