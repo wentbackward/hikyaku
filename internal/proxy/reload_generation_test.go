@@ -1,11 +1,9 @@
-//go:build !hardened
-
 package proxy
 
-// Inspect-only: these tests apply configs with plaintext gateways and http://
-// backends, which the hardened listen policy rejects. The generation swap they
-// exercise is the same code in both builds; the hardened ApplyConfig path is
-// covered by the facade test with an https backend.
+// These tests run in both builds: the backends are https (httptest's shared
+// localhost certificate, trusted through a TransportFactory) and every apply
+// asserts a runtime gateway certificate (WithExternalGatewayTLS), so the
+// hardened listen policy accepts them, as it does for the pro router.
 
 import (
 	"bytes"
@@ -18,22 +16,72 @@ import (
 
 	"github.com/wentbackward/hikyaku/internal/balancer"
 	"github.com/wentbackward/hikyaku/internal/config"
+	"github.com/wentbackward/hikyaku/internal/telemetry"
 )
 
-// ApplyConfig swaps the balancer while requests are in flight, including a
-// switch between a grouped and an ungrouped config. Every request must finish
-// on the balancer it started on (no data race under -race, no nil balancer,
-// no in-flight count left behind).
-func TestLB_ApplyConfigDuringTrafficSwapsBalancerSafely(t *testing.T) {
-	srv, backends := newLBTestServer(t)
-	for _, be := range backends {
-		t.Cleanup(be.Close)
+func applyTestConfig(t *testing.T, yaml string) *config.Config {
+	t.Helper()
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
 	}
-	grouped := srv.Config()
-	ungrouped := applyTestConfig(t, fmt.Sprintf(`
-server:
-  allow_plaintext: true
-backends:
+	return cfg
+}
+
+func tlsChatBackend(t *testing.T) *httptest.Server {
+	t.Helper()
+	be := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"id":"x","object":"chat.completion","model":"m","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}]}`)
+	}))
+	t.Cleanup(be.Close)
+	return be
+}
+
+const genGroupStanza = `    strategy: sticky_least_loaded
+    affinity:
+      key: first_user_message
+    health_check:
+      path: /v1/models
+      interval_seconds: 10
+      timeout_seconds: 2
+      unhealthy_after: 3
+`
+
+// genConfigs returns three configs over https backends: g1{lb-a, lb-b},
+// g2{lb-c} (same route, different group and members) and an ungrouped one.
+func genConfigs(t *testing.T) (srv *Server, grouped, moved, ungrouped *config.Config) {
+	t.Helper()
+	a, b, c := tlsChatBackend(t), tlsChatBackend(t), tlsChatBackend(t)
+	grouped = applyTestConfig(t, fmt.Sprintf(`backends:
+  - id: lb-a
+    type: openai
+    base_url: %q
+    group: g1
+  - id: lb-b
+    type: openai
+    base_url: %q
+    group: g1
+groups:
+  g1:
+`+genGroupStanza+`routes:
+  - virtual_model: coder
+    backend_group: g1
+    real_model: qwen-27b
+`, a.URL+"/v1", b.URL+"/v1"))
+	moved = applyTestConfig(t, fmt.Sprintf(`backends:
+  - id: lb-c
+    type: openai
+    base_url: %q
+    group: g2
+groups:
+  g2:
+`+genGroupStanza+`routes:
+  - virtual_model: coder
+    backend_group: g2
+    real_model: qwen-27b
+`, c.URL+"/v1"))
+	ungrouped = applyTestConfig(t, fmt.Sprintf(`backends:
   - id: lb-a
     type: openai
     base_url: %q
@@ -41,7 +89,28 @@ routes:
   - virtual_model: coder
     backend: lb-a
     real_model: qwen-27b
-`, backends[0].URL))
+`, a.URL+"/v1"))
+	metrics, _, _ := telemetry.Init()
+	// httptest TLS servers share one certificate, so a's client trusts all three.
+	srv = New("test", "inspect", grouped, metrics, nil, WithTransportFactory(staticFactory{rt: a.Client().Transport}))
+	t.Cleanup(func() {
+		if bal := srv.Balancer(); bal != nil {
+			bal.Stop()
+		}
+	})
+	return srv, grouped, moved, ungrouped
+}
+
+func apply(srv *Server, cfg *config.Config) error {
+	return srv.ApplyConfig(cfg, config.WithExternalGatewayTLS())
+}
+
+// ApplyConfig swaps the balancer while requests are in flight, including a
+// switch between a grouped and an ungrouped config. Every request must finish
+// on the balancer it started on (no data race under -race, no nil balancer,
+// no in-flight count left behind).
+func TestLB_ApplyConfigDuringTrafficSwapsBalancerSafely(t *testing.T) {
+	srv, grouped, _, ungrouped := genConfigs(t)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -78,12 +147,12 @@ routes:
 		if i%2 == 0 {
 			next = ungrouped
 		}
-		if applyErr = srv.ApplyConfig(next); applyErr != nil {
+		if applyErr = apply(srv, next); applyErr != nil {
 			break
 		}
 	}
 	if applyErr == nil {
-		applyErr = srv.ApplyConfig(grouped)
+		applyErr = apply(srv, grouped)
 	}
 	close(stop)
 	wg.Wait()
@@ -106,35 +175,7 @@ routes:
 // router or balancer: a backend id or group the request's config does not
 // know would be dereferenced as nil.
 func TestLB_ApplyConfigChangingGroupMembersDuringTraffic(t *testing.T) {
-	srv, backends := newLBTestServer(t)
-	for _, be := range backends {
-		t.Cleanup(be.Close)
-	}
-	grouped := srv.Config()
-	be3 := okBackend(t)
-	moved := applyTestConfig(t, fmt.Sprintf(`
-server:
-  allow_plaintext: true
-backends:
-  - id: lb-c
-    type: openai
-    base_url: %q
-    group: g2
-groups:
-  g2:
-    strategy: sticky_least_loaded
-    affinity:
-      key: first_user_message
-    health_check:
-      path: /v1/models
-      interval_seconds: 10
-      timeout_seconds: 2
-      unhealthy_after: 3
-routes:
-  - virtual_model: coder
-    backend_group: g2
-    real_model: qwen-27b
-`, be3.URL+"/v1"))
+	srv, grouped, moved, _ := genConfigs(t)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -169,7 +210,7 @@ routes:
 		if i%2 == 0 {
 			next = moved
 		}
-		if applyErr = srv.ApplyConfig(next); applyErr != nil {
+		if applyErr = apply(srv, next); applyErr != nil {
 			break
 		}
 	}
@@ -188,14 +229,9 @@ routes:
 // generation a reader can observe has a balancer that knows each of the
 // config's groups and backends.
 func TestServer_StateGenerationIsConsistent(t *testing.T) {
-	srv, backends := newLBTestServer(t)
-	for _, be := range backends {
-		t.Cleanup(be.Close)
-	}
-	grouped := srv.Config()
-	ungrouped := applyTestConfig(t, fmt.Sprintf("server:\n  allow_plaintext: true\nbackends:\n  - id: lb-a\n    type: openai\n    base_url: %q\nroutes:\n  - virtual_model: coder\n    backend: lb-a\n    real_model: qwen-27b\n", backends[0].URL))
-	for i, next := range []*config.Config{ungrouped, grouped, ungrouped} {
-		if err := srv.ApplyConfig(next); err != nil {
+	srv, grouped, moved, ungrouped := genConfigs(t)
+	for i, next := range []*config.Config{ungrouped, grouped, moved, ungrouped} {
+		if err := apply(srv, next); err != nil {
 			t.Fatalf("ApplyConfig %d: %v", i, err)
 		}
 		st := srv.state.Load()
@@ -207,6 +243,9 @@ func TestServer_StateGenerationIsConsistent(t *testing.T) {
 		}
 		for name := range next.Groups {
 			for _, b := range next.Backends {
+				// No membership lookup is exported; IsBackendHealthy reports
+				// false for an id in no group, and a fresh balancer starts
+				// every member healthy (unhealthy_after: 3 cannot trip here).
 				if b.Group == name && !st.bal.IsBackendHealthy(b.ID) {
 					t.Fatalf("generation %d: balancer does not know backend %q of group %q", i, b.ID, name)
 				}

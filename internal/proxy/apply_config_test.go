@@ -2,6 +2,11 @@
 
 package proxy
 
+// Inspect-only: these tests use plaintext gateways and http:// backends, which
+// the hardened listen policy rejects by design. The generation swap is tested
+// in both builds in reload_generation_test.go; the hardened ApplyConfig gate in
+// the facade test.
+
 import (
 	"fmt"
 	"net/http"
@@ -17,15 +22,6 @@ import (
 // ApplyConfig is the embedder's programmatic reload: the same gate the SIGHUP
 // path runs (listen policy, with the embedder's options) followed by the
 // atomic swap Reload performs. A rejected config changes nothing.
-
-func applyTestConfig(t *testing.T, yaml string) *config.Config {
-	t.Helper()
-	cfg, err := config.Parse([]byte(yaml))
-	if err != nil {
-		t.Fatalf("Parse: %v", err)
-	}
-	return cfg
-}
 
 func okBackend(t *testing.T) *httptest.Server {
 	t.Helper()
