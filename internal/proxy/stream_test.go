@@ -405,7 +405,11 @@ func TestInterceptedBody_OnCloseCalledOnce(t *testing.T) {
 }
 
 // endlessBody never ends until closed.
-type endlessBody struct{ closed chan struct{} }
+// Every successful Read is announced on reads (when it has room).
+type endlessBody struct {
+	closed chan struct{}
+	reads  chan struct{}
+}
 
 func (e *endlessBody) Read(p []byte) (int, error) {
 	select {
@@ -415,6 +419,10 @@ func (e *endlessBody) Read(p []byte) (int, error) {
 	}
 	for i := range p {
 		p[i] = 'x'
+	}
+	select {
+	case e.reads <- struct{}{}:
+	default:
 	}
 	return len(p), nil
 }
@@ -431,12 +439,19 @@ func (e *endlessBody) Close() error {
 // Closing an idleTimeoutBody whose consumer stopped reading must release its
 // read goroutine (it used to block forever on a full channel).
 func TestIdleTimeoutBody_CloseReleasesReader(t *testing.T) {
-	b := newIdleTimeoutBody(&endlessBody{closed: make(chan struct{})}, time.Minute)
+	up := &endlessBody{closed: make(chan struct{}), reads: make(chan struct{}, 8)}
+	b := newIdleTimeoutBody(up, time.Minute)
 	buf := make([]byte, 16)
 	if _, err := b.Read(buf); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(10 * time.Millisecond) // let readLoop fill the channel and block on the next send
+	// Three upstream reads have returned: the first result was consumed
+	// above, the second fills the one-slot channel, so the third result has
+	// nowhere to go — readLoop is at (or about to block on) its send, and
+	// nothing will ever read b.ch again.
+	for i := 0; i < 3; i++ {
+		<-up.reads
+	}
 	_ = b.Close()
 	select {
 	case <-b.done:
