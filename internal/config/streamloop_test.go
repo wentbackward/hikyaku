@@ -313,3 +313,63 @@ func TestLoopDetection_NoKeyNoDeprecation(t *testing.T) {
 		t.Errorf("unexpected deprecations: %q", dep)
 	}
 }
+
+// YAML merge keys resolve like aliases: merged values apply, and merged keys
+// are held to the same strict key check.
+func TestStreamLoop_YAMLMergeKeys(t *testing.T) {
+	cfg := mustLoadSL(t, `
+x-shadow: &shadow
+  mode: shadow
+  threshold: 0.42
+x-window: &window
+  window_chars: 1500
+defenders:
+  stream_loop_detection:
+    enabled: true
+    channels:
+      reasoning:
+        <<: *shadow
+        hard_threshold: 0.25
+routes:
+  - virtual_model: coder
+    backend: local
+    defenders:
+      stream_loop_detection:
+        channels:
+          content:
+            <<: [*shadow, *window]
+`)
+	g := cfg.GetStreamLoopDetection(nil)
+	if g.Reasoning.Mode != StreamLoopShadow || g.Reasoning.Threshold != 0.42 || g.Reasoning.HardThreshold != 0.25 {
+		t.Errorf("global merge not applied: %+v", g.Reasoning)
+	}
+	coder, _ := cfg.Route("coder")
+	c := cfg.GetStreamLoopDetection(coder).Content
+	if c.Mode != StreamLoopShadow || c.Threshold != 0.42 || c.WindowChars != 1500 {
+		t.Errorf("route list merge not applied: %+v", c)
+	}
+
+	_, err := loadSL(t, `
+x-bad: &bad
+  treshold: 0.3
+defenders:
+  stream_loop_detection:
+    channels:
+      reasoning:
+        <<: *bad
+`)
+	if err == nil || !strings.Contains(err.Error(), `unknown key "treshold"`) {
+		t.Errorf("unknown key behind a merge must be rejected, got %v", err)
+	}
+
+	_, err = loadSL(t, `
+defenders:
+  stream_loop_detection:
+    channels:
+      reasoning:
+        "<<": {mode: shadow}
+`)
+	if err == nil || !strings.Contains(err.Error(), `unknown key "<<"`) {
+		t.Errorf("a quoted \"<<\" is an ordinary key, not a merge: got %v", err)
+	}
+}

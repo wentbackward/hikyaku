@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -289,26 +290,58 @@ func (s *StreamLoopSamplesConfig) UnmarshalYAML(n *yaml.Node) error {
 	return n.Decode((*plain)(s))
 }
 
-// allowKeys rejects any mapping key of n not in allowed. A non-mapping node
-// is left to Decode, which reports the type error.
+// allowKeys rejects any mapping key of n not in allowed. YAML merge keys
+// (<<: *anchor, or a list of anchors) are resolved like aliases: the merged
+// mappings' keys are checked too, and the values are merged by Decode. A
+// non-mapping node is left to Decode, which reports the type error.
 func allowKeys(n *yaml.Node, where string, allowed ...string) error {
+	n = resolveAlias(n)
 	if n.Kind != yaml.MappingNode {
 		return nil
 	}
 	for i := 0; i+1 < len(n.Content); i += 2 {
-		k := n.Content[i].Value
-		ok := false
-		for _, a := range allowed {
-			if k == a {
-				ok = true
-				break
+		k, v := n.Content[i], n.Content[i+1]
+		if isMergeKey(k) {
+			if err := allowMergedKeys(v, where, allowed); err != nil {
+				return err
 			}
+			continue
 		}
-		if !ok {
-			return fmt.Errorf("line %d: %s: unknown key %q (allowed: %s)", n.Content[i].Line, where, k, strings.Join(allowed, ", "))
+		if !slices.Contains(allowed, k.Value) {
+			return fmt.Errorf("line %d: %s: unknown key %q (allowed: %s)", k.Line, where, k.Value, strings.Join(allowed, ", "))
 		}
 	}
 	return nil
+}
+
+// allowMergedKeys checks the mapping (or sequence of mappings) a merge key
+// pulls in.
+func allowMergedKeys(v *yaml.Node, where string, allowed []string) error {
+	v = resolveAlias(v)
+	switch v.Kind {
+	case yaml.MappingNode:
+		return allowKeys(v, where, allowed...)
+	case yaml.SequenceNode:
+		for _, e := range v.Content {
+			if err := allowMergedKeys(e, where, allowed); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("line %d: %s: a merge key (<<) must refer to a mapping or a list of mappings", v.Line, where)
+	}
+}
+
+func isMergeKey(k *yaml.Node) bool {
+	return k.Kind == yaml.ScalarNode && k.ShortTag() == "!!merge"
+}
+
+func resolveAlias(n *yaml.Node) *yaml.Node {
+	for n != nil && n.Kind == yaml.AliasNode {
+		n = n.Alias
+	}
+	return n
 }
 
 // ── Removed: request-repeat loop_detection ───────────────────────────────────
