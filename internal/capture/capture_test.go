@@ -1,3 +1,5 @@
+//go:build !hardened
+
 package capture
 
 import (

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/wentbackward/hikyaku/internal/config"
@@ -186,4 +187,81 @@ func TestLB_NoGroupFallsBackToSingleBackend(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Errorf("single-backend route: got %d, want 200", rec.Code)
 	}
+}
+
+// ApplyConfig swaps the balancer while requests are in flight, including a
+// switch between a grouped and an ungrouped config. Every request must finish
+// on the balancer it started on (no data race under -race, no nil balancer,
+// no in-flight count left behind).
+func TestLB_ApplyConfigDuringTrafficSwapsBalancerSafely(t *testing.T) {
+	srv, backends := newLBTestServer(t)
+	for _, be := range backends {
+		t.Cleanup(be.Close)
+	}
+	grouped := srv.Config()
+	ungrouped := applyTestConfig(t, fmt.Sprintf(`
+server:
+  allow_plaintext: true
+backends:
+  - id: lb-a
+    type: openai
+    base_url: %q
+routes:
+  - virtual_model: coder
+    backend: lb-a
+    real_model: qwen-27b
+`, backends[0].URL))
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				body, _ := json.Marshal(map[string]interface{}{
+					"model":    "coder",
+					"messages": []interface{}{map[string]interface{}{"role": "user", "content": fmt.Sprintf("w%d-%d", w, i)}},
+				})
+				req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				rec := httptest.NewRecorder()
+				srv.handleProxy(rec, req)
+				// 503 only in the instant a reload has stored a grouped config
+				// but not yet published its balancer.
+				if rec.Code != http.StatusOK && rec.Code != http.StatusServiceUnavailable {
+					t.Errorf("status %d: %s", rec.Code, rec.Body.String())
+					return
+				}
+			}
+		}(w)
+	}
+	for i := 0; i < 40; i++ {
+		next := grouped
+		if i%2 == 0 {
+			next = ungrouped
+		}
+		if err := srv.ApplyConfig(next); err != nil {
+			t.Fatalf("ApplyConfig: %v", err)
+		}
+	}
+	if err := srv.ApplyConfig(grouped); err != nil {
+		t.Fatalf("ApplyConfig: %v", err)
+	}
+	close(stop)
+	wg.Wait()
+
+	bal := srv.Balancer()
+	if bal == nil {
+		t.Fatal("grouped config must publish a balancer")
+	}
+	if n := bal.TotalInFlight(); n != 0 {
+		t.Fatalf("in-flight count after all requests finished = %d, want 0", n)
+	}
+	sendChat(t, srv, "coder", http.StatusOK)
 }

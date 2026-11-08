@@ -45,10 +45,10 @@ type Server struct {
 	cfg         atomic.Pointer[config.Config]
 	rtr         atomic.Pointer[router.Router]
 	metrics     *telemetry.Metrics
-	journal     *journal.Journal                // nil if journal disabled
-	capture     atomic.Pointer[capture.Capture] // nil value = capture disabled; rebuilt on Reload
-	balancer    *balancer.Balancer              // nil if no groups configured
-	loopSampler atomic.Pointer[loopSampler]     // nil = no stream-loop samples (always nil in hardened); rebuilt on Reload
+	journal     *journal.Journal                  // nil if journal disabled
+	capture     atomic.Pointer[capture.Capture]   // nil value = capture disabled; rebuilt on Reload
+	balancer    atomic.Pointer[balancer.Balancer] // nil if no groups configured; swapped by reload, loaded once per request
+	loopSampler atomic.Pointer[loopSampler]       // nil = no stream-loop samples (always nil in hardened); rebuilt on Reload
 
 	transport     http.RoundTripper        // shared outbound transport (default *http.Transport; override via WithTransportFactory)
 	usageObserver UsageObserver            // nil unless set via WithUsageObserver (pro accounting seam)
@@ -226,7 +226,7 @@ func New(version, buildMode string, cfg *config.Config, metrics *telemetry.Metri
 		o(s)
 	}
 	if len(cfg.Groups) > 0 {
-		s.balancer = s.newBalancer(cfg)
+		s.balancer.Store(s.newBalancer(cfg))
 	}
 	return s
 }
@@ -295,7 +295,7 @@ func (s *Server) Capture() *capture.Capture {
 
 // Balancer returns the current balancer (may be nil if no groups configured).
 func (s *Server) Balancer() *balancer.Balancer {
-	return s.balancer
+	return s.balancer.Load()
 }
 
 // ApplyConfig is the programmatic counterpart of a SIGHUP reload for
@@ -345,16 +345,14 @@ func (s *Server) reload(cfg *config.Config) {
 	// Swap balancer on reload; the new one probes through the same outbound
 	// transport as before (a factory's transport is reconfigured in place by the
 	// embedder, never replaced).
-	if s.balancer != nil {
-		old := s.balancer
-		if len(cfg.Groups) > 0 {
-			s.balancer = s.newBalancer(cfg)
-		} else {
-			s.balancer = nil
-		}
+	// Requests load the pointer once and finish on the balancer they started
+	// on, so in-flight counts never move between balancers.
+	var next *balancer.Balancer
+	if len(cfg.Groups) > 0 {
+		next = s.newBalancer(cfg)
+	}
+	if old := s.balancer.Swap(next); old != nil {
 		old.Stop()
-	} else if len(cfg.Groups) > 0 {
-		s.balancer = s.newBalancer(cfg)
 	}
 
 	log.Printf("[reload] %d backends, %d routes", len(cfg.Backends), len(cfg.Routes))
@@ -593,6 +591,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	var loopRoute *streamLoopRoute // stream loop detection for this request; nil when not streaming
 
 	cfg := s.cfg.Load()
+	bal := s.balancer.Load() // one balancer for the whole request (Select … CompleteAndDecr)
 	rtr := s.rtr.Load()
 
 	// Ollama nests sampling params under body["options"]. Flatten them into
@@ -654,7 +653,13 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 		}
 
 		// LB group: select backend at runtime
-		if res.Group != "" && s.balancer != nil {
+		if res.Group != "" && bal == nil {
+			// A reload that adds groups stores the config before it publishes
+			// the balancer; refuse rather than proxy to no backend.
+			jsonError(w, "no healthy backend available", http.StatusServiceUnavailable)
+			return
+		}
+		if res.Group != "" {
 			// Compute affinity key
 			var affKey string
 			grpCfg := cfg.Groups[res.Group]
@@ -671,7 +676,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 			lbGroup = res.Group
 			lbAffKey = affKey
 
-			selected, selErr := s.balancer.Select(res.Group, affKey, &balancer.RequestContext{
+			selected, selErr := bal.Select(res.Group, affKey, &balancer.RequestContext{
 				AffinityKey:   affKey,
 				IsStreaming:   isStreaming,
 				EstimatedSize: estimateTokens(body),
@@ -683,8 +688,8 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 			if bk, ok := cfg.Backend(selected.ID); ok {
 				backend = bk
 			}
-			s.balancer.Incr(selected.ID)
-			s.balancer.Dispatch(selected.ID)
+			bal.Incr(selected.ID)
+			bal.Dispatch(selected.ID)
 		} else {
 			backend = res.Backend
 		}
@@ -835,9 +840,9 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	s.metrics.ActiveRequests.Add(metricsCtx, 1, telemetry.BackendAttrs(backendID, realModel))
 	// Record gauges
 	s.metrics.RequestBodyBytesBuffered.Record(metricsCtx, float64(s.bufferedBytes.Load()))
-	if s.balancer != nil {
-		s.metrics.ActiveRequestsTotal.Record(metricsCtx, float64(s.balancer.TotalInFlight()))
-		s.metrics.AffinityCacheEntries.Record(metricsCtx, float64(s.balancer.AffinityCacheSize()))
+	if bal != nil {
+		s.metrics.ActiveRequestsTotal.Record(metricsCtx, float64(bal.TotalInFlight()))
+		s.metrics.AffinityCacheEntries.Record(metricsCtx, float64(bal.AffinityCacheSize()))
 	}
 
 	// ── Capture: reserve a slot if the SIGUSR1 window is open ─────────────
@@ -858,7 +863,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	rp := &httputil.ReverseProxy{
 		Transport:      s.transport,
 		Director:       director(targetURL, backend, newBody, opts.pathOverride, routeHeaders(res), loopRoute.guarded()),
-		ModifyResponse: s.modifyResponse(rid, backendID, modelName, realModel, r.URL.Path, backend.Type, backend.TimeoutSeconds, isStreaming, t0, metricsCtx, r.Context(), capCtx, lbGroup, lbAffKey, bytesHeld, loopRoute), //nolint:bodyclose // ReverseProxy owns the response body; ModifyResponse wraps or reads-and-restores it, and the framework closes it client-side.
+		ModifyResponse: s.modifyResponse(rid, backendID, modelName, realModel, r.URL.Path, backend.Type, backend.TimeoutSeconds, isStreaming, t0, metricsCtx, r.Context(), capCtx, lbGroup, lbAffKey, bal, bytesHeld, loopRoute), //nolint:bodyclose // ReverseProxy owns the response body; ModifyResponse wraps or reads-and-restores it, and the framework closes it client-side.
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			s.bufferedBytes.Add(-bytesHeld)
 			s.metrics.RequestBodyBytesBuffered.Record(metricsCtx, float64(s.bufferedBytes.Load()))
@@ -866,17 +871,17 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 			elapsed := time.Since(t0).Seconds()
 			s.metrics.RequestDuration.Record(metricsCtx, elapsed, telemetry.Attrs(backendID, realModel, "error"))
 			s.metrics.RequestsTotal.Add(metricsCtx, 1, telemetry.Attrs(backendID, realModel, "error"))
-			if s.balancer != nil {
+			if bal != nil {
 				// Track whether this is a timeout (backend busy, not dead)
 				var isTimeout bool
 				if netErr, ok := err.(interface{ Timeout() bool }); ok {
 					isTimeout = netErr.Timeout()
 				}
-				s.balancer.CompleteAndDecr(backendID, false, isTimeout, 0)
+				bal.CompleteAndDecr(backendID, false, isTimeout, 0)
 				// Invalidate pin for connection errors, but NOT timeouts.
 				// Timeout = backend is busy (long generation), not dead.
 				if !isTimeout {
-					s.balancer.InvalidatePin(lbGroup, lbAffKey)
+					bal.InvalidatePin(lbGroup, lbAffKey)
 				}
 			}
 			// r.URL has been rewritten by the director to the final upstream
@@ -1258,7 +1263,7 @@ func logMessageContent(rid string, body map[string]interface{}) {
 
 // modifyResponse returns a ModifyResponse function that instruments the
 // upstream response with telemetry.
-func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, backendType string, timeoutSec int, streaming bool, t0 time.Time, metricsCtx, reqCtx context.Context, capCtx *captureCtx, lbGroup, lbAffKey string, bytesHeld int64, loopRoute *streamLoopRoute) func(*http.Response) error {
+func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, backendType string, timeoutSec int, streaming bool, t0 time.Time, metricsCtx, reqCtx context.Context, capCtx *captureCtx, lbGroup, lbAffKey string, bal *balancer.Balancer, bytesHeld int64, loopRoute *streamLoopRoute) func(*http.Response) error {
 	return func(resp *http.Response) error {
 		statusStr := fmt.Sprintf("%d", resp.StatusCode)
 
@@ -1341,7 +1346,7 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 					s.metrics.ActiveRequests.Add(metricsCtx, -1, telemetry.BackendAttrs(backendID, realModel))
 					s.metrics.RequestDuration.Record(metricsCtx, elapsed, telemetry.Attrs(backendID, realModel, statusStr))
 					s.metrics.RequestsTotal.Add(metricsCtx, 1, telemetry.Attrs(backendID, realModel, statusStr))
-					if s.balancer != nil {
+					if bal != nil {
 						// Detect timeout: context cancellation or read timeout.
 						// reqCtx is the cancellable request context (client disconnect).
 						// metricsCtx is WithoutCancel — not useful for this check.
@@ -1354,16 +1359,16 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 						if reqCtx.Err() != nil {
 							isTimeout = true
 						}
-						s.balancer.CompleteAndDecr(backendID, resp.StatusCode == http.StatusOK, isTimeout, 0)
+						bal.CompleteAndDecr(backendID, resp.StatusCode == http.StatusOK, isTimeout, 0)
 						// Invalidate pin based on group failover config (5xx always + configured codes)
 						if !isTimeout && lbGroup != "" {
 							if grp, ok := s.cfg.Load().Groups[lbGroup]; ok && grp.ShouldFailoverOnCode(resp.StatusCode) {
-								s.balancer.InvalidatePin(lbGroup, lbAffKey)
+								bal.InvalidatePin(lbGroup, lbAffKey)
 							}
 						} else if !isTimeout {
 							// No group configured — 5xx always triggers failover
 							if resp.StatusCode >= 500 {
-								s.balancer.InvalidatePin(lbGroup, lbAffKey)
+								bal.InvalidatePin(lbGroup, lbAffKey)
 							}
 						}
 					}
@@ -1397,17 +1402,17 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 			s.metrics.ActiveRequests.Add(metricsCtx, -1, telemetry.BackendAttrs(backendID, realModel))
 			s.metrics.RequestDuration.Record(metricsCtx, elapsed, telemetry.Attrs(backendID, realModel, statusStr))
 			s.metrics.RequestsTotal.Add(metricsCtx, 1, telemetry.Attrs(backendID, realModel, statusStr))
-			if s.balancer != nil {
-				s.balancer.CompleteAndDecr(backendID, resp.StatusCode == http.StatusOK, false, 0)
+			if bal != nil {
+				bal.CompleteAndDecr(backendID, resp.StatusCode == http.StatusOK, false, 0)
 				// Invalidate pin based on group failover config (5xx always + configured codes)
 				if lbGroup != "" {
 					if grp, ok := s.cfg.Load().Groups[lbGroup]; ok && grp.ShouldFailoverOnCode(resp.StatusCode) {
-						s.balancer.InvalidatePin(lbGroup, lbAffKey)
+						bal.InvalidatePin(lbGroup, lbAffKey)
 					}
 				} else {
 					// No group configured — 5xx always triggers failover
 					if resp.StatusCode >= 500 {
-						s.balancer.InvalidatePin(lbGroup, lbAffKey)
+						bal.InvalidatePin(lbGroup, lbAffKey)
 					}
 				}
 			}

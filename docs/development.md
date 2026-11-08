@@ -78,6 +78,7 @@ Multi-arch images (linux/amd64, linux/arm64) are built automatically by the rele
 | `server.allow_plaintext`, `server.tls.*` | ✅ *policy check only* — accepted or rejected; the listener itself is not rebuilt |
 | `sig_message_capture.*` | ✅ (feature is rebuilt, arm state reset) |
 | `server.host` / `server.port` / `server.transport.*` | ❌ Restart |
+| `server.min_tls_version` | ❌ Restart — the outbound transport (live traffic and health probes) is built once at startup |
 | `telemetry.prometheus.*` (host, port, path, TLS, allow_plaintext) | ❌ Restart |
 | `journal.enabled` / `journal.otlp_endpoint` | ❌ Restart |
 
