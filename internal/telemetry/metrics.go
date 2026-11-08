@@ -25,7 +25,13 @@ type Metrics struct {
 	PromptTokensPerRequest   metric.Int64Histogram
 	AffinityCacheEntries     metric.Float64Gauge
 	RequestBodyBytesBuffered metric.Float64Gauge
+	StreamRatio              metric.Float64Histogram // stream loop detection: deflate ratio per evaluated window
+	StreamLoopTrips          metric.Int64Counter     // stream loop detection: trips by mode
 }
+
+// StreamRatioBuckets are the hikyaku_stream_ratio bucket boundaries: 0.10 to
+// 0.70 in steps of 0.05, the range where healthy and degenerate text separate.
+var StreamRatioBuckets = []float64{0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70}
 
 // Init creates the OTel meter provider backed by Prometheus and returns the
 // populated Metrics struct together with the HTTP handler to expose /metrics.
@@ -36,6 +42,17 @@ func Init() (*Metrics, http.Handler, error) {
 	}
 
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(exporter))
+	m, err := New(provider)
+	if err != nil {
+		return nil, nil, err
+	}
+	return m, promhttp.Handler(), nil
+}
+
+// New creates the instruments on provider's "hikyaku" meter. Init uses it with
+// the Prometheus-backed provider; tests pass a provider with a manual reader
+// to inspect what was recorded.
+func New(provider metric.MeterProvider) (*Metrics, error) {
 	meter := provider.Meter("hikyaku")
 
 	reqDur, err := meter.Float64Histogram("llm_request_duration_seconds",
@@ -43,7 +60,7 @@ func Init() (*Metrics, http.Handler, error) {
 		metric.WithExplicitBucketBoundaries(0.5, 1, 2, 5, 10, 30, 60, 120, 300),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	ttft, err := meter.Float64Histogram("llm_time_to_first_token_seconds",
@@ -51,42 +68,42 @@ func Init() (*Metrics, http.Handler, error) {
 		metric.WithExplicitBucketBoundaries(0.5, 1, 2, 5, 10, 20, 30, 45, 60, 90, 120, 180, 300),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	promptTok, err := meter.Int64Counter("llm_prompt_tokens_total",
 		metric.WithDescription("Cumulative prompt/input tokens processed"),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	completionTok, err := meter.Int64Counter("llm_completion_tokens_total",
 		metric.WithDescription("Cumulative completion/output tokens generated"),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	active, err := meter.Int64UpDownCounter("llm_active_requests",
 		metric.WithDescription("Number of requests currently in flight"),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	total, err := meter.Int64Counter("llm_requests_total",
 		metric.WithDescription("Total requests by backend, model and HTTP status"),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	genTPS, err := meter.Float64Gauge("llm_generation_tokens_per_second",
 		metric.WithDescription("Output token generation speed for the last completed request"),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	thinkRatio, err := meter.Float64Histogram("llm_think_content_ratio",
@@ -94,7 +111,7 @@ func Init() (*Metrics, http.Handler, error) {
 		metric.WithExplicitBucketBoundaries(0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	promptPerReq, err := meter.Int64Histogram("llm_prompt_tokens_per_request",
@@ -102,28 +119,43 @@ func Init() (*Metrics, http.Handler, error) {
 		metric.WithExplicitBucketBoundaries(128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	activeTotal, err := meter.Float64Gauge("hikyaku_active_requests",
 		metric.WithDescription("Total requests currently in flight across all backends"),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	affinityEntries, err := meter.Float64Gauge("hikyaku_affinity_cache_entries",
 		metric.WithDescription("Number of affinity pins currently cached"),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	bufferedBytes, err := meter.Float64Gauge("hikyaku_request_body_bytes_buffered",
 		metric.WithDescription("Bytes currently held in the proxy waiting to forward or waiting on responses"),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
+	}
+
+	streamRatio, err := meter.Float64Histogram("hikyaku_stream_ratio",
+		metric.WithDescription("Stream loop detection: deflate compression ratio of each evaluated output window (lower = more repetitive)"),
+		metric.WithExplicitBucketBoundaries(StreamRatioBuckets...),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	loopTrips, err := meter.Int64Counter("hikyaku_stream_loop_trips_total",
+		metric.WithDescription("Stream loop detection trips by route, backend, channel and mode"),
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	return &Metrics{
@@ -139,7 +171,9 @@ func Init() (*Metrics, http.Handler, error) {
 		PromptTokensPerRequest:   promptPerReq,
 		AffinityCacheEntries:     affinityEntries,
 		RequestBodyBytesBuffered: bufferedBytes,
-	}, promhttp.Handler(), nil
+		StreamRatio:              streamRatio,
+		StreamLoopTrips:          loopTrips,
+	}, nil
 }
 
 // Attrs returns a MeasurementOption carrying the standard label set.
@@ -156,5 +190,24 @@ func BackendAttrs(backend, model string) metric.MeasurementOption {
 	return metric.WithAttributes(
 		attribute.String("backend", backend),
 		attribute.String("model", model),
+	)
+}
+
+// StreamLoopAttrs returns the label set for hikyaku_stream_ratio.
+func StreamLoopAttrs(route, backend, channel string) metric.MeasurementOption {
+	return metric.WithAttributes(
+		attribute.String("route", route),
+		attribute.String("backend", backend),
+		attribute.String("channel", channel),
+	)
+}
+
+// StreamLoopTripAttrs returns the label set for hikyaku_stream_loop_trips_total.
+func StreamLoopTripAttrs(route, backend, channel, mode string) metric.MeasurementOption {
+	return metric.WithAttributes(
+		attribute.String("route", route),
+		attribute.String("backend", backend),
+		attribute.String("channel", channel),
+		attribute.String("mode", mode),
 	)
 }
