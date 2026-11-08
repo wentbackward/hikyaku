@@ -81,7 +81,7 @@ func TestFacade_EndReasonValues(t *testing.T) {
 // on bytes, and Server.ApplyConfig runs the SIGHUP gate (listen policy, with
 // the embedder's options) before swapping the live config atomically.
 func TestFacade_ParseConfigAndApplyConfig(t *testing.T) {
-	const base = "backends:\n  - id: b\n    type: openai\n    base_url: \"http://localhost:9/v1\"\n"
+	const base = "backends:\n  - id: b\n    type: openai\n    base_url: \"https://localhost:9/v1\"\n"
 	cfg, err := hikyaku.ParseConfig([]byte("server:\n  allow_plaintext: true\n" + base))
 	if err != nil {
 		t.Fatalf("ParseConfig: %v", err)
