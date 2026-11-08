@@ -109,140 +109,6 @@ func TestCheckZeroContent(t *testing.T) {
 	}
 }
 
-func TestLoopDetector_Basic(t *testing.T) {
-	ld := &loopDetector{state: make(map[string]*loopEntry)}
-	cfg := config.LoopDetectionConfig{
-		Enabled:              true,
-		ConsecutiveThreshold: 3,
-		WindowSeconds:        60,
-		Action:               "inject_forcing_message",
-		EscalateAfter:        2,
-		EscalateAction:       "refuse_429",
-	}
-
-	// First 2 requests: no detection
-	for i := 0; i < 2; i++ {
-		detected, _, _ := ld.checkLoop("session1", "hash1", cfg)
-		if detected {
-			t.Errorf("unexpected detection at request %d", i+1)
-		}
-	}
-
-	// 3rd request: detected
-	detected, escalated, action := ld.checkLoop("session1", "hash1", cfg)
-	if !detected {
-		t.Error("expected loop detection at request 3")
-	}
-	if escalated {
-		t.Error("should not escalate yet")
-	}
-	if action != "inject_forcing_message" {
-		t.Errorf("expected action inject_forcing_message, got %s", action)
-	}
-}
-
-func TestLoopDetector_Escalation(t *testing.T) {
-	ld := &loopDetector{state: make(map[string]*loopEntry)}
-	cfg := config.LoopDetectionConfig{
-		Enabled:              true,
-		ConsecutiveThreshold: 2,
-		WindowSeconds:        60,
-		Action:               "inject_forcing_message",
-		EscalateAfter:        1,
-		EscalateAction:       "refuse_429",
-	}
-
-	// Build up to threshold
-	ld.checkLoop("sess", "hash", cfg)
-	detected, escalated, action := ld.checkLoop("sess", "hash", cfg)
-	if !detected {
-		t.Fatal("expected detection at threshold")
-	}
-	if escalated {
-		t.Error("should not escalate on first detection")
-	}
-	if action != "inject_forcing_message" {
-		t.Errorf("expected inject_forcing_message, got %s", action)
-	}
-
-	// Next request: should escalate
-	detected, escalated, action = ld.checkLoop("sess", "hash", cfg)
-	if !detected {
-		t.Fatal("expected detection")
-	}
-	if !escalated {
-		t.Error("expected escalation")
-	}
-	if action != "refuse_429" {
-		t.Errorf("expected refuse_429, got %s", action)
-	}
-}
-
-func TestLoopDetector_Disabled(t *testing.T) {
-	ld := &loopDetector{state: make(map[string]*loopEntry)}
-	cfg := config.LoopDetectionConfig{
-		Enabled: false,
-	}
-
-	detected, _, _ := ld.checkLoop("key", "hash", cfg)
-	if detected {
-		t.Error("should not detect when disabled")
-	}
-}
-
-func TestApplyLoopDetected_Refuse429(t *testing.T) {
-	short, status, resp := applyLoopDetected("refuse_429", 3, nil)
-	if !short {
-		t.Error("expected short circuit")
-	}
-	if status != 429 {
-		t.Errorf("expected status 429, got %d", status)
-	}
-
-	var result map[string]interface{}
-	if err := json.Unmarshal([]byte(resp), &result); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-	errObj, ok := result["error"].(map[string]interface{})
-	if !ok {
-		t.Fatal("missing error object")
-	}
-	if errObj["type"] != "defender" {
-		t.Errorf("expected error type 'defender', got %v", errObj["type"])
-	}
-}
-
-func TestApplyLoopDetected_Inject(t *testing.T) {
-	body := map[string]interface{}{
-		"messages": []interface{}{
-			map[string]interface{}{"role": "system", "content": "you are helpful"},
-			map[string]interface{}{"role": "user", "content": "do stuff"},
-		},
-	}
-
-	short, status, resp := applyLoopDetected("inject_forcing_message", 3, body)
-	if short {
-		t.Error("inject should not short-circuit")
-	}
-	if status != 0 {
-		t.Errorf("expected status 0, got %d", status)
-	}
-	if resp != "" {
-		t.Error("inject should return empty response body")
-	}
-
-	// Verify system message was appended
-	msgs := body["messages"].([]interface{})
-	sysMsg := msgs[0].(map[string]interface{})
-	content := sysMsg["content"].(string)
-	if content[:15] != "you are helpful" {
-		t.Error("original system message should be preserved")
-	}
-	if len(content) <= 15 {
-		t.Error("forcing message should be appended to system message")
-	}
-}
-
 func TestApplyZeroContent_Refuse400(t *testing.T) {
 	short, status, resp := applyZeroContent("refuse_400")
 	if !short {
@@ -284,7 +150,6 @@ func TestApplyZeroContent_InjectMinimalResponse(t *testing.T) {
 }
 
 func TestCheckDefenders_ZeroContent(t *testing.T) {
-	ld := &loopDetector{state: make(map[string]*loopEntry)}
 	cfg := &config.Config{
 		Defenders: config.DefenderConfig{
 			ZeroContentDetection: &config.ZeroContentDetectionConfig{
@@ -292,9 +157,6 @@ func TestCheckDefenders_ZeroContent(t *testing.T) {
 				MinUserContentChars: 10,
 				MinTotalInputTokens: 500,
 				Action:              "refuse_400",
-			},
-			LoopDetection: &config.LoopDetectionConfig{
-				Enabled: false,
 			},
 		},
 	}
@@ -311,7 +173,7 @@ func TestCheckDefenders_ZeroContent(t *testing.T) {
 		},
 	}
 
-	short, status, _, header := checkDefenders(ld, cfg, nil, body, "model-x")
+	short, status, _, header := checkDefenders(cfg, nil, body)
 	if !short {
 		t.Error("expected short circuit")
 	}

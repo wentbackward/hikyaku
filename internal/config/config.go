@@ -238,6 +238,7 @@ type Config struct {
 
 	backendByID  map[string]*Backend
 	routeByModel map[string]*Route
+	deprecations []string // notices for deprecated keys found at load
 }
 
 // ── Loader ────────────────────────────────────────────────────────────────────
@@ -277,6 +278,7 @@ func Load(path string) (*Config, error) {
 	if err := validate(&cfg); err != nil {
 		return nil, err
 	}
+	deprecateLoopDetection(&cfg)
 
 	cfg.backendByID = make(map[string]*Backend, len(cfg.Backends))
 	for i := range cfg.Backends {
@@ -506,7 +508,10 @@ func validate(cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	return validateRoutes(cfg.Routes, ids)
+	if err := validateRoutes(cfg.Routes, ids); err != nil {
+		return err
+	}
+	return validateStreamLoop(cfg)
 }
 
 // MinTLS returns the configured minimum TLS version as a crypto/tls constant.
@@ -748,18 +753,12 @@ func (c *Config) ShouldDropEmptyContent(route *Route, backend *Backend) bool {
 // DefenderConfig holds global defaults for request defenders.
 // Routes can override per-key.
 type DefenderConfig struct {
-	LoopDetection        *LoopDetectionConfig        `yaml:"loop_detection"`
+	// LoopDetection is the removed request-repeat defender. The key is still
+	// accepted (any shape) so existing configs load; it is ignored and
+	// reported once through Config.Deprecations.
+	LoopDetection        *yaml.Node                  `yaml:"loop_detection"`
 	ZeroContentDetection *ZeroContentDetectionConfig `yaml:"zero_content_detection"`
-}
-
-// LoopDetectionConfig configures the loop detector.
-type LoopDetectionConfig struct {
-	Enabled              bool   `yaml:"enabled"`
-	ConsecutiveThreshold int    `yaml:"consecutive_threshold"`
-	WindowSeconds        int    `yaml:"window_seconds"`
-	Action               string `yaml:"action"`
-	EscalateAfter        int    `yaml:"escalate_after"`
-	EscalateAction       string `yaml:"escalate_action"`
+	StreamLoopDetection  *StreamLoopDetectionConfig  `yaml:"stream_loop_detection"`
 }
 
 // ZeroContentDetectionConfig configures the zero-content detector.
@@ -772,66 +771,9 @@ type ZeroContentDetectionConfig struct {
 
 // RouteDefenderConfig allows per-route override of defender settings.
 type RouteDefenderConfig struct {
-	LoopDetection        *LoopDetectionConfig        `yaml:"loop_detection"`
+	LoopDetection        *yaml.Node                  `yaml:"loop_detection"` // removed; accepted and ignored (see DefenderConfig)
 	ZeroContentDetection *ZeroContentDetectionConfig `yaml:"zero_content_detection"`
-}
-
-// GetLoopDetection resolves loop detection config for a route,
-// applying the cascading resolution: per-route > global > defaults.
-func (c *Config) GetLoopDetection(route *Route) LoopDetectionConfig {
-	cfg := LoopDetectionConfig{
-		Enabled:              true,
-		ConsecutiveThreshold: 3,
-		WindowSeconds:        60,
-		Action:               "inject_forcing_message",
-		EscalateAfter:        2,
-		EscalateAction:       "refuse_429",
-	}
-
-	// Global defaults
-	if c.Defenders.LoopDetection != nil {
-		glbl := c.Defenders.LoopDetection
-		if glbl.Enabled != cfg.Enabled {
-			cfg.Enabled = glbl.Enabled
-		}
-		if glbl.ConsecutiveThreshold > 0 {
-			cfg.ConsecutiveThreshold = glbl.ConsecutiveThreshold
-		}
-		if glbl.WindowSeconds > 0 {
-			cfg.WindowSeconds = glbl.WindowSeconds
-		}
-		if glbl.Action != "" {
-			cfg.Action = glbl.Action
-		}
-		if glbl.EscalateAfter > 0 {
-			cfg.EscalateAfter = glbl.EscalateAfter
-		}
-		if glbl.EscalateAction != "" {
-			cfg.EscalateAction = glbl.EscalateAction
-		}
-	}
-
-	// Per-route override
-	if route != nil && route.Defenders != nil && route.Defenders.LoopDetection != nil {
-		rt := route.Defenders.LoopDetection
-		cfg.Enabled = rt.Enabled
-		if rt.ConsecutiveThreshold > 0 {
-			cfg.ConsecutiveThreshold = rt.ConsecutiveThreshold
-		}
-		if rt.WindowSeconds > 0 {
-			cfg.WindowSeconds = rt.WindowSeconds
-		}
-		if rt.Action != "" {
-			cfg.Action = rt.Action
-		}
-		if rt.EscalateAfter > 0 {
-			cfg.EscalateAfter = rt.EscalateAfter
-		}
-		if rt.EscalateAction != "" {
-			cfg.EscalateAction = rt.EscalateAction
-		}
-	}
-	return cfg
+	StreamLoopDetection  *StreamLoopDetectionConfig  `yaml:"stream_loop_detection"`
 }
 
 // GetZeroContentDetection resolves zero-content detection config for a route,
