@@ -403,3 +403,44 @@ func TestInterceptedBody_OnCloseCalledOnce(t *testing.T) {
 		t.Errorf("onClose called %d times, want 1", count)
 	}
 }
+
+// endlessBody never ends until closed.
+type endlessBody struct{ closed chan struct{} }
+
+func (e *endlessBody) Read(p []byte) (int, error) {
+	select {
+	case <-e.closed:
+		return 0, io.ErrClosedPipe
+	default:
+	}
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
+}
+
+func (e *endlessBody) Close() error {
+	select {
+	case <-e.closed:
+	default:
+		close(e.closed)
+	}
+	return nil
+}
+
+// Closing an idleTimeoutBody whose consumer stopped reading must release its
+// read goroutine (it used to block forever on a full channel).
+func TestIdleTimeoutBody_CloseReleasesReader(t *testing.T) {
+	b := newIdleTimeoutBody(&endlessBody{closed: make(chan struct{})}, time.Minute)
+	buf := make([]byte, 16)
+	if _, err := b.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond) // let readLoop fill the channel and block on the next send
+	_ = b.Close()
+	select {
+	case <-b.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("readLoop goroutine still running after Close")
+	}
+}

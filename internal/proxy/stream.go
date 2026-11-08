@@ -479,6 +479,8 @@ type idleTimeoutBody struct {
 	timer   *time.Timer
 	ch      chan readResult
 	done    chan struct{}
+	closing chan struct{} // closed by Close; releases readLoop if nobody reads
+	closed  sync.Once
 	pending []byte // leftover bytes from a readResult that didn't fit in p
 	pendErr error  // error accompanying the pending bytes
 }
@@ -495,6 +497,7 @@ func newIdleTimeoutBody(rc io.ReadCloser, d time.Duration) *idleTimeoutBody {
 		timer:   time.NewTimer(d),
 		ch:      make(chan readResult, 1),
 		done:    make(chan struct{}),
+		closing: make(chan struct{}),
 	}
 	go b.readLoop()
 	return b
@@ -502,13 +505,20 @@ func newIdleTimeoutBody(rc io.ReadCloser, d time.Duration) *idleTimeoutBody {
 
 // readLoop runs in a single goroutine for the lifetime of the body.
 // It reads into its own buffer so the caller's slice is never shared.
+// Once the body is closed nobody reads b.ch any more, so a send also gives
+// up on closing — otherwise the goroutine would block forever whenever the
+// consumer stops early (client disconnect, stream loop abort).
 func (b *idleTimeoutBody) readLoop() {
 	defer close(b.done)
 	for {
 		buf := make([]byte, 32*1024)
 		n, err := b.rc.Read(buf)
 		if n > 0 || err != nil {
-			b.ch <- readResult{buf[:n], err}
+			select {
+			case b.ch <- readResult{buf[:n], err}:
+			case <-b.closing:
+				return
+			}
 		}
 		if err != nil {
 			return
@@ -550,6 +560,7 @@ func (b *idleTimeoutBody) Read(p []byte) (int, error) {
 
 func (b *idleTimeoutBody) Close() error {
 	b.timer.Stop()
+	b.closed.Do(func() { close(b.closing) })
 	return b.rc.Close()
 }
 
