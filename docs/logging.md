@@ -27,6 +27,10 @@ docker kill --signal=HUP hikyaku
 
 If the new config fails to parse, the old config is kept and an error is logged. In-flight requests continue with the old config; new requests pick up the new config.
 
+A reload (SIGHUP or an embedder's apply) also rebuilds the capture handle, the stream-loop sample writer and the load balancer, and logs any deprecation notice for the new config (for example the removed `loop_detection` key) once.
+
+**Embedders.** `hikyaku.ParseConfig(raw)` runs the same parse/validate pipeline as `LoadConfig` on bytes (an empty document is `ErrEmptyDocument`). `Server.ApplyConfig(cfg, opts...)` applies it the way SIGHUP does: it enforces the listen policy with the embedder's options (e.g. `WithExternalGatewayTLS()`), then swaps the live config atomically; a rejected config leaves the running one untouched. Applies and reloads are serialized. `ApplyConfig` does not re-probe backends or change the log level — call `ApplyLogLevel` after a successful apply, as on SIGHUP.
+
 ## Log levels
 
 Set in `config.yaml` under `server.log_level`, or via the `LOG_LEVEL` environment variable. Default is `0`. Reloaded on `SIGHUP`.
