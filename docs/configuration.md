@@ -660,6 +660,8 @@ defenders:                      # global defaults
     action: refuse_400
   stream_loop_detection:
     enabled: true
+    channels:
+      reasoning: {mode: shadow}   # calibrate first; see Stream loop detection
 
 routes:
   - virtual_model: coder
@@ -698,13 +700,22 @@ windows of `window_chars` characters (Unicode code points). Repetitive
 text compresses well even when no two lines match, so a low ratio means
 a loop. Healthy prose measures about 0.45–0.60; a loop falls toward 0.1.
 
+**Rollout — start in shadow.** The thresholds come from limited data, so
+enable the defender with every channel in `shadow` first (the example
+below does), watch `hikyaku_stream_ratio` per route and channel for a
+week, set `threshold` below the healthy p1 with a margin, and only then
+switch `reasoning` to `abort`. Keep `content` in `shadow` until its data
+says it is safe — code, JSON and tables compress well when healthy. If a
+channel's `mode` is omitted, its default applies: `abort` for
+`reasoning`, `shadow` for `content`.
+
 ```yaml
 defenders:
   stream_loop_detection:
     enabled: true              # default false: the whole defender is off
     channels:
       reasoning:               # thinking / reasoning text
-        mode: abort            # abort | shadow | off
+        mode: shadow           # abort | shadow | off — step 1 of the rollout (default when omitted: abort)
         window_chars: 2000     # 1–32768 code points per window
         warmup_windows: 1      # first windows are not measured
         threshold: 0.40        # a window below this is "low" (0 < t < 1)
@@ -728,11 +739,11 @@ routes:
       stream_loop_detection:   # per-route override, field by field
         channels:
           reasoning:
-            mode: shadow
+            mode: abort        # step 3: this route's data said abort is safe
 ```
 
-The values shown for the channels are the defaults that apply once
-`enabled: true`. Resolution is per field: route, then global, then
+Apart from the reasoning `mode`, the values shown for the channels are
+the defaults that apply once `enabled: true`. Resolution is per field: route, then global, then
 default — a route block that omits `enabled` inherits it, and
 `enabled: false` on a route turns the defender off there.
 
@@ -770,11 +781,20 @@ measured (the tokens are already spent).
 A channel trips at most once per choice per stream; in shadow mode it
 keeps recording ratios afterwards.
 
-**Rollout.** The thresholds come from limited data. Start with every
-channel in `shadow`, watch `hikyaku_stream_ratio` per route and channel
-for a week, set `threshold` below the healthy p1 with a margin, then
-switch `reasoning` to `abort`. Keep `content` in `shadow` until its data
-says it is safe — code, JSON and tables compress well when healthy.
+**Encoding.** The proxy reads the stream's bytes, so on a guarded
+stream it does not forward the caller's `Accept-Encoding`: the upstream
+answers uncompressed, or with gzip that Go's transport decodes before
+the proxy reads it. A backend or route `headers` rule that sets
+`Accept-Encoding` still wins; if the answer then arrives in an encoding
+the proxy cannot read, the stream passes through unmeasured and is
+counted in `hikyaku_stream_loop_unguarded_total{reason="content_encoding"}`
+with one `stream_loop_unguarded` log line (no text). SSE `data:` fields
+are read with or without the space after the colon.
+
+**Accounting.** An aborted stream never receives the upstream's final
+usage chunk, so its token counts are partial or zero; they are never
+estimated. Embedders see `UsageEvent.EndReason = "stream_loop_abort"`
+and `UsageEvent.LoopChannel` (see [metrics](metrics.md#per-request-usage-events)).
 
 **Trip log.** One line per trip, never with response text:
 

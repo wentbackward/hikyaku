@@ -150,13 +150,16 @@ on it, and the next request is a fresh start anyway.
 Same shape as the other defenders: global default plus per-route
 override (per-route wins, field by field).
 
+Shown as rollout step 1 (section below): every channel in `shadow`.
+Omitted modes default to `abort` for reasoning and `shadow` for content.
+
 ```yaml
 defenders:
   stream_loop_detection:
     enabled: true
     channels:
       reasoning:
-        mode: abort            # abort | shadow | off
+        mode: shadow           # abort | shadow | off; step 3 switches this to abort
         window_chars: 2000
         warmup_windows: 1
         threshold: 0.40
@@ -285,6 +288,32 @@ Choices made where the design was open:
   that the old defender was on by default, so removing it changes
   behaviour for every config, with or without the key.
 - **Bounded state.** At most 16 choice indices are measured per stream.
+- **End reason for embedders.** A streamed response's status is 200
+  however it ended, and an aborted one never receives its usage chunk.
+  `UsageEvent.EndReason` (`complete`, `client_disconnect`,
+  `upstream_error`, `stream_loop_abort`) and `UsageEvent.LoopChannel`
+  let an embedder tell a cut-off stream from a complete one. Token counts
+  are never estimated.
+- **n > 1.** The abort chunk closes only the choices still open; a choice
+  that already sent `finish_reason` is not finished twice (when every
+  choice has finished, `choices` is empty and the error is still sent).
+- **Fail-open made visible.** The parsers read the bytes, so a guarded
+  stream does not forward the caller's `Accept-Encoding`. This matches an
+  existing assumption: the proxy's usage parsing (streamed and
+  non-streamed) already reads bodies as plain text and silently found no
+  counts in a compressed one. Go's transport then negotiates gzip itself
+  and decodes it transparently. The deletion runs before backend/route
+  header rules, so an operator who sets `Accept-Encoding` keeps it; a
+  body that still arrives encoded is passed through unmeasured, counted
+  in `hikyaku_stream_loop_unguarded_total{reason="content_encoding"}` and
+  logged once (no text). SSE `data:` lines are read with or without the
+  optional space (SSE spec), for every stream — this also fixes usage
+  parsing for upstreams that omit the space, and changes nothing else.
+- **YAML merge keys** (`<<: *anchor`, or a list) are resolved inside the
+  strict block: merged values apply and merged keys are checked like
+  direct ones.
+- **Samples cap.** A failed sample write gives its slot back, so
+  `max_samples` counts samples that exist.
 - **Related fix.** The idle-timeout body wrapper's reader goroutine
   could block forever when the consumer stopped reading early (client
   disconnect, and now an abort); it now exits on close.
