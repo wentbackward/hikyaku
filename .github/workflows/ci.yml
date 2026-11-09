@@ -29,6 +29,9 @@ jobs:
       - name: Test
         run: go test ./... -race -count=1
 
+      - name: Test hardened
+        run: make test-hardened
+
       - name: Build
         run: go build ./cmd/hikyaku
 
