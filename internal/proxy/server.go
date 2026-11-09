@@ -862,7 +862,8 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	// ── Minimize plaintext dwell ───────────────────────────────────────────
 	// Wipe the outbound body once the reverse proxy is done with it. The
 	// reverse proxy consumes bytes.NewReader(newBody) synchronously within
-	// ServeHTTP (no GetBody re-read path), so a function-scoped defer runs
+	// ServeHTTP (a Transport retry re-reads it through the Director's GetBody,
+	// but inside RoundTrip, still within ServeHTTP), so a function-scoped defer runs
 	// strictly after the bytes have left for the backend (or after an early
 	// return where they never did). Always-on: cheap, and frees large
 	// (multimodal) payloads promptly.
@@ -1074,6 +1075,39 @@ func safeHeaders(h http.Header) map[string]string {
 	return out
 }
 
+// dropConnectionHeaders removes the headers the caller names in Connection
+// (any case), then Connection itself: they are hop-by-hop (RFC 9110 7.6.1).
+// httputil.ReverseProxy does the same, but after the Director returns, so a
+// caller sending "Connection: Authorization" would make it drop the backend
+// key and any rule header the Director set. Doing it first leaves nothing
+// for that later pass to act on. This also ends protocol upgrades, which the
+// proxy does not support: every request is a buffered JSON body.
+func dropConnectionHeaders(h http.Header) {
+	for k, vs := range h {
+		if http.CanonicalHeaderKey(k) != "Connection" {
+			continue
+		}
+		for _, v := range vs {
+			for _, name := range strings.Split(v, ",") {
+				if name = strings.TrimSpace(name); name != "" {
+					deleteHeaderAnyCase(h, name)
+				}
+			}
+		}
+		delete(h, k)
+	}
+}
+
+// deleteHeaderAnyCase deletes name from h whatever the case of its map key.
+func deleteHeaderAnyCase(h http.Header, name string) {
+	canonical := http.CanonicalHeaderKey(name)
+	for k := range h {
+		if http.CanonicalHeaderKey(k) == canonical {
+			delete(h, k)
+		}
+	}
+}
+
 // stripCredentials deletes every credential header (config.CredentialHeaders)
 // from h, matching keys in any case: an embedder's middleware may have
 // written a non-canonical key straight into the map.
@@ -1089,7 +1123,11 @@ func stripCredentials(h http.Header) {
 // for the given backend. If pathOverride is non-empty, it replaces the request
 // path (used by completions/embeddings to force the backend path).
 //
-// Credentials: every caller credential header is stripped first, then only
+// Hop-by-hop: the headers the caller names in Connection, and Connection
+// itself, are removed first (dropConnectionHeaders), so the reverse proxy's
+// own hop-by-hop pass cannot remove headers the Director sets.
+//
+// Credentials: every caller credential header is stripped next, then only
 // the backend's own api_key is set, in its lane's header (a backend without
 // api_key gets none). The header rules run after that, so an operator's add
 // still sends a static credential, while a rename never moves a value out of
@@ -1109,6 +1147,7 @@ func director(target *url.URL, backend *config.Backend, body []byte, pathOverrid
 			endpointPath = pathOverride
 		}
 		req.URL.Path = joinUpstreamPath(target.Path, endpointPath, backend.Type, backend.URLJoin)
+		dropConnectionHeaders(req.Header)
 		stripCredentials(req.Header)
 		// Auth headers — auth_type overrides the default for the backend type.
 		// Default: "x-api-key" for anthropic, "bearer" for openai.
