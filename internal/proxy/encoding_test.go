@@ -94,7 +94,7 @@ const opaqueBrotli = "\x1b\x00\x00opaque-brotli-bytes"
 func encodeAs(t *testing.T, coding, payload string) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	switch coding {
+	switch strings.ToLower(coding) {
 	case "":
 		return []byte(payload)
 	case "gzip", "x-gzip":

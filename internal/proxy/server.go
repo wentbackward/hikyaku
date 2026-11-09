@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -898,7 +899,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 
 	rp := &httputil.ReverseProxy{
 		Transport:      s.transport,
-		Director:       director(targetURL, backend, newBody, opts.pathOverride, routeHeaders(res), loopRoute.guarded()),
+		Director:       director(targetURL, backend, newBody, opts.pathOverride, routeHeaders(res)),
 		ModifyResponse: s.modifyResponse(rid, backendID, modelName, realModel, r.URL.Path, backend.Type, backend.TimeoutSeconds, isStreaming, t0, metricsCtx, r.Context(), capCtx, lbGroup, lbAffKey, st, bytesHeld, loopRoute), //nolint:bodyclose // ReverseProxy owns the response body; ModifyResponse wraps or reads-and-restores it, and the framework closes it client-side.
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			s.bufferedBytes.Add(-bytesHeld)
@@ -1067,14 +1068,10 @@ func safeHeaders(h http.Header) map[string]string {
 // for the given backend. If pathOverride is non-empty, it replaces the request
 // path (used by completions/embeddings to force the backend path).
 //
-// identityResponse drops the caller's Accept-Encoding so the upstream answers
-// uncompressed (Go's transport may still negotiate gzip itself and then
-// decodes it transparently). Stream loop detection sets it: the lane parsers
-// read the response bytes, and they cannot read a compressed body. It is
-// applied before the header operations, so an operator who sets
-// Accept-Encoding on a backend or route keeps that setting (the stream is
-// then counted as unguarded if the answer comes back encoded).
-func director(target *url.URL, backend *config.Backend, body []byte, pathOverride string, routeHeaders config.HeadersOp, identityResponse bool) func(*http.Request) {
+// Accept-Encoding is set after the header operations: the proxy reads every
+// response body, so it asks for identity whatever the caller or a headers
+// rule asked for (see encoding.go).
+func director(target *url.URL, backend *config.Backend, body []byte, pathOverride string, routeHeaders config.HeadersOp) func(*http.Request) {
 	return func(req *http.Request) {
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
@@ -1111,9 +1108,6 @@ func director(target *url.URL, backend *config.Backend, body []byte, pathOverrid
 		req.ContentLength = int64(len(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Del("Transfer-Encoding")
-		if identityResponse {
-			req.Header.Del("Accept-Encoding")
-		}
 
 		// Header manipulation: backend-level first (infrastructure), then
 		// route-level (request-specific) so route wins on conflict.
@@ -1123,6 +1117,7 @@ func director(target *url.URL, backend *config.Backend, body []byte, pathOverrid
 		if !routeHeaders.IsZero() {
 			applyHeaderOps(req.Header, routeHeaders)
 		}
+		req.Header.Set("Accept-Encoding", upstreamAcceptEncoding)
 	}
 }
 
@@ -1310,6 +1305,14 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 			resp.Body = newIdleTimeoutBody(resp.Body, time.Duration(timeoutSec)*time.Second)
 		}
 
+		// Everything below reads the body as plain bytes. A coding that
+		// cannot be decoded is an upstream error (502), not a response
+		// passed on unmetered.
+		decoded, err := decodeUpstreamBody(resp)
+		if err != nil {
+			return err
+		}
+
 		if streaming && resp.StatusCode == http.StatusOK {
 			// Pick the parser that matches the upstream protocol. SSE parsing
 			// for OpenAI/Anthropic (both use text/event-stream); minimal
@@ -1318,17 +1321,6 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 			// The stream loop guard (nil when detection is off for the route)
 			// rides on the parser, which already decodes every event.
 			guard := newStreamLoopGuard(loopRoute, rid, backendID, s.metrics, metricsCtx, s.loopSampler.Load())
-			if guard != nil {
-				// The parsers read plain bytes. A body the transport left
-				// compressed cannot be measured: say so instead of failing
-				// open silently.
-				if enc := resp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
-					s.metrics.StreamLoopUnguarded.Add(metricsCtx, 1, telemetry.StreamLoopUnguardedAttrs(loopRoute.route, backendID, "content_encoding"))
-					log.Printf("stream_loop_unguarded route=%s backend=%s reason=content_encoding encoding=%s request_id=%s",
-						logValue(loopRoute.route), logValue(backendID), logValue(enc), rid)
-					guard = nil
-				}
-			}
 			var parser streamParser
 			var ssep *sseParser
 			if backendType == "ollama" {
@@ -1497,6 +1489,9 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 
 			resp.Body = io.NopCloser(bytes.NewReader(data))
 			resp.ContentLength = int64(len(data))
+			if decoded {
+				resp.Header.Set("Content-Length", strconv.Itoa(len(data)))
+			}
 		}
 		return nil
 	}
