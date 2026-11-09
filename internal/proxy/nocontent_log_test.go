@@ -276,18 +276,47 @@ func runMarkerTraffic(t *testing.T, level string) markerRun {
 	client.WriteString(sendMarkerRequest(t, refuse, "/v1/chat/completions",
 		fmt.Sprintf(`{"model":"m","stop":["%[1]s stop"],"messages":[{"role":"%[1]s role","content":""}]}`, logMarker)))
 
+	// A model name is caller text unless it names a configured route: an
+	// unknown one is rejected (level 0 logs the rejection), or, with
+	// passthrough_unrouted, forwarded as is and logged on every level-1 and
+	// level-2 line of the request, its errors included.
+	unknown := fmt.Sprintf(`{"model":"%s model","messages":[{"role":"user","content":"hi"}]}`, logMarker)
+	reject := newCredServer(t, "http://127.0.0.1:1", "openai", "", "", "")
+	client.WriteString(sendMarkerRequest(t, reject, "/v1/chat/completions", unknown))
+	for _, oc := range markerOutcomes {
+		if oc.name == "cut-mid-stream" {
+			continue
+		}
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			oc.respond(markerLanes[0], w, false)
+		}))
+		pass := newCredServer(t, upstream.URL, "openai", "\n  passthrough_unrouted: true", "", "")
+		client.WriteString(sendMarkerRequest(t, pass, "/v1/chat/completions", unknown))
+		upstream.Close()
+	}
+
 	return markerRun{log: buf.String(), upstream: up.saw(), client: client.String()}
 }
 
-// sendMarkerRequest serves s on a loopback listener, posts body to path and
-// returns whatever response body arrived, read to the end or to the cut.
+// sendMarkerRequest serves s on a loopback listener, posts body to path
+// (with marker-carrying query string and headers) and returns whatever response body arrived, read to the end or to the cut.
 func sendMarkerRequest(t *testing.T, s *Server, path, body string) string {
 	t.Helper()
 	mux := http.NewServeMux()
 	s.RegisterRoutes(mux)
 	front := httptest.NewServer(mux)
 	defer front.Close()
-	resp, err := http.Post(front.URL+path, "application/json", strings.NewReader(body))
+	// The query string, a custom header, a non-standard credential header
+	// and the User-Agent's comment carry the marker too: all caller text.
+	req, err := http.NewRequest(http.MethodPost, front.URL+path+"?q="+logMarker, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Title", logMarker+" title")
+	req.Header.Set("X-Auth-Token", logMarker+" token")
+	req.Header.Set("User-Agent", "marker-test/1.0 ("+logMarker+")")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("POST %s: %v", path, err)
 	}

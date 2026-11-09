@@ -30,7 +30,16 @@ func TestLog_NoContentAtRequestAndHeaderLevels(t *testing.T) {
 // are reduced to lengths.
 func TestLog_HeaderLevelKeepsStructure(t *testing.T) {
 	run := runMarkerTraffic(t, "2")
-	for _, want := range []string{"[hdr] ", "params=", "<string len=", "role=<non-standard>"} {
+	for _, want := range []string{
+		"[hdr] ", "params=", "<string len=", "role=<non-standard>",
+		"Content-Type: application/json", // an allowlisted header: its value
+		"User-Agent: marker-test/1.0",    // the User-Agent's product token only
+		"X-Title: <len=",                 // any other header: its length
+		"X-Auth-Token: <len=",            // a credential header the redaction list misses
+		"<unknown model len=",            // a model name no route defines
+		"url=http://127.0.0.1:",          // the upstream URL, without the query
+		"model=m→real-m",                 // a configured route, verbatim
+	} {
 		if !strings.Contains(run.log, want) {
 			t.Errorf("level-2 log missing %q:\n%s", want, run.log)
 		}
