@@ -1760,7 +1760,7 @@ func extractNonStreamingUsage(data []byte, backendID, model, backendType string,
 	default:
 		// The metrics keep the provider's own prompt_tokens; the event
 		// gets the prompt net of the cache classes it includes.
-		provider := openAIUsage(usage)
+		provider := openAIUsage(openAIUsageObject(resp))
 		provider.recordTokenMetrics(ctx, m, backendID, model)
 		return provider.netOfCache()
 	}
@@ -1789,6 +1789,25 @@ func openAIUsage(usage map[string]interface{}) usageCounts {
 		cacheWrite: jsonCount(promptDetails, "cache_write_tokens"),
 		reasoning:  jsonCount(completionDetails, "reasoning_tokens"),
 	}
+}
+
+// openAIUsageObject returns the usage object of an OpenAI-lane response or
+// stream chunk: the top-level "usage" when it is an object, else the usage
+// inside choices[0], where Moonshot's schema allows it (its older streams
+// put the final usage on the finish_reason choice and sent no separate
+// usage chunk). Only one of the two is ever read, so a response carrying
+// both is counted once. nil when neither is present.
+func openAIUsageObject(obj map[string]interface{}) map[string]interface{} {
+	if usage, ok := obj["usage"].(map[string]interface{}); ok {
+		return usage
+	}
+	choices, _ := obj["choices"].([]interface{})
+	if len(choices) == 0 {
+		return nil
+	}
+	choice, _ := choices[0].(map[string]interface{})
+	usage, _ := choice["usage"].(map[string]interface{})
+	return usage
 }
 
 // netOfCache returns c with the cache classes taken out of prompt, for a lane

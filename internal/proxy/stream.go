@@ -305,10 +305,13 @@ func (p *sseParser) handleOpenAIEvent(evt map[string]interface{}) {
 	}
 
 	// Usage arrives in the final chunk when stream_options.include_usage=true
-	// (OpenAI sends it on a chunk with "choices": []). Each class keeps its
-	// last positive value; promptToks stays the provider's prompt_tokens,
-	// which includes the cache classes, and usage() nets them out.
-	if usage, ok := evt["usage"].(map[string]interface{}); ok {
+	// (OpenAI and Moonshot send it on a chunk with "choices": []; older
+	// Moonshot streams inside choices[0] of the finish_reason chunk, see
+	// openAIUsageObject). Each class keeps its last positive value, so usage
+	// reported more than once is never summed; promptToks stays the
+	// provider's prompt_tokens, which includes the cache classes, and usage()
+	// nets them out.
+	if usage := openAIUsageObject(evt); usage != nil {
 		u := openAIUsage(usage)
 		keepPositive(&p.promptToks, u.prompt)
 		keepPositive(&p.completionToks, u.completion)
