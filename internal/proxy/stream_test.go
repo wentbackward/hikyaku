@@ -149,8 +149,8 @@ func TestAnthropic_InputTokensFromMessageStart(t *testing.T) {
 	feedLines(p,
 		`data: {"type":"message_start","message":{"usage":{"input_tokens":42}}}`,
 	)
-	if p.anthropicInputTokens != 42 {
-		t.Errorf("input tokens: got %d, want 42", p.anthropicInputTokens)
+	if p.anthropicIn.prompt != 42 {
+		t.Errorf("input tokens: got %d, want 42", p.anthropicIn.prompt)
 	}
 }
 
@@ -172,9 +172,9 @@ func TestAnthropic_TokensResetAfterMessageStop(t *testing.T) {
 		`data: {"type":"message_stop"}`,
 	)
 	// After message_stop the counters should be flushed (reset to 0)
-	if p.anthropicInputTokens != 0 || p.anthropicOutputTokens != 0 {
+	if p.anthropicIn.prompt != 0 || p.anthropicOutputTokens != 0 {
 		t.Errorf("tokens should be zeroed after flush, got in=%d out=%d",
-			p.anthropicInputTokens, p.anthropicOutputTokens)
+			p.anthropicIn.prompt, p.anthropicOutputTokens)
 	}
 }
 

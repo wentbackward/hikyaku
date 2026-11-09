@@ -264,15 +264,35 @@ type UsageEvent struct {
 	// CacheWriteTokens is input written to the provider's prompt cache:
 	// Anthropic cache_creation_input_tokens; OpenAI lane
 	// prompt_tokens_details.cache_write_tokens (Moonshot); 0 on Ollama.
+	// It is the total of every cache lifetime; CacheWrite5mTokens and
+	// CacheWrite1hTokens split it where the provider reports the split.
 	CacheWriteTokens int64
+	// CacheWrite5mTokens and CacheWrite1hTokens are the parts of
+	// CacheWriteTokens written with the 5-minute and the 1-hour cache
+	// lifetime, which providers price differently. They are informational
+	// sub-classes, already inside CacheWriteTokens: do not add them to it.
+	// Anthropic: usage.cache_creation.ephemeral_5m_input_tokens and
+	// ephemeral_1h_input_tokens. OpenAI lane: Moonshot's
+	// Msh-Usage-Cache-Write-Tokens-5m and -1h response headers. Their sum
+	// never exceeds CacheWriteTokens: a reported split that would (or one
+	// with no CacheWriteTokens to split) is dropped and both are 0. Any
+	// remainder, CacheWriteTokens minus both, is cache write whose lifetime
+	// the provider did not report. 0 on Ollama and where not reported.
+	CacheWrite5mTokens int64
+	CacheWrite1hTokens int64
 	// ReasoningTokens is informational: the part of CompletionTokens the
 	// provider reports as reasoning (OpenAI lane
 	// completion_tokens_details.reasoning_tokens). It is already inside
 	// CompletionTokens; do not add the two. 0 where not reported.
 	ReasoningTokens int64
-	Streamed        bool
-	Status          int
-	Duration        time.Duration
+	// WebSearchRequests is the number of server-side web search tool calls
+	// the provider ran for the request, billed per call on top of tokens
+	// (Anthropic usage.server_tool_use.web_search_requests). 0 on the other
+	// lanes.
+	WebSearchRequests int64
+	Streamed          bool
+	Status            int
+	Duration          time.Duration
 	// EndReason says how the response ended. Status is the upstream's HTTP
 	// status, which is 200 for every streamed response however it ended, so
 	// an aborted or cut-off stream (whose final usage chunk never arrived and
@@ -330,6 +350,10 @@ func streamEndReason(trip *loopTrip, readErr error, reqCtx context.Context) EndR
 // decision.
 type usageCounts struct {
 	prompt, completion, cacheRead, cacheWrite, reasoning int64
+	// cacheWrite5m and cacheWrite1h split cacheWrite by cache lifetime
+	// (see UsageEvent.CacheWrite5mTokens); webSearch counts server-side web
+	// search calls (UsageEvent.WebSearchRequests).
+	cacheWrite5m, cacheWrite1h, webSearch int64
 }
 
 // recordTokenMetrics adds c to the per-backend Prometheus token counters and
@@ -1592,6 +1616,13 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 	rlog := st.log
 	return func(resp *http.Response) error {
 		statusStr := fmt.Sprintf("%d", resp.StatusCode)
+		// Moonshot reports the cache-write split by lifetime only in the
+		// response headers of its OpenAI-lane API; read them before the body
+		// flows. The split is applied to the body's total at emit time.
+		var headerSplit cacheWriteSplit
+		if backendType == "openai" {
+			headerSplit = moonshotCacheWriteSplit(resp.Header)
+		}
 
 		// Wrap with idle timeout if configured — cancels if no bytes
 		// flow for timeout_seconds. Applied before any other wrappers.
@@ -1652,6 +1683,9 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 					s.metrics.RequestBodyBytesBuffered.Record(metricsCtx, float64(s.bufferedBytes.Load()))
 					parser.recordFinal()
 					counts := parser.usage()
+					if backendType == "openai" {
+						counts = counts.withCacheWriteSplit(headerSplit)
+					}
 					trip := parser.abortTrip()
 					var loopChannel string
 					if trip != nil {
@@ -1662,8 +1696,9 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 						Backend: backendID, BackendType: backendType,
 						PromptTokens: counts.prompt, CompletionTokens: counts.completion,
 						CacheReadTokens: counts.cacheRead, CacheWriteTokens: counts.cacheWrite,
-						ReasoningTokens: counts.reasoning,
-						Streamed:        true, Status: status, Duration: time.Since(t0),
+						CacheWrite5mTokens: counts.cacheWrite5m, CacheWrite1hTokens: counts.cacheWrite1h,
+						ReasoningTokens: counts.reasoning, WebSearchRequests: counts.webSearch,
+						Streamed: true, Status: status, Duration: time.Since(t0),
 						EndReason: streamEndReason(trip, readErr, reqCtx), LoopChannel: loopChannel,
 					})
 					elapsed := time.Since(t0).Seconds()
@@ -1751,14 +1786,18 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 			var counts usageCounts
 			if resp.StatusCode == http.StatusOK {
 				counts = extractNonStreamingUsage(data, backendID, realModel, backendType, s.metrics, metricsCtx)
+				if backendType == "openai" {
+					counts = counts.withCacheWriteSplit(headerSplit)
+				}
 			}
 			s.emitUsage(UsageEvent{
 				Ctx: reqCtx, RequestID: rid, VirtualModel: virtualModel, RealModel: realModel,
 				Backend: backendID, BackendType: backendType,
 				PromptTokens: counts.prompt, CompletionTokens: counts.completion,
 				CacheReadTokens: counts.cacheRead, CacheWriteTokens: counts.cacheWrite,
-				ReasoningTokens: counts.reasoning,
-				Streamed:        false, Status: resp.StatusCode, Duration: time.Since(t0),
+				CacheWrite5mTokens: counts.cacheWrite5m, CacheWrite1hTokens: counts.cacheWrite1h,
+				ReasoningTokens: counts.reasoning, WebSearchRequests: counts.webSearch,
+				Streamed: false, Status: resp.StatusCode, Duration: time.Since(t0),
 				EndReason: EndComplete,
 			})
 
@@ -2020,8 +2059,9 @@ func detectProtocol(r *http.Request) string {
 //   - openai:    usage.prompt_tokens / usage.completion_tokens plus the cache
 //     classes and reasoning count (see openAIUsage); the metrics get
 //     prompt_tokens as reported, the returned counts the prompt net of cache
-//   - anthropic: usage.input_tokens / usage.output_tokens plus the two cache
-//     classes usage.cache_read_input_tokens / usage.cache_creation_input_tokens
+//   - anthropic: usage.input_tokens / usage.output_tokens plus the cache
+//     classes, the cache-write split and the web search count (see
+//     anthropicUsage)
 //   - ollama:    top-level prompt_eval_count / eval_count (no "usage" object;
 //     /api/embed carries only prompt_eval_count)
 //
@@ -2036,12 +2076,7 @@ func extractNonStreamingUsage(data []byte, backendID, model, backendType string,
 	usage, _ := resp["usage"].(map[string]interface{})
 	switch backendType {
 	case "anthropic":
-		counts = usageCounts{
-			prompt:     jsonCount(usage, "input_tokens"),
-			completion: jsonCount(usage, "output_tokens"),
-			cacheRead:  jsonCount(usage, "cache_read_input_tokens"),
-			cacheWrite: jsonCount(usage, "cache_creation_input_tokens"),
-		}
+		counts = anthropicUsage(usage)
 	case "ollama":
 		counts = usageCounts{
 			prompt:     jsonCount(resp, "prompt_eval_count"),
@@ -2056,6 +2091,89 @@ func extractNonStreamingUsage(data []byte, backendID, model, backendType string,
 	}
 	counts.recordTokenMetrics(ctx, m, backendID, model)
 	return counts
+}
+
+// anthropicUsage reads one Anthropic usage object (a Messages API response,
+// or the usage of a message_start or message_delta stream event). Every
+// class comes from this one object: input_tokens (uncached input),
+// output_tokens, cache_read_input_tokens, cache_creation_input_tokens (the
+// cache-write total), its split by lifetime in
+// cache_creation.ephemeral_5m_input_tokens / ephemeral_1h_input_tokens
+// (applied through withCacheWriteSplit, so a split that does not fit inside
+// the total is dropped), and server_tool_use.web_search_requests. A nil
+// usage yields zeros.
+func anthropicUsage(usage map[string]interface{}) usageCounts {
+	creation, _ := usage["cache_creation"].(map[string]interface{})
+	serverTools, _ := usage["server_tool_use"].(map[string]interface{})
+	c := usageCounts{
+		prompt:     jsonCount(usage, "input_tokens"),
+		completion: jsonCount(usage, "output_tokens"),
+		cacheRead:  jsonCount(usage, "cache_read_input_tokens"),
+		cacheWrite: jsonCount(usage, "cache_creation_input_tokens"),
+		webSearch:  jsonCount(serverTools, "web_search_requests"),
+	}
+	return c.withCacheWriteSplit(cacheWriteSplit{
+		m5: jsonCount(creation, "ephemeral_5m_input_tokens"),
+		h1: jsonCount(creation, "ephemeral_1h_input_tokens"),
+	})
+}
+
+// cacheWriteSplit is a provider-reported split of the cache-write total by
+// cache lifetime (5 minutes, 1 hour).
+type cacheWriteSplit struct {
+	m5, h1 int64
+}
+
+// withCacheWriteSplit returns c with its cache-write split set to s, or
+// cleared when s does not fit inside c.cacheWrite (their sum exceeds it, or
+// there is no total): a split is never reported that is larger than the
+// total it splits. Every operand is in [0, 2^63) (jsonCount, headerCount),
+// so the comparison cannot overflow where adding the two could.
+func (c usageCounts) withCacheWriteSplit(s cacheWriteSplit) usageCounts {
+	if s.m5 > c.cacheWrite || s.h1 > c.cacheWrite-s.m5 {
+		s = cacheWriteSplit{}
+	}
+	c.cacheWrite5m, c.cacheWrite1h = s.m5, s.h1
+	return c
+}
+
+// moonshotCacheWriteSplit reads Moonshot's cache-write split from the
+// response headers of its OpenAI-compatible Chat Completions API, whose body
+// carries only the total (prompt_tokens_details.cache_write_tokens):
+// Msh-Usage-Cache-Write-Tokens-5m and Msh-Usage-Cache-Write-Tokens-1h, the
+// tokens written under the 5m and the 1h cache option. Other providers do
+// not send them, so the split is zero.
+func moonshotCacheWriteSplit(h http.Header) cacheWriteSplit {
+	return cacheWriteSplit{
+		m5: headerCount(h, "Msh-Usage-Cache-Write-Tokens-5m"),
+		h1: headerCount(h, "Msh-Usage-Cache-Write-Tokens-1h"),
+	}
+}
+
+// headerCount reads a non-negative token count from response header key:
+// one or more values (repeated headers) that are all the same string of
+// ASCII digits within int64. A missing, empty, signed, non-decimal or
+// out-of-range value, or repeated values that disagree, count as zero;
+// repeated values are never summed.
+func headerCount(h http.Header, key string) int64 {
+	vals := h.Values(key)
+	if len(vals) == 0 {
+		return 0
+	}
+	v := strings.TrimSpace(vals[0])
+	for _, other := range vals[1:] {
+		if strings.TrimSpace(other) != v {
+			return 0
+		}
+	}
+	if v == "" || strings.TrimLeft(v, "0123456789") != "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // openAIUsage reads an OpenAI-lane usage object (OpenAI, Moonshot and other
@@ -2114,7 +2232,8 @@ func (c usageCounts) netOfCache() usageCounts {
 
 // hasCounts reports whether c carries any positive class.
 func (c usageCounts) hasCounts() bool {
-	return c.prompt > 0 || c.completion > 0 || c.cacheRead > 0 || c.cacheWrite > 0 || c.reasoning > 0
+	return c.prompt > 0 || c.completion > 0 || c.cacheRead > 0 || c.cacheWrite > 0 || c.reasoning > 0 ||
+		c.cacheWrite5m > 0 || c.cacheWrite1h > 0 || c.webSearch > 0
 }
 
 // jsonCount reads a non-negative integer token count from a decoded JSON

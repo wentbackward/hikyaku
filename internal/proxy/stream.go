@@ -69,22 +69,31 @@ type sseParser struct {
 	completionToks int64
 	cacheReadToks  int64 // Anthropic cache_read_input_tokens; OpenAI cached_tokens
 	cacheWriteToks int64 // Anthropic cache_creation_input_tokens; OpenAI cache_write_tokens
-	reasoningToks  int64 // OpenAI completion_tokens_details.reasoning_tokens (inside completionToks)
-	thinkChars     int64 // length of thinking/reasoning content seen
-	contentChars   int64 // length of regular text content seen
+	// cacheWrite5mToks and cacheWrite1hToks split cacheWriteToks by cache
+	// lifetime (Anthropic cache_creation.ephemeral_5m/1h_input_tokens; the
+	// OpenAI lane's split comes from response headers, outside the parser).
+	cacheWrite5mToks int64
+	cacheWrite1hToks int64
+	webSearchReqs    int64 // Anthropic server_tool_use.web_search_requests
+	reasoningToks    int64 // OpenAI completion_tokens_details.reasoning_tokens (inside completionToks)
+	thinkChars       int64 // length of thinking/reasoning content seen
+	contentChars     int64 // length of regular text content seen
 
 	// promptIncludesCache is set by the lane handler whose provider counts
 	// the cache classes inside its prompt figure (the OpenAI lane), so
 	// usage() reports the prompt net of them. Anthropic never sets it.
 	promptIncludesCache bool
 
-	// Anthropic accumulates token counts across events (message_start carries
-	// the input classes, message_delta the output count) until the flush on
-	// message_stop / [DONE] moves them into the fields above.
-	anthropicInputTokens  int64
+	// Anthropic accumulates usage across events until the flush on
+	// message_stop / [DONE] moves it into the fields above. anthropicIn holds
+	// every class but output (input, both cache classes, the cache-write
+	// split, web search requests) of the latest usage object that carries
+	// any of them: message_start's, superseded whole by a message_delta's.
+	// message_delta usage is cumulative, so the last one is final; on a
+	// server-tool turn its input_tokens exceed message_start's.
+	// anthropicOutputTokens is the last message_delta's output_tokens.
+	anthropicIn           usageCounts
 	anthropicOutputTokens int64
-	anthropicCacheRead    int64
-	anthropicCacheWrite   int64
 
 	// L4 content capture
 	captureContent bool
@@ -331,22 +340,14 @@ func (p *sseParser) handleOpenAIEvent(evt map[string]interface{}) {
 func (p *sseParser) handleAnthropicEvent(evt map[string]interface{}) {
 	switch evt["type"] {
 	case "message_start":
-		// input_tokens and the two cache classes arrive here. input_tokens
+		// input_tokens and the cache classes arrive here. input_tokens
 		// excludes cached tokens, so each class is kept separately.
 		if msg, ok := evt["message"].(map[string]interface{}); ok {
 			if id, _ := msg["id"].(string); id != "" {
 				p.loop.setUpstreamID(id)
 			}
 			if usage, ok := msg["usage"].(map[string]interface{}); ok {
-				if v := jsonCount(usage, "input_tokens"); v > 0 {
-					p.anthropicInputTokens = v
-				}
-				if v := jsonCount(usage, "cache_read_input_tokens"); v > 0 {
-					p.anthropicCacheRead = v
-				}
-				if v := jsonCount(usage, "cache_creation_input_tokens"); v > 0 {
-					p.anthropicCacheWrite = v
-				}
+				p.takeAnthropicInput(usage)
 			}
 		}
 
@@ -379,16 +380,38 @@ func (p *sseParser) handleAnthropicEvent(evt map[string]interface{}) {
 		}
 
 	case "message_delta":
-		// output_tokens arrive here
+		// output_tokens arrive here, and (cumulatively, so the last delta
+		// is final) the input classes, which supersede message_start's.
 		if usage, ok := evt["usage"].(map[string]interface{}); ok {
 			if v := jsonCount(usage, "output_tokens"); v > 0 {
 				p.anthropicOutputTokens = v
 			}
+			p.takeAnthropicInput(usage)
 		}
 
 	case "message_stop":
 		p.recordAnthropicTokens()
 	}
+}
+
+// takeAnthropicInput replaces the pending Anthropic input-side classes with
+// those of usage when it carries any positive one; an object with none (a
+// message_delta with output_tokens only, or zero placeholders) leaves the
+// earlier object's in place. Classes are never mixed between objects, with
+// one exception that is not a mix: when usage reports the same cache-write
+// total as before but no cache_creation split, the earlier split still
+// describes that total and is kept. A changed total without a split has an
+// unknown split (zero).
+func (p *sseParser) takeAnthropicInput(usage map[string]interface{}) {
+	in := anthropicUsage(usage)
+	in.completion = 0
+	if !in.hasCounts() {
+		return
+	}
+	if _, split := usage["cache_creation"].(map[string]interface{}); !split && in.cacheWrite == p.anthropicIn.cacheWrite {
+		in = in.withCacheWriteSplit(cacheWriteSplit{m5: p.anthropicIn.cacheWrite5m, h1: p.anthropicIn.cacheWrite1h})
+	}
+	p.anthropicIn = in
 }
 
 // recordAnthropicTokens flushes the counts accumulated across Anthropic events
@@ -398,23 +421,22 @@ func (p *sseParser) handleAnthropicEvent(evt map[string]interface{}) {
 // totals it exposes via usage() persist.
 func (p *sseParser) recordAnthropicTokens() {
 	attrs := telemetry.BackendAttrs(p.backendID, p.model)
-	if p.anthropicInputTokens > 0 {
-		p.promptToks = p.anthropicInputTokens
-		p.metrics.PromptTokens.Add(p.ctx, p.anthropicInputTokens, attrs)
-		p.anthropicInputTokens = 0
+	if in := p.anthropicIn; in.hasCounts() {
+		p.promptToks = in.prompt
+		p.cacheReadToks = in.cacheRead
+		p.cacheWriteToks = in.cacheWrite
+		p.cacheWrite5mToks = in.cacheWrite5m
+		p.cacheWrite1hToks = in.cacheWrite1h
+		p.webSearchReqs = in.webSearch
+		if in.prompt > 0 {
+			p.metrics.PromptTokens.Add(p.ctx, in.prompt, attrs)
+		}
+		p.anthropicIn = usageCounts{}
 	}
 	if p.anthropicOutputTokens > 0 {
 		p.completionToks = p.anthropicOutputTokens
 		p.metrics.CompletionTokens.Add(p.ctx, p.anthropicOutputTokens, attrs)
 		p.anthropicOutputTokens = 0
-	}
-	if p.anthropicCacheRead > 0 {
-		p.cacheReadToks = p.anthropicCacheRead
-		p.anthropicCacheRead = 0
-	}
-	if p.anthropicCacheWrite > 0 {
-		p.cacheWriteToks = p.anthropicCacheWrite
-		p.anthropicCacheWrite = 0
 	}
 }
 
@@ -424,7 +446,8 @@ func (p *sseParser) usage() usageCounts {
 	c := usageCounts{
 		prompt: p.promptToks, completion: p.completionToks,
 		cacheRead: p.cacheReadToks, cacheWrite: p.cacheWriteToks,
-		reasoning: p.reasoningToks,
+		cacheWrite5m: p.cacheWrite5mToks, cacheWrite1h: p.cacheWrite1hToks,
+		reasoning: p.reasoningToks, webSearch: p.webSearchReqs,
 	}
 	if p.promptIncludesCache {
 		return c.netOfCache()
