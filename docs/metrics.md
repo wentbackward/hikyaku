@@ -54,6 +54,10 @@ principal. There every lane means the same thing, so total input is
 
 Streamed OpenAI-lane responses carry these in the final usage chunk
 (`"choices": []`), which core requests with `stream_options.include_usage`.
+When a chunk (or a non-streamed response) has no top-level `usage`, core
+reads `choices[0].usage` instead, where Moonshot's older streams put the
+final usage on the `finish_reason` chunk. Usage reported in both places is
+counted once.
 
 ## Per-request usage events
 
