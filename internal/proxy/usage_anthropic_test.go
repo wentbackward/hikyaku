@@ -28,7 +28,7 @@ import (
 //     ephemeral_1h_input_tokens split cache_creation_input_tokens (their sum).
 //   - anthropic_messages_web_search.json: the non-streamed web search usage.
 //   - anthropic_messages_stream_web_search_cache_tiers.sse: both features in
-//     one stream, the final message_delta carrying the full usage object.
+//     one stream, the final message_delta carrying every class.
 
 // recordedUsageServer serves raw with the given content type and extra
 // response headers (flushing per line, so streams arrive chunked) from a
@@ -225,13 +225,52 @@ func TestAnthropicStream_LastMessageDeltaWinsNotSummed(t *testing.T) {
 	}
 }
 
-// The input classes of a message_delta that carries any are taken whole:
-// a class the delta omits is not filled in from message_start.
-func TestAnthropicStream_MessageDeltaInputClassesTakenWhole(t *testing.T) {
-	got := anthropicStream(t, `{"input_tokens":100,"cache_read_input_tokens":60,"output_tokens":1}`,
+// message_delta usage is merged class by class, as Anthropic's SDK
+// accumulator does: a class the delta omits is not applicable to it, so
+// message_start's value survives. Here the delta updates only input_tokens;
+// the cache classes and their split stay message_start's.
+func TestAnthropicStream_MessageDeltaOmittedClassesKeepMessageStart(t *testing.T) {
+	got := anthropicStream(t,
+		`{"input_tokens":100,"cache_read_input_tokens":60,"cache_creation_input_tokens":248,"output_tokens":1,"cache_creation":{"ephemeral_5m_input_tokens":148,"ephemeral_1h_input_tokens":100}}`,
 		`{"input_tokens":400,"output_tokens":20}`,
 	)
-	if want := (usageCounts{prompt: 400, completion: 20}); got != want {
+	if want := (usageCounts{prompt: 400, completion: 20, cacheRead: 60, cacheWrite: 248, cacheWrite5m: 148, cacheWrite1h: 100}); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+}
+
+// A delta carrying only output and server_tool_use keeps every input class
+// of message_start and adds the web search count.
+func TestAnthropicStream_ServerToolUseOnlyDeltaKeepsInputClasses(t *testing.T) {
+	got := anthropicStream(t,
+		`{"input_tokens":2679,"cache_read_input_tokens":500,"output_tokens":3}`,
+		`{"output_tokens":510,"server_tool_use":{"web_search_requests":1}}`,
+	)
+	if want := (usageCounts{prompt: 2679, completion: 510, cacheRead: 500, webSearch: 1}); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+}
+
+// Explicit nulls are treated as omitted, never as zero.
+func TestAnthropicStream_NullClassesKeepEarlierValues(t *testing.T) {
+	got := anthropicStream(t,
+		`{"input_tokens":100,"cache_read_input_tokens":60,"cache_creation_input_tokens":248,"output_tokens":1,"cache_creation":{"ephemeral_5m_input_tokens":148,"ephemeral_1h_input_tokens":100},"server_tool_use":{"web_search_requests":1}}`,
+		`{"input_tokens":null,"cache_read_input_tokens":null,"cache_creation_input_tokens":null,"cache_creation":null,"server_tool_use":null,"output_tokens":20}`,
+	)
+	if want := (usageCounts{prompt: 100, completion: 20, cacheRead: 60, cacheWrite: 248, cacheWrite5m: 148, cacheWrite1h: 100, webSearch: 1}); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+}
+
+// Cumulative counts never fall: a delta reporting a smaller value than an
+// earlier one (a non-compliant placeholder) does not lower the class.
+func TestAnthropicStream_SmallerDeltaValueDoesNotLowerClass(t *testing.T) {
+	got := anthropicStream(t,
+		`{"input_tokens":100,"cache_read_input_tokens":60,"output_tokens":1,"server_tool_use":{"web_search_requests":2}}`,
+		`{"input_tokens":1,"cache_read_input_tokens":1,"output_tokens":30,"server_tool_use":{"web_search_requests":1}}`,
+		`{"output_tokens":5}`,
+	)
+	if want := (usageCounts{prompt: 100, completion: 30, cacheRead: 60, webSearch: 2}); got != want {
 		t.Errorf("usage() = %+v, want %+v", got, want)
 	}
 }
@@ -248,9 +287,10 @@ func TestAnthropicStream_ZeroInputMessageDeltaKeepsMessageStart(t *testing.T) {
 }
 
 // The cache-write split belongs to the cache_creation_input_tokens total it
-// was reported with. A message_delta with its own cache_creation object
-// replaces it; one without keeps the earlier split only when the total is
-// unchanged (the split still describes it), else the split is unknown (0).
+// was reported with. A larger total takes the delta's split, or none when
+// the delta has no cache_creation object; the same total keeps the earlier
+// split unless the delta carries a positive one; an absent or smaller total
+// keeps the earlier total and split.
 func TestAnthropicStream_CacheWriteSplitFollowsItsTotal(t *testing.T) {
 	start := `{"input_tokens":100,"cache_creation_input_tokens":248,"output_tokens":1,"cache_creation":{"ephemeral_5m_input_tokens":148,"ephemeral_1h_input_tokens":100}}`
 	cases := []struct {
@@ -266,6 +306,26 @@ func TestAnthropicStream_CacheWriteSplitFollowsItsTotal(t *testing.T) {
 			name:  "SameTotalWithoutSplitKeepsEarlierSplit",
 			delta: `{"input_tokens":200,"cache_creation_input_tokens":248,"output_tokens":9}`,
 			want:  usageCounts{prompt: 200, completion: 9, cacheWrite: 248, cacheWrite5m: 148, cacheWrite1h: 100},
+		},
+		{
+			name:  "SameTotalWithNewSplitReplaces",
+			delta: `{"cache_creation_input_tokens":248,"output_tokens":9,"cache_creation":{"ephemeral_5m_input_tokens":248,"ephemeral_1h_input_tokens":0}}`,
+			want:  usageCounts{prompt: 100, completion: 9, cacheWrite: 248, cacheWrite5m: 248},
+		},
+		{
+			name:  "SameTotalWithZeroSplitKeepsEarlierSplit",
+			delta: `{"cache_creation_input_tokens":248,"output_tokens":9,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}`,
+			want:  usageCounts{prompt: 100, completion: 9, cacheWrite: 248, cacheWrite5m: 148, cacheWrite1h: 100},
+		},
+		{
+			name:  "AbsentTotalKeepsEarlierPairWhateverSplit",
+			delta: `{"output_tokens":9,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":248}}`,
+			want:  usageCounts{prompt: 100, completion: 9, cacheWrite: 248, cacheWrite5m: 148, cacheWrite1h: 100},
+		},
+		{
+			name:  "SmallerTotalKeepsEarlierPair",
+			delta: `{"cache_creation_input_tokens":10,"output_tokens":9,"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":0}}`,
+			want:  usageCounts{prompt: 100, completion: 9, cacheWrite: 248, cacheWrite5m: 148, cacheWrite1h: 100},
 		},
 		{
 			name:  "ChangedTotalWithoutSplitDropsSplit",

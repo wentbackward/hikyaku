@@ -87,11 +87,11 @@ type sseParser struct {
 	// Anthropic accumulates usage across events until the flush on
 	// message_stop / [DONE] moves it into the fields above. anthropicIn holds
 	// every class but output (input, both cache classes, the cache-write
-	// split, web search requests) of the latest usage object that carries
-	// any of them: message_start's, superseded whole by a message_delta's.
-	// message_delta usage is cumulative, so the last one is final; on a
-	// server-tool turn its input_tokens exceed message_start's.
-	// anthropicOutputTokens is the last message_delta's output_tokens.
+	// split, web search requests), merged class by class from message_start
+	// and each message_delta (mergeAnthropicUsage). message_delta usage is
+	// cumulative, so the last value of each class is final; on a server-tool
+	// turn its input_tokens exceed message_start's. anthropicOutputTokens is
+	// the message_delta output_tokens, merged the same way.
 	anthropicIn           usageCounts
 	anthropicOutputTokens int64
 
@@ -347,7 +347,7 @@ func (p *sseParser) handleAnthropicEvent(evt map[string]interface{}) {
 				p.loop.setUpstreamID(id)
 			}
 			if usage, ok := msg["usage"].(map[string]interface{}); ok {
-				p.takeAnthropicInput(usage)
+				p.mergeAnthropicUsage(usage)
 			}
 		}
 
@@ -380,13 +380,12 @@ func (p *sseParser) handleAnthropicEvent(evt map[string]interface{}) {
 		}
 
 	case "message_delta":
-		// output_tokens arrive here, and (cumulatively, so the last delta
-		// is final) the input classes, which supersede message_start's.
+		// output_tokens arrive here, and the input classes again. Both are
+		// cumulative, so the last (largest) delta is final; on a server-tool
+		// turn its input_tokens exceed message_start's.
 		if usage, ok := evt["usage"].(map[string]interface{}); ok {
-			if v := jsonCount(usage, "output_tokens"); v > 0 {
-				p.anthropicOutputTokens = v
-			}
-			p.takeAnthropicInput(usage)
+			p.anthropicOutputTokens = max(p.anthropicOutputTokens, jsonCount(usage, "output_tokens"))
+			p.mergeAnthropicUsage(usage)
 		}
 
 	case "message_stop":
@@ -394,24 +393,41 @@ func (p *sseParser) handleAnthropicEvent(evt map[string]interface{}) {
 	}
 }
 
-// takeAnthropicInput replaces the pending Anthropic input-side classes with
-// those of usage when it carries any positive one; an object with none (a
-// message_delta with output_tokens only, or zero placeholders) leaves the
-// earlier object's in place. Classes are never mixed between objects, with
-// one exception that is not a mix: when usage reports the same cache-write
-// total as before but no cache_creation split, the earlier split still
-// describes that total and is kept. A changed total without a split has an
-// unknown split (zero).
-func (p *sseParser) takeAnthropicInput(usage map[string]interface{}) {
-	in := anthropicUsage(usage)
-	in.completion = 0
-	if !in.hasCounts() {
-		return
+// mergeAnthropicUsage folds one Anthropic usage object (message_start's or a
+// message_delta's) into the pending classes other than output, class by
+// class, as Anthropic's own SDK accumulator does: message_delta usage is
+// cumulative, and a class it omits (or sends as null) is not applicable to
+// it, so the earlier value must survive. Each class takes the larger of its
+// earlier value and this object's. Cumulative counts never fall, so on a
+// compliant stream that is the last reported value, and a zero placeholder
+// (or an omitted key, which jsonCount reads as zero) never erases a count.
+// server_tool_use is read as one object, the way the SDK replaces it.
+//
+// The cache-write split stays tied to the total it was reported with:
+//   - a larger total takes this object's cache_creation split, or none (0)
+//     when the object has no split for it;
+//   - the same total takes this object's split only when it carries a
+//     positive tier, else keeps the earlier one;
+//   - an absent, null or smaller total keeps the earlier total and split,
+//     whatever cache_creation this object carries.
+func (p *sseParser) mergeAnthropicUsage(usage map[string]interface{}) {
+	u := anthropicUsage(usage)
+	in := &p.anthropicIn
+	in.prompt = max(in.prompt, u.prompt)
+	in.cacheRead = max(in.cacheRead, u.cacheRead)
+	in.webSearch = max(in.webSearch, u.webSearch)
+	_, hasSplit := usage["cache_creation"].(map[string]interface{})
+	split := cacheWriteSplit{m5: u.cacheWrite5m, h1: u.cacheWrite1h}
+	switch {
+	case u.cacheWrite > in.cacheWrite:
+		in.cacheWrite = u.cacheWrite
+		if !hasSplit {
+			split = cacheWriteSplit{}
+		}
+		*in = in.withCacheWriteSplit(split)
+	case u.cacheWrite == in.cacheWrite && (split.m5 > 0 || split.h1 > 0):
+		*in = in.withCacheWriteSplit(split)
 	}
-	if _, split := usage["cache_creation"].(map[string]interface{}); !split && in.cacheWrite == p.anthropicIn.cacheWrite {
-		in = in.withCacheWriteSplit(cacheWriteSplit{m5: p.anthropicIn.cacheWrite5m, h1: p.anthropicIn.cacheWrite1h})
-	}
-	p.anthropicIn = in
 }
 
 // recordAnthropicTokens flushes the counts accumulated across Anthropic events

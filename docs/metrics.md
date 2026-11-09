@@ -6,7 +6,7 @@ All metrics are exported via OpenTelemetry with a Prometheus exporter. Default e
 |---|---|---|---|
 | `llm_request_duration_seconds` | Histogram | `backend`, `model`, `status` | End-to-end request duration |
 | `llm_time_to_first_token_seconds` | Histogram | `backend`, `model` | Time from request start to first streamed content token |
-| `llm_prompt_tokens_total` | Counter | `backend`, `model` | Cumulative prompt/input tokens |
+| `llm_prompt_tokens_total` | Counter | `backend`, `model` | Cumulative prompt/input tokens (a streamed Anthropic response adds its final, cumulative `input_tokens`; see [Token counters](#token-counters)) |
 | `llm_completion_tokens_total` | Counter | `backend`, `model` | Cumulative completion/output tokens |
 | `llm_active_requests` | Gauge | `backend`, `model` | Requests currently in flight |
 | `llm_requests_total` | Counter | `backend`, `model`, `status` | Total requests by backend, model, and HTTP status |
@@ -65,14 +65,18 @@ summed).
 Streamed Anthropic responses carry the input classes in `message_start` and
 again, **cumulatively**, in `message_delta`. On a turn with server-side
 tools (web search) the final `message_delta` reports more input than
-`message_start`, so core takes every class but the output count from the
-last usage object that carries any (`message_start`, superseded whole by
-each `message_delta`), and `output_tokens` from the last `message_delta`.
-A `message_delta` with only `output_tokens`, or only zero input classes,
-leaves `message_start`'s classes in place. When a `message_delta` reports
-the same cache-write total without a `cache_creation` split, the earlier
-split still describes it and is kept; a changed total without a split has
-an unknown split (0). `llm_prompt_tokens_total` gets the same final
+`message_start`. Core merges each usage object class by class, as
+Anthropic's SDK does: a class a `message_delta` omits (or sends as `null`)
+is not applicable to it, so the earlier value survives, and each class
+takes the larger of its earlier and its new value (cumulative counts never
+fall, so on a compliant stream that is the last value, and a zero
+placeholder never erases a count). `output_tokens` comes from the
+`message_delta` events the same way, and `server_tool_use` is read as one
+object. The cache-write split stays with the total it was reported with: a
+larger total takes that event's `cache_creation` split, or none (0) when
+the event has no split; the same total keeps the earlier split unless the
+event carries a positive one; an absent or smaller total keeps the earlier
+total and split. `llm_prompt_tokens_total` gets the same final
 `input_tokens`.
 
 Streamed OpenAI-lane responses carry these in the final usage chunk
