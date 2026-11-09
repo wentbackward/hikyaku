@@ -39,10 +39,10 @@ func main() {
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		log.Fatalf("config: %s", configError(err))
 	}
 	if err := cfg.ValidateListenPolicy(); err != nil {
-		log.Fatalf("%v", err)
+		log.Fatalf("%s", configError(err))
 	}
 	logger.Apply(cfg.Server.LogLevel)
 	logSecurityPosture(cfg)
@@ -144,7 +144,7 @@ func main() {
 			newCfg, err := config.Load(cfgPath)
 			switch {
 			case err != nil:
-				log.Printf("[hikyaku] config reload failed: %v (keeping old config)", err)
+				log.Printf("[hikyaku] config reload failed: %s (keeping old config)", configError(err))
 				logger.Apply(srv.Config().Server.LogLevel)
 			default:
 				// ApplyConfig enforces the TLS policy on reload too, and
@@ -152,7 +152,7 @@ func main() {
 				// address, TLS files, metrics listener, journal, ...) rather
 				// than run a config other than the file's.
 				if perr := srv.ApplyConfig(newCfg); perr != nil {
-					log.Printf("[hikyaku] config reload rejected: %v (keeping old config)", perr)
+					log.Printf("[hikyaku] config reload rejected: %s (keeping old config)", configError(perr))
 					logger.Apply(srv.Config().Server.LogLevel)
 				} else {
 					logger.Apply(newCfg.Server.LogLevel)
@@ -225,20 +225,20 @@ func probeBackends(cfg *config.Config, rt http.RoundTripper) {
 
 		base, err := url.Parse(b.BaseURL)
 		if err != nil {
-			log.Printf("[probe] backend %-12s ERROR parsing URL: %v", b.ID, err)
+			log.Printf("[probe] backend %-12s ERROR parsing URL: %s", b.ID, logger.SafeErr(err))
 			continue
 		}
 		probeURL := base.ResolveReference(&url.URL{Path: "models"}).String()
 		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, probeURL, http.NoBody)
 		if err != nil {
-			log.Printf("[probe] backend %-12s ERROR building request: %v", b.ID, err)
+			log.Printf("[probe] backend %-12s ERROR building request: %s", b.ID, logger.SafeErr(err))
 			continue
 		}
 		b.SetCredential(req.Header)
 
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Printf("[probe] backend %-12s UNREACHABLE: %v", b.ID, err)
+			log.Printf("[probe] backend %-12s UNREACHABLE: %s", b.ID, logger.SafeErr(err))
 			logVirtualModels(byBackend[b.ID])
 			continue
 		}
@@ -281,3 +281,9 @@ func logVirtualModels(vmodels []vmodel) {
 		log.Printf("[probe]   → %-30s (real: %s)", vm.virtual, vm.real)
 	}
 }
+
+// configError renders a config load, validation or reload error for the log.
+// The YAML decoder quotes the offending scalar (cannot unmarshal !!str
+// `...`), which may be a secret typed into the wrong field, so every quoted
+// span is reduced to its length; the line, column and type remain.
+func configError(err error) string { return logger.SafeErr(err) }

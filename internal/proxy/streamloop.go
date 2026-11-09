@@ -283,7 +283,7 @@ func (g *streamLoopGuard) evaluate(choice int, ch loopChannel, w *loopWindow, cf
 	// One line per trip. It carries no response text, in any build.
 	log.Printf("stream_loop_trip route=%s backend=%s channel=%s mode=%s trigger=%s ratio=%.3f threshold=%.3f window=%d chars_seen=%d choice=%d request_id=%s upstream_id=%s",
 		logValue(g.route), logValue(g.backendID), ch, cfg.Mode, trip.trigger, r, trip.limit,
-		trip.window, trip.charsSeen, choice, g.rid, logValue(g.upstreamID))
+		trip.window, trip.charsSeen, choice, g.rid, logUpstreamID(g.upstreamID))
 	g.sampler.save(g, trip, w.buf, cfg.WindowChars)
 	return trip
 }
@@ -313,6 +313,27 @@ func logValue(s string) string {
 	for _, r := range s {
 		if !logSafeRune(r) {
 			return strconv.Quote(s)
+		}
+	}
+	return s
+}
+
+// maxLogUpstreamID caps the upstream response id on the trip line.
+const maxLogUpstreamID = 64
+
+// logUpstreamID renders the upstream's response id: bare when it is at most
+// maxLogUpstreamID token characters, otherwise only its length. The id is
+// upstream-supplied, so its size and contents are not ours to trust.
+func logUpstreamID(s string) string {
+	if s == "" {
+		return `""`
+	}
+	if len(s) > maxLogUpstreamID {
+		return fmt.Sprintf("<len=%d>", len(s))
+	}
+	for _, r := range s {
+		if !logSafeRune(r) {
+			return fmt.Sprintf("<len=%d>", len(s))
 		}
 	}
 	return s

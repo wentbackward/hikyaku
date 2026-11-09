@@ -1,10 +1,8 @@
 package proxy
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"reflect"
 	"strings"
 
@@ -175,28 +173,3 @@ func logModels(cfg *config.Config, virtual, resolved string) (logVirtual, logRes
 }
 
 func logUnknownModel(name string) string { return fmt.Sprintf("<unknown model len=%d>", len(name)) }
-
-// logURL renders an upstream URL without its query string, fragment or
-// user info: the proxy forwards the caller's query string, which is caller
-// text. Scheme, host and path come from config and the fixed API paths.
-func logURL(u *url.URL) string {
-	if u == nil {
-		return ""
-	}
-	c := url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}
-	return c.String()
-}
-
-// logErr renders an outbound error for the log. A *url.Error quotes the
-// request URL, query string included; it is printed with logURL instead.
-func logErr(err error) string {
-	var ue *url.Error
-	if errors.As(err, &ue) {
-		u, perr := url.Parse(ue.URL)
-		if perr != nil {
-			return fmt.Sprintf("%s <unparsable url len=%d>: %v", ue.Op, len(ue.URL), ue.Err)
-		}
-		return fmt.Sprintf("%s %q: %v", ue.Op, logURL(u), ue.Err)
-	}
-	return err.Error()
-}

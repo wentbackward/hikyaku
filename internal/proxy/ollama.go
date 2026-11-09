@@ -7,6 +7,7 @@ import (
 	"net/url"
 
 	"github.com/wentbackward/hikyaku/internal/config"
+	"github.com/wentbackward/hikyaku/internal/logger"
 )
 
 // ── Ollama native endpoints ──────────────────────────────────────────────────
@@ -110,14 +111,14 @@ func (s *Server) handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[proxy] /api/tags upstream error backend=%s: %v", backend.ID, logErr(err))
+		log.Printf("[proxy] /api/tags upstream error backend=%s: %v", backend.ID, logger.SafeErr(err))
 		jsonError(w, "upstream error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if _, err := decodeUpstreamBody(resp); err != nil {
-		log.Printf("[proxy] /api/tags upstream error backend=%s: %v", backend.ID, logErr(err))
+		log.Printf("[proxy] /api/tags upstream error backend=%s: %v", backend.ID, logger.SafeErr(err))
 		jsonError(w, err.Error(), http.StatusBadGateway)
 		return
 	}

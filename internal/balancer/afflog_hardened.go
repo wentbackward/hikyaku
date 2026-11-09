@@ -7,3 +7,7 @@ package balancer
 // HMAC the value is a stable per-process correlation token, so hardened builds
 // omit it entirely.
 func logAffinity(_ string, _ ...any) {}
+
+// affinityLogKey feeds only logAffinity, which logs nothing in hardened
+// builds, so it does no work.
+func affinityLogKey(_ string) string { return "" }

@@ -1,15 +1,11 @@
 package proxy
 
 import (
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"net/url"
 
 	"github.com/wentbackward/hikyaku/internal/config"
 	"github.com/wentbackward/hikyaku/internal/logger"
@@ -206,32 +202,46 @@ routes:
 	}
 }
 
-// The upstream URL is logged without the caller's query string, fragment
-// or user info.
-func TestLogURL(t *testing.T) {
-	u, _ := url.Parse("https://user:pw@api.example:8443/v1/chat/completions?q=secret#frag")
-	if got, want := logURL(u), "https://api.example:8443/v1/chat/completions"; got != want {
-		t.Errorf("logURL = %q, want %q", got, want)
+// The upstream response id on the trip line is printed only when it is a
+// short token; anything longer or with other characters is its length.
+func TestLogUpstreamID(t *testing.T) {
+	cases := map[string]string{
+		"":                      `""`,
+		"chatcmpl-abc123":       "chatcmpl-abc123",
+		"msg_01XyZ:a/b@c.d":     "msg_01XyZ:a/b@c.d",
+		strings.Repeat("a", 64): strings.Repeat("a", 64),
+		strings.Repeat("a", 65): "<len=65>",
+		"id with spaces":        "<len=14>",
+		"id\nnewline":           "<len=10>",
+		"idé":                   "<len=4>",
 	}
-	if logURL(nil) != "" {
-		t.Error("logURL(nil) should be empty")
-	}
-	if upstreamURL(nil) != "" || upstreamURL(&http.Response{}) != "" {
-		t.Error("upstreamURL without a request should be empty")
+	for in, want := range cases {
+		if got := logUpstreamID(in); got != want {
+			t.Errorf("logUpstreamID(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
-// An outbound *url.Error quotes the request URL; logErr drops its query.
-func TestLogErr(t *testing.T) {
-	ue := &url.Error{Op: "Post", URL: "http://h/v1/chat/completions?q=secret", Err: io.EOF}
-	if got, want := logErr(fmt.Errorf("wrapped: %w", ue)), `Post "http://h/v1/chat/completions": EOF`; got != want {
-		t.Errorf("logErr = %q, want %q", got, want)
+// Backend base URLs are logged without user info or query string.
+func TestLog_TargetURLWithoutUserInfo(t *testing.T) {
+	t.Cleanup(logger.Reload)
+	t.Setenv("LOG_LEVEL", "2")
+	logger.Reload()
+	buf := captureLog(t)
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer up.Close()
+	withCreds := strings.Replace(up.URL, "http://", "http://user:basicsecret@", 1) + "/v1?key=querysecret"
+	s := newCredServer(t, withCreds, "openai", "", "", "")
+	sendMarkerRequest(t, s, "/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	out := buf.String()
+	if strings.Contains(out, "basicsecret") || strings.Contains(out, "querysecret") {
+		t.Errorf("log carries base_url user info or query:\n%s", out)
 	}
-	bad := &url.Error{Op: "Get", URL: "http://h/%zz?q=secret", Err: io.EOF}
-	if got := logErr(bad); strings.Contains(got, "secret") || !strings.Contains(got, "unparsable url") {
-		t.Errorf("logErr(unparsable) = %q", got)
-	}
-	if got := logErr(errors.New("dial tcp: connection refused")); got != "dial tcp: connection refused" {
-		t.Errorf("logErr(plain) = %q", got)
+	if !strings.Contains(out, "target="+up.URL+"/v1 ") {
+		t.Errorf("log missing the stripped target %s/v1:\n%s", up.URL, out)
 	}
 }

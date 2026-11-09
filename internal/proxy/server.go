@@ -195,7 +195,7 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request, rid string, st *r
 	if errors.As(err, &ae) && ae.Status >= 400 && ae.Status <= 599 {
 		status = ae.Status
 	}
-	log.Printf("[proxy] [%s] %s %s not admitted (generation %d): %v", rid, r.Method, r.URL.Path, st.id, err)
+	log.Printf("[proxy] [%s] %s %s not admitted (generation %d): %s", rid, r.Method, r.URL.Path, st.id, logger.SafeErr(err))
 	jsonError(w, "request not admitted", status)
 	return false
 }
@@ -585,7 +585,7 @@ func (s *Server) Reload(cfg *config.Config) {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
 	if err := s.checkStartupFields(cfg); err != nil {
-		log.Printf("[reload] config rejected: %v (keeping old config)", err)
+		log.Printf("[reload] config rejected: %s (keeping old config)", logger.SafeErr(err))
 		return
 	}
 	s.reload(cfg)
@@ -619,7 +619,7 @@ func (s *Server) reload(cfg *config.Config) {
 		if b.Default {
 			marker = " [default]"
 		}
-		log.Printf("[reload]   backend %-16s %s (%s)%s", b.ID, b.BaseURL, conc, marker)
+		log.Printf("[reload]   backend %-16s %s (%s)%s", b.ID, logger.SafeURLString(b.BaseURL), conc, marker)
 	}
 	if cfg.Server.PassthroughUnrouted {
 		if def := cfg.DefaultBackend(); def != nil && !cfg.HasExplicitDefault() {
@@ -1025,10 +1025,10 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	logVirtual, logReal := logModels(cfg, modelName, realModel)
 	if res != nil && len(res.Params) > 0 && rlog.level() >= logger.LevelHeaders {
 		rlog.Headers("[%s] → backend=%s target=%s model=%s→%s auth=%s params=%v",
-			rid, backend.ID, backend.BaseURL, logVirtual, logReal, authType, logParams(res.Params))
+			rid, backend.ID, logger.SafeURLString(backend.BaseURL), logVirtual, logReal, authType, logParams(res.Params))
 	} else {
 		rlog.Headers("[%s] → backend=%s target=%s model=%s→%s auth=%s",
-			rid, backend.ID, backend.BaseURL, logVirtual, logReal, authType)
+			rid, backend.ID, logger.SafeURLString(backend.BaseURL), logVirtual, logReal, authType)
 	}
 
 	// ── L4: log full message content ───────────────────────────────────────
@@ -1173,10 +1173,10 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 				}
 			}
 			// r.URL has been rewritten by the director to the final upstream
-			// scheme/host/path; logURL drops the caller's query string.
+			// scheme/host/path; logger.SafeURL drops the caller's query string.
 			rlog.Request("[%s] %s %s model=%s backend=%s url=%s status=502 dur=%.3fs ERROR: %v",
-				rid, r.Method, r.URL.Path, logVirtual, backendID, logURL(r.URL), elapsed, logErr(err))
-			log.Printf("[proxy] upstream error backend=%s: %v", backendID, logErr(err))
+				rid, r.Method, r.URL.Path, logVirtual, backendID, logger.SafeURL(r.URL), elapsed, logger.SafeErr(err))
+			log.Printf("[proxy] upstream error backend=%s: %v", backendID, logger.SafeErr(err))
 			capCtx.finishError(t0, "upstream error: "+err.Error())
 			jsonError(w, "upstream error: "+err.Error(), http.StatusBadGateway)
 		},
@@ -1270,16 +1270,15 @@ func (c *captureCtx) finishError(t0 time.Time, msg string) {
 	}
 }
 
-// upstreamURL returns the full URL that was sent to the backend, as rewritten
-// by the director (scheme + host + resolved path + query). Used in request
-// logs so misconfigured base_url / endpoint composition is visible at L1.
-// upstreamURL is the URL a response came from, for the log: without the
-// caller's query string (logURL).
+// upstreamURL is the URL sent to the backend, as rewritten by the director,
+// for the L1 request line: scheme, host and resolved path, so a misconfigured
+// base_url / endpoint composition is visible, but never the caller's query
+// string or user info (logger.SafeURL).
 func upstreamURL(resp *http.Response) string {
 	if resp == nil || resp.Request == nil {
 		return ""
 	}
-	return logURL(resp.Request.URL)
+	return logger.SafeURL(resp.Request.URL)
 }
 
 func timing(t0 time.Time) capture.TimingSnapshot {

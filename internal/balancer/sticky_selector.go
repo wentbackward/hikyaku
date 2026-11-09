@@ -43,18 +43,18 @@ func (s *StickyLeastLoaded) Select(pool []*BackendState, key string, ctx *Reques
 					s.store.Touch(key)
 					return pinned, nil
 				}
-				logAffinity("[lb] affinity key=%-16s pinned=%s OVERLOADED (inflight=%d, max=%d)",
-					key[:min(len(key), 16)], pinned.ID, pinned.InFlight.Load(), s.maxConcurrency)
+				logAffinity("[lb] affinity key=%s pinned=%s OVERLOADED (inflight=%d, max=%d)",
+					affinityLogKey(key), pinned.ID, pinned.InFlight.Load(), s.maxConcurrency)
 			}
 			if pinned == nil {
-				logAffinity("[lb] affinity key=%-16s pinned=%s NOT IN POOL (pool=%v)",
-					key[:min(len(key), 16)], entry.BackendID, poolIDs(pool))
+				logAffinity("[lb] affinity key=%s pinned=%s NOT IN POOL (pool=%v)",
+					affinityLogKey(key), entry.BackendID, poolIDs(pool))
 			} else {
-				logAffinity("[lb] affinity key=%-16s pinned=%s FAILING (cooldown active)",
-					key[:min(len(key), 16)], pinned.ID)
+				logAffinity("[lb] affinity key=%s pinned=%s FAILING (cooldown active)",
+					affinityLogKey(key), pinned.ID)
 			}
 		} else {
-			logAffinity("[lb] affinity key=%-16s MISS (no pin yet)", key[:min(len(key), 16)])
+			logAffinity("[lb] affinity key=%s MISS (no pin yet)", affinityLogKey(key))
 		}
 	}
 

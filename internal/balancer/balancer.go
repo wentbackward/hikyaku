@@ -196,7 +196,7 @@ func (b *Balancer) Select(groupName, key string, ctx *RequestContext) (*BackendS
 	if err != nil {
 		return nil, err
 	}
-	logAffinity("[lb] group %-20s → %-20s (pool=%d, affinity=%s)", groupName, selected.ID, len(pool), key)
+	logAffinity("[lb] group %-20s → %-20s (pool=%d, affinity=%s)", groupName, selected.ID, len(pool), affinityLogKey(key))
 	return selected, nil
 }
 

@@ -16,7 +16,8 @@
 // without their query string); statuses and byte lengths; sampling params
 // with strings as lengths; standard message roles; allowlisted protocol
 // header values and the User-Agent product token (other headers as
-// lengths); the caller's network address; transport and config errors.
+// lengths); the caller's network address; transport and config errors
+// with quoted spans redacted (RedactQuoted, SafeErr).
 // Content goes only through Body and Content, which the hardened build
 // compiles out. docs/logging.md is the reference.
 //
