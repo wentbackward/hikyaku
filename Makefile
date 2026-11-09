@@ -54,16 +54,11 @@ vet:
 # Run everything CI runs, in order.
 check: lint test build
 
-# Hardened-specific unit tests. We do NOT run ./... under -tags hardened:
-# internal/journal's analyze tests assert the prompt text fields that hardened
-# deliberately compiles out, so they would fail by design. The listed packages
-# hold the hardened enforcement assertions (TLS policy, https-only openai
-# backends, keyed affinity hash, log-level clamp and body/content gating).
-# From internal/proxy only the stream loop detection tests run: they hold the
-# assertion that tripping-window samples are compiled out of hardened.
+# The whole unit suite under -tags hardened, so no package can skip it.
+# Tests of inspect-only features (capture, prompt text, log levels 3-4) are
+# split by build tag: the hardened file asserts the feature is compiled out.
 test-hardened:
-	go test -tags hardened -count=1 . ./internal/config/ ./internal/balancer/ ./internal/sectls/ ./internal/logger/ ./cmd/hikyaku/
-	go test -tags hardened -race -count=1 ./internal/proxy/
+	go test -tags hardened -race -count=1 ./...
 
 # Same as `check` but for the hardened build variant.
 check-hardened: lint-hardened test-hardened
