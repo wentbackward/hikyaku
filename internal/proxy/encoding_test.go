@@ -380,9 +380,14 @@ func TestEncoding_CorruptGzipIsBadGateway(t *testing.T) {
 }
 
 // A decoded stream is passed on as it is decoded: the first event reaches the
-// client while the upstream is still holding the rest of the stream.
+// client while the upstream is still holding the rest of the stream. The
+// upstream waits only for the test (or the request ending), so a proxy that
+// buffered the decoded body would never deliver the first event.
 func TestEncoding_DecodedStreamFlushesIncrementally(t *testing.T) {
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseUpstream := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseUpstream)
 	first := `data: {"id":"x","choices":[{"index":0,"delta":{"content":"ok"}}]}` + "\n\n"
 	rest := `data: {"id":"x","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7}}` + "\n\n" + "data: [DONE]\n\n"
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -395,19 +400,13 @@ func TestEncoding_DecodedStreamFlushesIncrementally(t *testing.T) {
 		w.(http.Flusher).Flush()
 		select {
 		case <-release:
-		case <-time.After(10 * time.Second):
+		case <-r.Context().Done():
+			return
 		}
 		_, _ = io.WriteString(zw, rest)
 		_ = zw.Close()
 	}))
 	t.Cleanup(up.Close)
-	t.Cleanup(func() {
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
-	})
 	events := make(chan UsageEvent, 4)
 	ps := newEncodingProxy(t, "openai", up.URL, "", func(ev UsageEvent) { events <- ev })
 	lane := encodingLanes[1]
@@ -418,14 +417,28 @@ func TestEncoding_DecodedStreamFlushesIncrementally(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	got := make([]byte, len(first))
-	if _, err := io.ReadFull(resp.Body, got); err != nil {
-		t.Fatalf("first event did not arrive before the upstream finished: %v", err)
+	type readResult struct {
+		b   []byte
+		err error
 	}
-	if string(got) != first {
-		t.Fatalf("first event = %q", got)
+	firstRead := make(chan readResult, 1)
+	go func() {
+		got := make([]byte, len(first))
+		_, err := io.ReadFull(resp.Body, got)
+		firstRead <- readResult{got, err}
+	}()
+	select {
+	case r := <-firstRead:
+		if r.err != nil || string(r.b) != first {
+			t.Fatalf("first event = %q, %v", r.b, r.err)
+		}
+	case <-time.After(5 * time.Second):
+		// The upstream is still held: only an incremental proxy gets here
+		// in time. Closing the body ends the reader goroutine.
+		_ = resp.Body.Close()
+		t.Fatal("first event did not reach the client while the upstream held the rest")
 	}
-	close(release)
+	releaseUpstream()
 	tail, _ := io.ReadAll(resp.Body)
 	if string(tail) != rest {
 		t.Errorf("rest of stream = %q", tail)
