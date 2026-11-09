@@ -1,0 +1,8 @@
+data: {"id":"chatcmpl-fixture08","object":"chat.completion.chunk","created":1730000000,"model":"kimi-k3.1-pro","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture08","object":"chat.completion.chunk","created":1730000000,"model":"kimi-k3.1-pro","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-fixture08","object":"chat.completion.chunk","created":1730000000,"model":"kimi-k3.1-pro","choices":[],"usage":{"prompt_tokens":90,"completion_tokens":1524,"total_tokens":1614,"completion_tokens_details":{"reasoning_tokens":1007},"prompt_tokens_details":{"cache_write_tokens":0}}}
+
+data: [DONE]
+

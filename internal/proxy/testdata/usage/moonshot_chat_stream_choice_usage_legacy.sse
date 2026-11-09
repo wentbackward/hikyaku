@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl-fixture07","object":"chat.completion.chunk","created":1730000000,"model":"moonshot-v1-8k","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture07","object":"chat.completion.chunk","created":1730000000,"model":"moonshot-v1-8k","choices":[{"index":0,"delta":{},"finish_reason":"stop","usage":{"prompt_tokens":1500,"completion_tokens":40,"total_tokens":1540,"cached_tokens":1024}}]}
+
+data: [DONE]
+

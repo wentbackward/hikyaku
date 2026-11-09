@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
@@ -15,11 +16,16 @@ import (
 	"github.com/wentbackward/hikyaku/internal/telemetry"
 )
 
-// The OpenAI lane fixtures under testdata/usage are recorded response shapes
-// (identifiers replaced) from OpenAI and Moonshot (api.moonshot.ai/v1). Both
-// report cached prompt tokens INSIDE prompt_tokens, so the lane reports them
-// as cache classes and PromptTokens net of them, the meaning PromptTokens has
-// on every lane (uncached input).
+// The OpenAI lane fixtures under testdata/usage follow the documented
+// response shapes (identifiers replaced) of OpenAI and Moonshot
+// (api.moonshot.ai/v1). moonshot_chat_stream_docs.sse is Moonshot's documented
+// streaming example (usage on a final chunk with "choices": []); the
+// *_choice_usage* fixtures carry usage inside choices[0], which Moonshot's
+// chunk schema allows (an optional per-choice usage) and its older streams
+// sent on the finish_reason chunk with no separate usage chunk. Both
+// providers report cached prompt tokens INSIDE prompt_tokens, so the lane
+// reports them as cache classes and PromptTokens net of them, the meaning
+// PromptTokens has on every lane (uncached input).
 
 func readUsageFixture(t *testing.T, name string) string {
 	t.Helper()
@@ -113,6 +119,26 @@ var openAIUsageCases = []openAIUsageCase{
 	},
 	{
 		name: "MoonshotStreamUsageChunkWithEmptyChoices", fixture: "moonshot_chat_stream.sse", stream: true,
+		want:        usageCounts{prompt: 220, completion: 40, cacheRead: 1024, cacheWrite: 256},
+		grossPrompt: 1500,
+	},
+	{
+		name: "MoonshotDocumentedStreamExample", fixture: "moonshot_chat_stream_docs.sse", stream: true,
+		want:        usageCounts{prompt: 90, completion: 1524, reasoning: 1007},
+		grossPrompt: 90,
+	},
+	{
+		name: "MoonshotStreamUsageInsideFinishChoice", fixture: "moonshot_chat_stream_choice_usage.sse", stream: true,
+		want:        usageCounts{prompt: 220, completion: 40, cacheRead: 1024, cacheWrite: 256},
+		grossPrompt: 1500,
+	},
+	{
+		name: "MoonshotStreamUsageInsideFinishChoiceLegacyTopLevelCachedTokens", fixture: "moonshot_chat_stream_choice_usage_legacy.sse", stream: true,
+		want:        usageCounts{prompt: 476, completion: 40, cacheRead: 1024},
+		grossPrompt: 1500,
+	},
+	{
+		name: "MoonshotUsageInsideChoice", fixture: "moonshot_chat_choice_usage.json",
 		want:        usageCounts{prompt: 220, completion: 40, cacheRead: 1024, cacheWrite: 256},
 		grossPrompt: 1500,
 	},
@@ -323,4 +349,61 @@ func TestUsageEvent_ReasoningTokensZeroOnAnthropic(t *testing.T) {
 	if got, want := p.usage(), (usageCounts{prompt: 7, completion: 5, cacheRead: 300}); got != want {
 		t.Errorf("usage() = %+v, want %+v", got, want)
 	}
+}
+
+// Usage is read from the chunk's top-level usage first and from
+// choices[0].usage only when there is none, and the counts are taken (each
+// class's last value), never summed: a stream that reports usage in both
+// places, on one chunk or across chunks, is metered once.
+func TestOpenAIUsage_TopLevelAndChoiceUsageNeverDoubleCount(t *testing.T) {
+	const choiceUsage = `{"prompt_tokens":1500,"completion_tokens":40,"prompt_tokens_details":{"cached_tokens":1024}}`
+	const topUsage = `{"prompt_tokens":1500,"completion_tokens":40,"prompt_tokens_details":{"cached_tokens":1024}}`
+	want := usageCounts{prompt: 476, completion: 40, cacheRead: 1024}
+
+	t.Run("AcrossChunks", func(t *testing.T) {
+		m, lr := newLoopMetrics(t)
+		p := newSSEParser("be", "real-m", "openai", time.Now(), m, t.Context())
+		feedLines(p,
+			`data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}`,
+			`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop","usage":`+choiceUsage+`}]}`,
+			`data: {"choices":[],"usage":`+topUsage+`}`,
+			`data: [DONE]`,
+		)
+		p.recordFinal()
+		if got := p.usage(); got != want {
+			t.Errorf("usage() = %+v, want %+v", got, want)
+		}
+		if got := lr.promptTokensTotal(t); got != 1500 {
+			t.Errorf("llm_prompt_tokens_total = %d, want 1500 (counted once)", got)
+		}
+	})
+
+	t.Run("OneChunkTopLevelWins", func(t *testing.T) {
+		const other = `{"prompt_tokens":9999,"completion_tokens":9999,"prompt_tokens_details":{"cached_tokens":9000}}`
+		p := makeParser(t, "openai")
+		feedLines(p,
+			`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop","usage":`+other+`}],"usage":`+topUsage+`}`,
+			`data: [DONE]`,
+		)
+		p.recordFinal()
+		if got := p.usage(); got != want {
+			t.Errorf("usage() = %+v, want %+v (top-level usage wins)", got, want)
+		}
+		body := `{"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop","usage":` + other + `}],"usage":` + topUsage + `}`
+		if got := extractNonStreamingUsage([]byte(body), "be", "real-m", "openai", nullMetrics(t), t.Context()); got != want {
+			t.Errorf("extractNonStreamingUsage = %+v, want %+v (top-level usage wins)", got, want)
+		}
+	})
+
+	t.Run("NullTopLevelFallsBackToChoice", func(t *testing.T) {
+		p := makeParser(t, "openai")
+		feedLines(p,
+			`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop","usage":`+choiceUsage+`}],"usage":null}`,
+			`data: [DONE]`,
+		)
+		p.recordFinal()
+		if got := p.usage(); got != want {
+			t.Errorf("usage() = %+v, want %+v", got, want)
+		}
+	})
 }
