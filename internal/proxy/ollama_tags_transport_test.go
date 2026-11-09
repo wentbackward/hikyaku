@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -282,12 +284,19 @@ func TestOllamaTags_DefaultTransportIgnoresHTTPProxy(t *testing.T) {
 	}
 }
 
-// runTagsProxyChild sends /api/tags to a backend that is not on loopback (Go
-// never proxies loopback addresses), with HTTP_PROXY pointing at the parent's
-// recording proxy. The backend name does not resolve, so a direct attempt
-// fails; only a proxied one could succeed.
+// runTagsProxyChild sends /api/tags to a backend at 0.0.0.0 on a closed port,
+// with HTTP_PROXY pointing at the parent's recording proxy. Go never proxies
+// localhost or a loopback IP, but 0.0.0.0 is neither, so a client that
+// honored HTTP_PROXY would send the request to the proxy. A direct dial is
+// refused at once. No name is resolved, so no DNS query leaves the machine.
 func runTagsProxyChild(t *testing.T) {
-	s := newTagsServer(t, config.Backend{ID: "ollama", Type: "ollama", BaseURL: "http://ollama.example.invalid:11434"})
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	s := newTagsServer(t, config.Backend{ID: "ollama", Type: "ollama", BaseURL: fmt.Sprintf("http://0.0.0.0:%d", port)})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -296,10 +305,10 @@ func runTagsProxyChild(t *testing.T) {
 	s.handleOllamaTags(rec, req)
 
 	if rec.Code == http.StatusOK {
-		t.Fatalf("/api/tags reached the backend name through HTTP_PROXY: %s", rec.Body.String())
+		t.Fatalf("/api/tags was answered through HTTP_PROXY: %s", rec.Body.String())
 	}
 	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502 from the failed direct attempt", rec.Code)
+		t.Fatalf("status = %d, want 502 from the refused direct attempt", rec.Code)
 	}
 }
 
