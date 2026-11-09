@@ -38,14 +38,25 @@ Set in `config.yaml` under `server.log_level`, or via the `LOG_LEVEL` environmen
 | Level | What is logged |
 |---|---|
 | `0` | Errors only (default) |
-| `1` | One line per request — method, path, virtual model → real model, backend, upstream URL, status, duration. For an upstream error, one more line with the status, the request ID and the error body's length in bytes (`upstream error status=400 body_bytes=312`) |
-| `2` | Level 1 + incoming request headers (credential headers redacted) + transformation summary (backend, target URL, model rewrite, auth type, merged params with every string value shown as its length) |
+| `1` | One line per request — method, API path, virtual model → real model (configured routes only, see below), backend, upstream URL without its query string, status, duration. For an upstream error, one more line with the status, the request ID and the error body's length in bytes (`upstream error status=400 body_bytes=312`) |
+| `2` | Level 1 + incoming request headers (allowlisted protocol headers with their values, every other header as its length) + transformation summary (backend, target URL, model rewrite, auth type, merged params with every string value shown as its length) |
 | `3` | Level 2 + first 80 characters of the request body + the upstream error body (up to 1 KB) |
 | `4` | Level 3 + full message text content (request and response) |
 
 ### What each level may contain
 
-Levels 0, 1 and 2 never contain request or response **content**: no message text, system prompt, tool definition or tool-call argument, completion, stream chunk, upstream error text, stop sequence or other caller-supplied string value. They carry only structure and metadata: method, path, model names, backend, upstream URL, status, durations, byte lengths, numeric and boolean parameters, the message role when it is one of the standard roles (any other role is logged as `<non-standard>`), and the values of non-credential request headers at level 2. Error lines at level 0 carry the transport error (for example `connection refused` or `EOF`), never a response body.
+Levels 0, 1 and 2 never contain request or response **content** or other caller-supplied text: no message text, system prompt, tool definition or tool-call argument, completion, stream chunk, upstream error text, stop sequence, query string, custom header value or unknown model name. What they do contain is exactly:
+
+- **Ids and timing:** the interaction ID, durations, the generation number of a refused request.
+- **The request line:** the method and the API path (one of the fixed endpoint paths; the query string is never logged).
+- **Model names from config:** a model name appears only when it is a configured route or alias, together with the real model it resolves to. Any other name, and the real model a `passthrough_unrouted` request copies from it, appears as `<unknown model len=N>`.
+- **Routing from config:** backend id, backend base URL, upstream URL (scheme, host and path; no query string, fragment or user info), auth type, stream-loop route label.
+- **Status and sizes:** HTTP status, `upstream error status=N body_bytes=N`, byte counts.
+- **Parameters:** merged sampling parameters, numbers and booleans as they are, every string as `<string len=N>`.
+- **Message roles:** a standard role (`system`, `developer`, `user`, `assistant`, `tool`, `function`); any other value is `<non-standard>`.
+- **Headers (level 2):** values only for `Content-Type`, `Content-Length`, `Accept`, `Accept-Encoding`, `anthropic-version`, `anthropic-beta` and `OpenAI-Beta` (up to 128 printable ASCII characters), and the first product token of `User-Agent` (up to 32 token characters, the rest as its length). Every other header, credentials included, is `Name: <len=N>`.
+- **Caller network address:** the remote address on level-0 unknown-model lines.
+- **Errors:** transport errors (for example `connection refused` or `EOF`, with any quoted URL stripped of its query string), the embedder's admission error, the upstream response id on a stream-loop trip line, and config, file and backend errors. Never a response body.
 
 Content reaches the log only at level 3 (the request-body preview and the upstream error body, `[body]` lines) and level 4 (full message and response text). The hardened build compiles both out and clamps a requested level 3 or 4 to 2, so a hardened binary never logs content at any level. `internal/proxy/nocontent_log_*_test.go` enforce this in both builds by sending a unique marker through every lane, in requests, 2xx and error responses, streams and cut-off streams, and failing if the marker reaches the log.
 
@@ -78,10 +89,12 @@ This ties request headers, body, transformation summary, and response together f
 
 ```
 [hdr] [abc12def] POST /v1/chat/completions
-[hdr] [abc12def]   Authorization: [redacted]
+[hdr] [abc12def]   Authorization: <len=13>
 [hdr] [abc12def]   Content-Type: application/json
+[hdr] [abc12def]   User-Agent: OpenAI/Python <len=7>
+[hdr] [abc12def]   X-Title: <len=11>
 [hdr] [abc12def] → backend=local target=http://gpu-server:8000 model=my-fast→Qwen/Qwen3.5-9B auth=bearer params=map[stop:[<string len=6>] temperature:0.7]
-[req] [abc12def] POST /v1/chat/completions model=my-fast→Qwen/Qwen3.5-9B backend=local status=200 dur=1.234s stream=true
+[req] [abc12def] POST /v1/chat/completions model=my-fast→Qwen/Qwen3.5-9B backend=local url=http://gpu-server:8000/v1/chat/completions status=200 dur=1.234s stream=true
 ```
 
 ### Example log output at L4
@@ -180,7 +193,7 @@ One file per request: `{YYYYMMDDTHHMMSS.sssZ}-{request_id}.json`, mode `0600`.
 - `resolved` is the body as sent to the backend (after defaults, caller overrides, clamp, and protocol-specific translation).
 - Streaming responses are captured as raw SSE bytes under `response.sse`; non-streaming responses are captured under `response.body`.
 - Per-response capture is capped at 5 MB; over-cap bodies set `response.truncated: true`.
-- Credential headers (`Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`, `Proxy-Authorization`, `Cookie`) and `Set-Cookie` are redacted, here and in the level-2 header log.
+- Credential headers (`Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`, `Proxy-Authorization`, `Cookie`) and `Set-Cookie` are redacted. (The level-2 header log goes further and prints every header off its protocol allowlist as its length; see [What each level may contain](#what-each-level-may-contain).)
 
 ### Programmatic arming and filters (embedders)
 

@@ -158,7 +158,7 @@ The `virtual_model` name is an arbitrary string — whatever the client sends in
 | Slash namespace in the name (dropdowns) | `local/qwen-coder` |
 | Fully-qualified HF-style | `Qwen/Qwen3-Coder-30B` |
 
-If a client breaks, set `LOG_LEVEL=1` and read the `[req]` line — it shows the exact model name that arrived. Then name your virtual model to match.
+If a client breaks, read the error it gets back: an unknown model is refused with a 404 that names the model exactly as it arrived and lists the available ones. Then name your virtual model (or an alias) to match. The log does not echo unknown model names, since they are caller text; it shows `<unknown model len=N>` ([what each log level may contain](docs/logging.md#what-each-level-may-contain)).
 
 ### Routing decisions
 
@@ -270,7 +270,7 @@ Click the refresh icon on the connection. OpenWebUI calls `/v1/models` and popul
 
 LiteLLM wants a provider prefix. For custom OpenAI-compatible endpoints, prefix with `openai/` — at time of writing LiteLLM strips that prefix before calling the base URL, so a virtual model named `qwen-coder` is reached as `openai/qwen-coder` in LiteLLM config.
 
-If the version of LiteLLM you're running *doesn't* strip the prefix, you'll see `openai/qwen-coder` arrive at the proxy (check `LOG_LEVEL=1`). Either register a matching virtual model or update LiteLLM.
+If the version of LiteLLM you're running *doesn't* strip the prefix, the client gets a 404 `unknown model "openai/qwen-coder"` back from the proxy. Either register a matching virtual model or update LiteLLM.
 
 #### Ollama
 
@@ -329,7 +329,7 @@ Use `/model` inside Claude Code to pick a virtual model whose route points to yo
 - Base URL: `http://hikyaku:4000/v1`
 - API key: your `server.api_key`
 
-The client sees virtual models via `/v1/models`. If anything odd happens, `LOG_LEVEL=1` + `[req]` line will show you the model name as received — 90% of client-integration issues diagnose from that one line.
+The client sees virtual models via `/v1/models`. If anything odd happens, the proxy's 404 names the model as received, and `LOG_LEVEL=1` shows each request's route, backend, upstream URL and status — most client-integration issues diagnose from those.
 
 ## Capturing full request bodies for debugging
 

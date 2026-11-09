@@ -74,7 +74,7 @@ The request body is the one the proxy buffered and rewrote, sent with a `Content
 - **`rename`** out of or into a credential header has no effect: out of one there is nothing left to move, and into one would send a caller-controlled value as an upstream credential. The config still loads; one `[config] WARNING:` line naming each backend and route with such a rule is logged on start and on every reload.
 - **`add`** or **`rename`** into a hop-by-hop header (`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `Proxy-Connection`, `Te`, `Trailer`, `Transfer-Encoding`, `Upgrade`) has no effect: the reverse proxy acts on those after the rules run. It strips a `Proxy-Authorization` a rule would add, and a `Connection` value (for example a caller header renamed into it) would make it remove the backend key again. The config still loads, with one `[config] WARNING:` line naming each backend and route with such a rule.
 
-The level-2 header log and capture files redact every credential header and `Set-Cookie`.
+Capture files redact every credential header and `Set-Cookie`. The level-2 header log prints values only for an allowlist of protocol headers and every other header, credentials included, as its length ([what each level may contain](logging.md#what-each-level-may-contain)).
 
 **Upgrading:** backends without `api_key` no longer receive the caller's `Authorization` or API-key header. A deployment that relied on that passthrough sets the backend's `api_key`, or sends a static credential with `headers.add`.
 
