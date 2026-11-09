@@ -51,6 +51,11 @@ func (s *Server) handleOllamaEmbed(w http.ResponseWriter, r *http.Request) {
 	s.proxyRequest(w, r, proxyOpts{protocol: "ollama"})
 }
 
+// maxTagsResponseBytes caps the /api/tags model list the proxy reads into
+// memory. A list of thousands of models is a few hundred KiB; anything near
+// the cap is a misbehaving upstream.
+const maxTagsResponseBytes = 8 << 20
+
 // handleOllamaTags forwards /api/tags (model list) to the first configured
 // ollama backend. MVP: no virtual-model rewriting — clients see the backend's
 // real model names. Parallel to /v1/models, but we deliberately skip the
@@ -61,6 +66,7 @@ func (s *Server) handleOllamaEmbed(w http.ResponseWriter, r *http.Request) {
 // floor, no HTTP_PROXY). It is built fresh, so no caller header reaches the
 // backend; it carries only the backend's own credential, asks for identity
 // encoding, and a redirect is answered to the caller rather than followed.
+// The (decoded) list is capped at maxTagsResponseBytes; a larger one is a 502.
 func (s *Server) handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -111,9 +117,14 @@ func (s *Server) handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxTagsResponseBytes+1))
 	if err != nil {
 		jsonError(w, "failed to read upstream response: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	if len(data) > maxTagsResponseBytes {
+		log.Printf("[proxy] /api/tags upstream response over %d bytes backend=%s", maxTagsResponseBytes, backend.ID)
+		jsonError(w, "upstream model list too large", http.StatusBadGateway)
 		return
 	}
 	if ct := resp.Header.Get("Content-Type"); ct != "" {

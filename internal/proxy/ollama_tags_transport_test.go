@@ -337,3 +337,31 @@ func TestServer_OutboundTransport_DefaultHasNoProxyAndTLSFloor(t *testing.T) {
 		t.Errorf("default outbound transport must carry the build's TLS floor %#x", want.MinVersion)
 	}
 }
+
+// The model list is read into memory, so it is capped: a list at the cap is
+// passed on, one byte more is a 502.
+func TestOllamaTags_ResponseSizeIsCapped(t *testing.T) {
+	cases := []struct {
+		name string
+		size int
+		want int
+	}{
+		{"at the cap", maxTagsResponseBytes, http.StatusOK},
+		{"one byte over", maxTagsResponseBytes + 1, http.StatusBadGateway},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := &tagsRT{body: bytes.Repeat([]byte("a"), tc.size)}
+			s := newTagsServer(t, config.Backend{ID: "ollama", Type: "ollama", BaseURL: "http://ollama.example.invalid"},
+				WithTransportFactory(staticFactory{rt: rt}))
+			rec := httptest.NewRecorder()
+			s.handleOllamaTags(rec, callerTagsRequest())
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.want)
+			}
+			if tc.want == http.StatusOK && rec.Body.Len() != tc.size {
+				t.Errorf("body length = %d, want %d", rec.Body.Len(), tc.size)
+			}
+		})
+	}
+}
