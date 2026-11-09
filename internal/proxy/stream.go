@@ -62,16 +62,21 @@ type sseParser struct {
 	t0FirstTok time.Time // when first content token arrived (for gen speed)
 	lineBuf    []byte    // holds a partial line between Read calls
 
-	// Token accumulation
+	// Token accumulation. promptToks is the provider's own prompt count:
+	// uncached on Anthropic (input_tokens), including both cache classes on
+	// OpenAI (prompt_tokens).
 	promptToks     int64
 	completionToks int64
-	// promptToks is the provider's own prompt count: uncached on Anthropic
-	// (input_tokens), including both cache classes on OpenAI (prompt_tokens).
 	cacheReadToks  int64 // Anthropic cache_read_input_tokens; OpenAI cached_tokens
 	cacheWriteToks int64 // Anthropic cache_creation_input_tokens; OpenAI cache_write_tokens
 	reasoningToks  int64 // OpenAI completion_tokens_details.reasoning_tokens (inside completionToks)
 	thinkChars     int64 // length of thinking/reasoning content seen
 	contentChars   int64 // length of regular text content seen
+
+	// promptIncludesCache is set by the lane handler whose provider counts
+	// the cache classes inside its prompt figure (the OpenAI lane), so
+	// usage() reports the prompt net of them. Anthropic never sets it.
+	promptIncludesCache bool
 
 	// Anthropic accumulates token counts across events (message_start carries
 	// the input classes, message_delta the output count) until the flush on
@@ -307,25 +312,19 @@ func (p *sseParser) handleOpenAIEvent(evt map[string]interface{}) {
 	// Usage arrives in the final chunk when stream_options.include_usage=true
 	// (OpenAI and Moonshot send it on a chunk with "choices": []; older
 	// Moonshot streams inside choices[0] of the finish_reason chunk, see
-	// openAIUsageObject). Each class keeps its last positive value, so usage
-	// reported more than once is never summed; promptToks stays the
-	// provider's prompt_tokens, which includes the cache classes, and usage()
-	// nets them out.
-	if usage := openAIUsageObject(evt); usage != nil {
-		u := openAIUsage(usage)
-		keepPositive(&p.promptToks, u.prompt)
-		keepPositive(&p.completionToks, u.completion)
-		keepPositive(&p.cacheReadToks, u.cacheRead)
-		keepPositive(&p.cacheWriteToks, u.cacheWrite)
-		keepPositive(&p.reasoningToks, u.reasoning)
-	}
-}
-
-// keepPositive stores v in *dst when v is positive, so a later usage object
-// that omits a class does not erase the count an earlier one reported.
-func keepPositive(dst *int64, v int64) {
-	if v > 0 {
-		*dst = v
+	// openAIUsageObject). The last usage object with any positive count is
+	// taken whole, never mixed class by class with an earlier one and never
+	// summed, so usage reported more than once is metered once and an empty
+	// trailing object does not erase it. promptToks holds the provider's
+	// prompt_tokens, which includes the cache classes; promptIncludesCache
+	// tells usage() to net them out.
+	if u := openAIUsage(openAIUsageObject(evt)); u.hasCounts() {
+		p.promptToks = u.prompt
+		p.completionToks = u.completion
+		p.cacheReadToks = u.cacheRead
+		p.cacheWriteToks = u.cacheWrite
+		p.reasoningToks = u.reasoning
+		p.promptIncludesCache = true
 	}
 }
 
@@ -382,8 +381,8 @@ func (p *sseParser) handleAnthropicEvent(evt map[string]interface{}) {
 	case "message_delta":
 		// output_tokens arrive here
 		if usage, ok := evt["usage"].(map[string]interface{}); ok {
-			if v, _ := usage["output_tokens"].(float64); v > 0 {
-				p.anthropicOutputTokens = int64(v)
+			if v := jsonCount(usage, "output_tokens"); v > 0 {
+				p.anthropicOutputTokens = v
 			}
 		}
 
@@ -427,10 +426,10 @@ func (p *sseParser) usage() usageCounts {
 		cacheRead: p.cacheReadToks, cacheWrite: p.cacheWriteToks,
 		reasoning: p.reasoningToks,
 	}
-	if p.backendType == "anthropic" {
-		return c
+	if p.promptIncludesCache {
+		return c.netOfCache()
 	}
-	return c.netOfCache()
+	return c
 }
 
 // recordFinal records per-request summary metrics once the stream is complete.

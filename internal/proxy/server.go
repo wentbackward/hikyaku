@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -1813,20 +1814,32 @@ func openAIUsageObject(obj map[string]interface{}) map[string]interface{} {
 // netOfCache returns c with the cache classes taken out of prompt, for a lane
 // whose prompt count includes them (OpenAI). The cache classes are kept as
 // reported; a prompt smaller than their sum (an inconsistent upstream) is
-// clamped at zero rather than going negative.
+// clamped at zero rather than going negative. Each class is subtracted and
+// clamped in turn: every operand is in [0, 2^63) (jsonCount), so no step can
+// overflow, where subtracting both at once could.
 func (c usageCounts) netOfCache() usageCounts {
-	c.prompt = max(c.prompt-c.cacheRead-c.cacheWrite, 0)
+	p := max(c.prompt-c.cacheRead, 0)
+	c.prompt = max(p-c.cacheWrite, 0)
 	return c
 }
 
+// hasCounts reports whether c carries any positive class.
+func (c usageCounts) hasCounts() bool {
+	return c.prompt > 0 || c.completion > 0 || c.cacheRead > 0 || c.cacheWrite > 0 || c.reasoning > 0
+}
+
 // jsonCount reads a non-negative integer token count from a decoded JSON
-// object; a missing, non-numeric or negative value counts as zero. Reading
-// from a nil map is safe, so callers can pass a missing sub-object through.
+// object; a missing, non-numeric, negative, non-finite or out-of-range
+// value counts as zero. Values at or above 2^63 are rejected because their
+// conversion to int64 is implementation-defined in Go (MinInt64 on amd64).
+// Reading from a nil map is safe, so callers can pass a missing sub-object
+// through.
 func jsonCount(obj map[string]interface{}, key string) int64 {
-	if v, _ := obj[key].(float64); v > 0 {
-		return int64(v)
+	v, _ := obj[key].(float64)
+	if math.IsNaN(v) || v <= 0 || v >= 0x1p63 {
+		return 0
 	}
-	return 0
+	return int64(v)
 }
 
 // logNonStreamingResponse extracts and logs the assistant's text content from a non-streaming response.
