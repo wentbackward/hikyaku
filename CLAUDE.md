@@ -39,7 +39,9 @@ Two build variants gated by the `hardened` Go build tag:
 - **Default (`make build`)**: all features, including SIGUSR1 message capture, log levels 3-4, and the prompt text fields in journal entries.
 - **Hardened (`make build-hardened`, `go build -tags hardened`)**: above three features are compiled out — not runtime-disabled, removed from the binary. Structural telemetry stays.
 
-When adding new code that touches any of those three feature areas, split across build-tag files using the existing pattern (see `internal/capture/new_debug.go` + `new_hardened.go`, `internal/logger/level_*.go`, `internal/journal/text_*.go`, `cmd/hikyaku/buildmode_*.go`). The `hardened` file always has the stripped/no-op implementation. Run `make check-hardened` to verify the hardened variant still builds and lints cleanly.
+When adding new code that touches any of those three feature areas, split across build-tag files using the existing pattern (see `internal/capture/new_debug.go` + `new_hardened.go`, `internal/logger/level_*.go`, `internal/journal/text_*.go`, `cmd/hikyaku/buildmode_*.go`). The `hardened` file always has the stripped/no-op implementation. Run `make check-hardened` to verify the hardened variant: it lints, runs the whole test suite (`go test -tags hardened -race ./...`, also run by CI) and builds.
+
+Tests of inspect-only features are split the same way: the default-build assertions go in a `*_debug_test.go` file (`//go:build !hardened`) and a `*_hardened_test.go` counterpart asserts the feature is absent (see `internal/logger/logger_*_test.go`, `internal/journal/analyze_*_test.go`). Never leave a test that fails under `-tags hardened`, and never drop a package from the hardened suite.
 
 ## Protocol rule
 
