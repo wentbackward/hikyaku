@@ -620,27 +620,25 @@ func TestSemaphore_LimitsConcurrency(t *testing.T) {
 }
 
 func TestSemaphore_ContextCancellation(t *testing.T) {
-	s := &Server{}
-	s.semaphores = map[string]chan struct{}{
+	st := &runtimeState{sems: map[string]chan struct{}{
 		"full": make(chan struct{}, 1),
-	}
+	}}
 	// Fill the semaphore
-	s.semaphores["full"] <- struct{}{}
+	st.sems["full"] <- struct{}{}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already canceled
 
-	_, ok := s.acquireSemaphore(ctx, "full")
+	_, ok := acquireSemaphore(ctx, st, "full")
 	if ok {
 		t.Error("acquireSemaphore should fail when context is canceled")
 	}
 }
 
 func TestSemaphore_UnlimitedBackend(t *testing.T) {
-	s := &Server{}
-	s.semaphores = map[string]chan struct{}{}
+	st := &runtimeState{sems: map[string]chan struct{}{}}
 
-	release, ok := s.acquireSemaphore(context.Background(), "no-limit")
+	release, ok := acquireSemaphore(context.Background(), st, "no-limit")
 	if !ok {
 		t.Error("acquireSemaphore should succeed for backends without max_concurrency")
 	}
@@ -656,9 +654,7 @@ func TestSemaphore_ReloadUpdatesSemaphores(t *testing.T) {
 	metrics, _, _ := telemetry.Init()
 	s := New("test", "inspect", cfg1, metrics, nil)
 
-	s.mu.RLock()
-	sem := s.semaphores["b1"]
-	s.mu.RUnlock()
+	sem := s.state.Load().sems["b1"]
 	if cap(sem) != 5 {
 		t.Errorf("initial semaphore cap: got %d, want 5", cap(sem))
 	}
@@ -670,9 +666,7 @@ func TestSemaphore_ReloadUpdatesSemaphores(t *testing.T) {
 	}
 	s.Reload(cfg2)
 
-	s.mu.RLock()
-	sem = s.semaphores["b1"]
-	s.mu.RUnlock()
+	sem = s.state.Load().sems["b1"]
 	if cap(sem) != 10 {
 		t.Errorf("reloaded semaphore cap: got %d, want 10", cap(sem))
 	}
@@ -1191,7 +1185,7 @@ func TestCheckEmptyMessages_Disabled(t *testing.T) {
 			map[string]interface{}{"role": "assistant", "content": nil},
 		},
 	}
-	err := checkEmptyMessages(cfg, nil, nil, "test", body)
+	err := checkEmptyMessages(cfg, nil, nil, body)
 	if err != nil {
 		t.Fatalf("disabled: expected no error, got: %v", err)
 	}
@@ -1207,7 +1201,7 @@ func TestCheckEmptyMessages_RefusesNil(t *testing.T) {
 			map[string]interface{}{"role": "user", "content": "follow up"},
 		},
 	}
-	err := checkEmptyMessages(cfg, nil, nil, "test", body)
+	err := checkEmptyMessages(cfg, nil, nil, body)
 	if !errors.Is(err, ErrEmptyContent) {
 		t.Fatalf("expected ErrEmptyContent, got: %v", err)
 	}
@@ -1223,7 +1217,7 @@ func TestCheckEmptyMessages_RefusesEmptyString(t *testing.T) {
 			map[string]interface{}{"role": "user", "content": "again"},
 		},
 	}
-	err := checkEmptyMessages(cfg, nil, nil, "test", body)
+	err := checkEmptyMessages(cfg, nil, nil, body)
 	if !errors.Is(err, ErrEmptyContent) {
 		t.Fatalf("expected ErrEmptyContent, got: %v", err)
 	}
@@ -1239,7 +1233,7 @@ func TestCheckEmptyMessages_AllowsClean(t *testing.T) {
 			map[string]interface{}{"role": "user", "content": "follow up"},
 		},
 	}
-	err := checkEmptyMessages(cfg, nil, nil, "test", body)
+	err := checkEmptyMessages(cfg, nil, nil, body)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}

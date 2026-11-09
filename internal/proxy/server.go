@@ -48,15 +48,17 @@ type Server struct {
 	state     atomic.Pointer[runtimeState] // one generation of the reloadable state, published as a whole
 	metrics   *telemetry.Metrics
 	journal   *journal.Journal // nil if journal disabled
+	// startup is the config passed to New. Its startup-only fields
+	// (config.NonReloadableFields) are what the process runs for its whole
+	// life, so every later config is checked against it.
+	startup *config.Config
 
-	transport     http.RoundTripper        // shared outbound transport (default *http.Transport; override via WithTransportFactory)
-	usageObserver UsageObserver            // nil unless set via WithUsageObserver (pro accounting seam)
-	admission     GenerationAdmission      // nil unless set via WithGenerationAdmission (pro attestation seam)
-	captureGate   captureGate              // server-level capture filter (WithCaptureFilter); fieldless in hardened builds
-	mu            sync.RWMutex             // guards semaphores
-	reloadMu      sync.Mutex               // serializes Reload / ApplyConfig (balancer swap)
-	semaphores    map[string]chan struct{} // per-backend concurrency limiter (nil entry = unlimited)
-	bufferedBytes atomic.Int64             // bytes currently held in proxy buffers
+	transport     http.RoundTripper   // shared outbound transport (default *http.Transport; override via WithTransportFactory)
+	usageObserver UsageObserver       // nil unless set via WithUsageObserver (pro accounting seam)
+	admission     GenerationAdmission // nil unless set via WithGenerationAdmission (pro attestation seam)
+	captureGate   captureGate         // server-level capture filter (WithCaptureFilter); fieldless in hardened builds
+	reloadMu      sync.Mutex          // serializes Reload / ApplyConfig (balancer swap)
+	bufferedBytes atomic.Int64        // bytes currently held in proxy buffers
 }
 
 // runtimeState is one immutable generation of the reloadable state: the
@@ -65,14 +67,49 @@ type Server struct {
 // loads it once, after reading its body, passes it to the admission hook and
 // uses that generation throughout, so it never pairs one config with another
 // config's router, balancer (a group or backend id the other side does not
-// know), capture window or sample writer.
+// know), concurrency limits, log level, capture window or sample writer.
 type runtimeState struct {
 	id          uint64 // 1 for the config passed to New, +1 per applied config
 	cfg         *config.Config
 	rtr         *router.Router
-	bal         *balancer.Balancer // nil iff cfg has no groups
-	capture     *capture.Capture   // nil = capture disabled (always nil in hardened)
-	loopSampler *loopSampler       // nil = no stream-loop samples (always nil in hardened)
+	bal         *balancer.Balancer       // nil iff cfg has no groups
+	sems        map[string]chan struct{} // per-backend max_concurrency limiter (no entry = unlimited)
+	log         reqLog                   // this generation's log-level cap for its requests
+	capture     *capture.Capture         // nil = capture disabled (always nil in hardened)
+	loopSampler *loopSampler             // nil = no stream-loop samples (always nil in hardened)
+}
+
+// reqLog logs for one request at most at its generation's configured level
+// (server.log_level, LOG_LEVEL override, build cap: logger.Level) and never
+// above the process-wide level (logger.Get, which ApplyLogLevel sets): a
+// request admitted on a generation configured for level 0 never logs
+// headers, even if a later apply raised the process level.
+type reqLog struct{ max int }
+
+func (l reqLog) level() int { return min(logger.Get(), l.max) }
+
+func (l reqLog) Request(format string, args ...interface{}) {
+	if l.level() >= logger.LevelRequest {
+		logger.Request(format, args...)
+	}
+}
+
+func (l reqLog) Headers(format string, args ...interface{}) {
+	if l.level() >= logger.LevelHeaders {
+		logger.Headers(format, args...)
+	}
+}
+
+func (l reqLog) Body(format string, args ...interface{}) {
+	if l.level() >= logger.LevelBody {
+		logger.Body(format, args...) // a no-op in hardened builds
+	}
+}
+
+func (l reqLog) Content(format string, args ...interface{}) {
+	if l.level() >= logger.LevelContent {
+		logger.Content(format, args...) // a no-op in hardened builds
+	}
 }
 
 // generation is the embedder's view of st.
@@ -104,17 +141,20 @@ func (g Generation) Config() *config.Config { return g.cfg }
 // Core calls it exactly once for every request that reaches routing: after
 // the request body has been read and the generation the request will route
 // with has been selected, and before anything contacts an upstream (no
-// balancer selection, journal export, capture or backend connection has
-// happened yet). The request is then served by exactly gen — core never
+// request logging, balancer selection, journal export, capture or backend
+// connection has happened yet). The request is then served by exactly gen — core never
 // re-loads the live state for it, even if a reload lands meanwhile. ctx is
 // the inbound request context, so a hook can compare gen with what the
 // embedder recorded for the connection (the config digest its attested
 // certificate binds, say). A non-nil error ends the request with no upstream
 // contact: 503, or the status of an AdmissionError in the chain; the error
-// text is logged, never sent to the client. Requests that end before routing
-// (bad method, unreadable or invalid body) and endpoints that contact no
-// upstream (/health, /v1/models) do not call it. It runs on the request path
-// and must not block for long.
+// text is logged, never sent to the client. /v1/models, answered from the
+// config's routes, is admitted the same way. Requests that end before routing
+// (bad method, unreadable or invalid body) and /health do not call it. A
+// request's log lines are capped at gen's configured level as well as the
+// process-wide one (the lower wins), so a generation configured for level 0
+// never logs request headers or bodies. It runs on the request path and must
+// not block for long.
 type GenerationAdmission func(ctx context.Context, gen Generation) error
 
 // WithGenerationAdmission installs the admission hook. nil admits every
@@ -164,6 +204,12 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request, rid string, st *r
 // requests. The default build supplies a standard *http.Transport; the pro
 // layer injects its own (RA-TLS attested transport, mTLS, cert pinning, …) via
 // WithTransportFactory. This is the primary extension seam for pro.
+//
+// NewTransport is called once, in New, with generation 1's config; core never
+// passes it a later config. Any field the factory reads is therefore
+// startup-only in effect (ApplyConfig does not refuse a change to it, since
+// core cannot know which fields a factory reads), unless the embedder
+// reconfigures the transport it returned in place on each apply.
 type TransportFactory interface {
 	NewTransport(cfg *config.Config) http.RoundTripper
 }
@@ -338,8 +384,8 @@ func New(version, buildMode string, cfg *config.Config, metrics *telemetry.Metri
 			TLSClientConfig:     sectls.ClientConfig(cfg.MinTLS()),
 		},
 	}
+	s.startup = cfg
 	s.state.Store(newGeneration(cfg, 1))
-	s.buildSemaphores(cfg)
 	logConfigNotices(cfg)
 	// Apply options before anything that depends on them: the balancer's probes
 	// go through the outbound transport an option may replace. cfg is already
@@ -371,6 +417,8 @@ func newGeneration(cfg *config.Config, id uint64) *runtimeState {
 		id:          id,
 		cfg:         cfg,
 		rtr:         router.New(cfg),
+		sems:        newSemaphores(cfg),
+		log:         reqLog{max: logger.Level(cfg.Server.LogLevel)},
 		capture:     newCapture(cfg),
 		loopSampler: newConfiguredLoopSampler(cfg),
 	}
@@ -453,30 +501,37 @@ func (s *Server) Balancer() *balancer.Balancer {
 //   - cfg is nil;
 //   - cfg changes a field the server reads only at startup (listen address,
 //     TLS files and floor, outbound pool, metrics listener, journal — see
-//     config.NonReloadableFields): a *config.NonReloadableError listing them,
-//     since applying the rest would leave the process running a config other
-//     than cfg;
+//     config.NonReloadableFields) relative to the config passed to New: a
+//     *config.NonReloadableError listing them, since applying the rest would
+//     leave the process running a config other than cfg. Every generation
+//     agrees with New's config on these fields, so the live config compares
+//     the same way (config.NonReloadableChanges(s.Config(), cfg));
 //   - cfg fails the listen policy with the embedder's options (an embedder
 //     serving a runtime certificate passes config.WithExternalGatewayTLS, as
 //     it does at startup).
 //
 // A refused cfg changes nothing: the live generation (config, router,
-// balancer, capture, semaphores) stays exactly as it was. Otherwise cfg is
+// balancer, semaphores, capture) stays exactly as it was. Otherwise cfg is
 // published as the next generation with one atomic swap; requests already
 // routed finish on theirs. cfg must come from config.Load or config.Parse,
-// which validate its structure; the log level is the caller's to apply
-// afterwards (logger.Apply), as on SIGHUP. Concurrent calls, and calls
+// which validate its structure; the process log level is the caller's to
+// apply afterwards (logger.Apply), as on SIGHUP. Concurrent calls, and calls
 // concurrent with Reload, are serialized: the checks and the swap run under
 // one lock, so two ApplyConfig calls can never interleave between their
 // verdicts and their swaps.
+//
+// A TransportFactory is called once, in New, with generation 1's config;
+// core never hands it a later one. Any field the factory reads is therefore
+// startup-only in effect unless the embedder reconfigures its transport in
+// place on each apply.
 func (s *Server) ApplyConfig(cfg *config.Config, opts ...config.ListenPolicyOption) error {
 	if cfg == nil {
 		return errors.New("apply config: nil config")
 	}
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
-	if fields := config.NonReloadableChanges(s.state.Load().cfg, cfg); len(fields) > 0 {
-		return &config.NonReloadableError{Fields: fields}
+	if err := s.checkStartupFields(cfg); err != nil {
+		return err
 	}
 	if err := cfg.ValidateListenPolicy(opts...); err != nil {
 		return err
@@ -485,16 +540,30 @@ func (s *Server) ApplyConfig(cfg *config.Config, opts ...config.ListenPolicyOpti
 	return nil
 }
 
-// Reload publishes cfg as the next generation without ApplyConfig's checks:
-// no listen policy, and changes to startup-only fields are silently not
-// applied. In-flight requests continue with their generation. Reloads are
-// serialized with ApplyConfig.
+// checkStartupFields refuses cfg when it changes a startup-only field of the
+// config passed to New.
+func (s *Server) checkStartupFields(cfg *config.Config) error {
+	if fields := config.NonReloadableChanges(s.startup, cfg); len(fields) > 0 {
+		return &config.NonReloadableError{Fields: fields}
+	}
+	return nil
+}
+
+// Reload publishes cfg as the next generation without the listen-policy
+// check (it has no way to receive the embedder's options). A cfg that changes
+// a startup-only field is refused like ApplyConfig refuses it: logged, and
+// the live generation kept. In-flight requests continue with their
+// generation. Reloads are serialized with ApplyConfig.
 //
-// Deprecated: use ApplyConfig, which refuses a config the server cannot run
-// as a whole instead of applying part of it.
+// Deprecated: use ApplyConfig, which also enforces the listen policy and
+// returns the refusal.
 func (s *Server) Reload(cfg *config.Config) {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
+	if err := s.checkStartupFields(cfg); err != nil {
+		log.Printf("[reload] config rejected: %v (keeping old config)", err)
+		return
+	}
 	s.reload(cfg)
 }
 
@@ -510,7 +579,6 @@ func (s *Server) reload(cfg *config.Config) {
 	if len(cfg.Groups) > 0 {
 		next.bal = s.newBalancer(cfg)
 	}
-	s.buildSemaphores(cfg)
 	if old := s.state.Swap(next); old.bal != nil {
 		old.bal.Stop()
 	}
@@ -544,9 +612,10 @@ func (s *Server) reload(cfg *config.Config) {
 	}
 }
 
-// buildSemaphores creates a fresh semaphore map from the config.
-// Backends without max_concurrency get no entry (unlimited).
-func (s *Server) buildSemaphores(cfg *config.Config) {
+// newSemaphores builds the per-backend concurrency limiters for cfg.
+// Backends without max_concurrency get no entry (unlimited). Each generation
+// has its own: a request holds a slot of the generation it was admitted on.
+func newSemaphores(cfg *config.Config) map[string]chan struct{} {
 	sems := make(map[string]chan struct{}, len(cfg.Backends))
 	for i := range cfg.Backends {
 		b := &cfg.Backends[i]
@@ -554,19 +623,14 @@ func (s *Server) buildSemaphores(cfg *config.Config) {
 			sems[b.ID] = make(chan struct{}, b.MaxConcurrency)
 		}
 	}
-	s.mu.Lock()
-	s.semaphores = sems
-	s.mu.Unlock()
+	return sems
 }
 
-// acquireSemaphore blocks until a slot is available for the given backend,
-// or the request context is canceled. Returns a release function and true,
-// or nil and false if the context was canceled while waiting.
-func (s *Server) acquireSemaphore(ctx context.Context, backendID string) (release func(), ok bool) {
-	s.mu.RLock()
-	sem := s.semaphores[backendID]
-	s.mu.RUnlock()
-
+// acquireSemaphore blocks until one of st's slots for the given backend is
+// free, or the request context is canceled. Returns a release function and
+// true, or nil and false if the context was canceled while waiting.
+func acquireSemaphore(ctx context.Context, st *runtimeState, backendID string) (release func(), ok bool) {
+	sem := st.sems[backendID]
 	if sem == nil {
 		return func() {}, true
 	}
@@ -644,7 +708,13 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := s.state.Load().cfg
+	// The route list is this generation's: admitted like a proxied request,
+	// so a client bound to one config never sees another config's routes.
+	st := s.state.Load()
+	if !s.admit(w, r, requestID(), st) {
+		return
+	}
+	cfg := st.cfg
 
 	type modelEntry struct {
 		ID      string `json:"id"`
@@ -707,7 +777,11 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 
 	// ── Read & parse body ──────────────────────────────────────────────────
 	// Cap request body size to avoid OOM on a malicious/misbehaving client.
-	if maxMB := s.state.Load().cfg.Server.MaxRequestBodyMB; maxMB > 0 {
+	// The cap is an input limit read from the live config before the body
+	// arrives (the request's generation is chosen after it); read once, so
+	// the 413 names the limit actually applied.
+	maxMB := s.state.Load().cfg.Server.MaxRequestBodyMB
+	if maxMB > 0 {
 		r.Body = http.MaxBytesReader(w, r.Body, int64(maxMB)*1024*1024)
 	}
 	rawBody, err := io.ReadAll(r.Body)
@@ -715,7 +789,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			jsonError(w, fmt.Sprintf("request body exceeds max_request_body_mb limit (%d MB)", s.state.Load().cfg.Server.MaxRequestBodyMB), http.StatusRequestEntityTooLarge)
+			jsonError(w, fmt.Sprintf("request body exceeds max_request_body_mb limit (%d MB)", maxMB), http.StatusRequestEntityTooLarge)
 			return
 		}
 		jsonError(w, "failed to read request body", http.StatusBadRequest)
@@ -728,9 +802,21 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 		return
 	}
 
+	// One generation for the whole request (admission, logging, route …
+	// Select … CompleteAndDecr, semaphores, capture, samples), loaded once
+	// here — after the body has been read — and never again. The admission
+	// hook sees exactly this generation before anything below can contact an
+	// upstream.
+	st := s.state.Load()
+	if !s.admit(w, r, rid, st) {
+		return
+	}
+	cfg, rtr, bal := st.cfg, st.rtr, st.bal
+	rlog := st.log
+
 	// ── L2: log incoming headers, L3: log body preview ────────────────────
-	logger.Headers("[%s] %s %s", rid, r.Method, r.URL.Path)
-	if logger.Get() >= logger.LevelHeaders {
+	rlog.Headers("[%s] %s %s", rid, r.Method, r.URL.Path)
+	if rlog.level() >= logger.LevelHeaders {
 		logged := safeHeaders(r.Header)
 		names := make([]string, 0, len(logged))
 		for k := range logged {
@@ -738,14 +824,14 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 		}
 		sort.Strings(names)
 		for _, k := range names {
-			logger.Headers("[%s]   %s: %s", rid, k, logged[k])
+			rlog.Headers("[%s]   %s: %s", rid, k, logged[k])
 		}
 	}
 	preview := rawBody
 	if len(preview) > 80 {
 		preview = preview[:80]
 	}
-	logger.Body("[%s] %s %s body: %s", rid, r.Method, r.URL.Path, string(preview))
+	rlog.Body("[%s] %s %s body: %s", rid, r.Method, r.URL.Path, string(preview))
 
 	// ── Detect protocol ────────────────────────────────────────────────────
 	protocol := opts.protocol
@@ -764,16 +850,6 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	var lbGroup, lbAffKey string // affinity group/key for pin invalidation on failure
 	var realModel string
 	var loopRoute *streamLoopRoute // stream loop detection for this request; nil when not streaming
-
-	// One generation for the whole request (admission, route … Select …
-	// CompleteAndDecr, capture, samples), loaded once here — after the body
-	// has been read — and never again. The admission hook sees exactly this
-	// generation before anything below can contact an upstream.
-	st := s.state.Load()
-	if !s.admit(w, r, rid, st) {
-		return
-	}
-	cfg, rtr, bal := st.cfg, st.rtr, st.bal
 
 	// Ollama nests sampling params under body["options"]. Flatten them into
 	// body's top level so the router's param merge sees caller-supplied values;
@@ -902,8 +978,9 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	if res != nil {
 		route = res.Route
 	}
-	dropErr := checkEmptyMessages(cfg, route, backend, rid, body)
+	dropErr := checkEmptyMessages(cfg, route, backend, body)
 	if dropErr != nil {
+		rlog.Request("[%s] refusing: %v", rid, dropErr)
 		jsonError(w, "empty messages are blocked by your administrator", http.StatusBadRequest)
 		return
 	}
@@ -921,15 +998,15 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 		}
 	}
 	if res != nil && len(res.Params) > 0 {
-		logger.Headers("[%s] → backend=%s target=%s model=%s→%s auth=%s params=%v",
+		rlog.Headers("[%s] → backend=%s target=%s model=%s→%s auth=%s params=%v",
 			rid, backend.ID, backend.BaseURL, modelName, realModel, authType, res.Params)
 	} else {
-		logger.Headers("[%s] → backend=%s target=%s model=%s→%s auth=%s",
+		rlog.Headers("[%s] → backend=%s target=%s model=%s→%s auth=%s",
 			rid, backend.ID, backend.BaseURL, modelName, realModel, authType)
 	}
 
 	// ── L4: log full message content ───────────────────────────────────────
-	if logger.Get() >= logger.LevelContent {
+	if rlog.level() >= logger.LevelContent {
 		logMessageContent(rid, body)
 	}
 
@@ -1036,7 +1113,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	capCtx := s.startCapture(st.capture, r, rid, t0, modelName, realModel, backend.ID, protocol, isStreaming, rawBody, newBody)
 
 	// ── Per-backend concurrency guard ─────────────────────────────────────
-	release, ok := s.acquireSemaphore(r.Context(), backendID)
+	release, ok := acquireSemaphore(r.Context(), st, backendID)
 	if !ok {
 		s.metrics.ActiveRequests.Add(metricsCtx, -1, telemetry.BackendAttrs(backendID, realModel))
 		capCtx.finishError(t0, "backend concurrency limit reached")
@@ -1072,7 +1149,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 			// r.URL has been rewritten by the director to the final upstream
 			// scheme/host/path, so r.URL.String() is the actual outbound URL.
 			upstreamURL := r.URL.String()
-			logger.Request("[%s] %s %s model=%s backend=%s url=%s status=502 dur=%.3fs ERROR: %v",
+			rlog.Request("[%s] %s %s model=%s backend=%s url=%s status=502 dur=%.3fs ERROR: %v",
 				rid, r.Method, r.URL.Path, modelName, backendID, upstreamURL, elapsed, err)
 			log.Printf("[proxy] upstream error backend=%s: %v", backendID, err)
 			capCtx.finishError(t0, "upstream error: "+err.Error())
@@ -1512,6 +1589,7 @@ func logMessageContent(rid string, body map[string]interface{}) {
 // upstream response with telemetry.
 func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, backendType string, timeoutSec int, streaming bool, t0 time.Time, metricsCtx, reqCtx context.Context, capCtx *captureCtx, lbGroup, lbAffKey string, st *runtimeState, bytesHeld int64, loopRoute *streamLoopRoute) func(*http.Response) error {
 	bal := st.bal // the request's generation: the balancer it was counted in on
+	rlog := st.log
 	return func(resp *http.Response) error {
 		statusStr := fmt.Sprintf("%d", resp.StatusCode)
 
@@ -1545,7 +1623,7 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 				parser = op
 			} else {
 				ssep = newSSEParser(backendID, realModel, backendType, t0, s.metrics, metricsCtx)
-				if logger.Get() >= logger.LevelContent {
+				if rlog.level() >= logger.LevelContent {
 					ssep.captureContent = true
 				}
 				ssep.loop = guard
@@ -1618,10 +1696,10 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 							}
 						}
 					}
-					logger.Request("[%s] POST %s model=%s→%s backend=%s url=%s status=%s dur=%.3fs stream=true",
+					rlog.Request("[%s] POST %s model=%s→%s backend=%s url=%s status=%s dur=%.3fs stream=true",
 						rid, path, virtualModel, realModel, backendID, upstreamURL(resp), statusStr, elapsed)
 					if ssep != nil && ssep.captureContent {
-						logger.Content("[resp %s] | %s", rid, ssep.ResponseText())
+						rlog.Content("[resp %s] | %s", rid, ssep.ResponseText())
 					}
 					if capCtx != nil {
 						capCtx.finishSuccess(t0, capture.ResponseSnapshot{
@@ -1662,12 +1740,12 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 					}
 				}
 			}
-			logger.Request("[%s] POST %s model=%s→%s backend=%s url=%s status=%s dur=%.3fs",
+			rlog.Request("[%s] POST %s model=%s→%s backend=%s url=%s status=%s dur=%.3fs",
 				rid, path, virtualModel, realModel, backendID, upstreamURL(resp), statusStr, elapsed)
 
 			// Log upstream error body at level >= 1
-			if resp.StatusCode != http.StatusOK && logger.Get() >= logger.LevelRequest {
-				logger.Request("[%s] upstream error body: %s", rid, string(data)[:min(len(data), 1024)])
+			if resp.StatusCode != http.StatusOK && rlog.level() >= logger.LevelRequest {
+				rlog.Request("[%s] upstream error body: %s", rid, string(data)[:min(len(data), 1024)])
 			}
 
 			var counts usageCounts
@@ -1685,7 +1763,7 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 			})
 
 			// L4: log non-streaming response content
-			if logger.Get() >= logger.LevelContent {
+			if rlog.level() >= logger.LevelContent {
 				logNonStreamingResponse(rid, data, backendType)
 			}
 
@@ -1880,8 +1958,9 @@ var ErrEmptyContent = errors.New("empty messages are blocked by your administrat
 
 // checkEmptyMessages scans the messages array for any message with nil or
 // empty content. If found, returns ErrEmptyContent so the caller can refuse
-// with HTTP 400. Does not mutate the request.
-func checkEmptyMessages(cfg *config.Config, route *config.Route, backend *config.Backend, rid string, body map[string]interface{}) error {
+// with HTTP 400, wrapped with the offending message's index and role for the
+// caller's log. Does not mutate the request.
+func checkEmptyMessages(cfg *config.Config, route *config.Route, backend *config.Backend, body map[string]interface{}) error {
 	if !cfg.ShouldDropEmptyContent(route, backend) {
 		return nil
 	}
@@ -1897,8 +1976,7 @@ func checkEmptyMessages(cfg *config.Config, route *config.Route, backend *config
 			continue
 		}
 		if isEmptyContent(m["content"]) {
-			logger.Request("[%s] refusing: message[%d] (role=%s) has empty content", rid, i, m["role"])
-			return ErrEmptyContent
+			return fmt.Errorf("%w: message[%d] (role=%v) has empty content", ErrEmptyContent, i, m["role"])
 		}
 	}
 	return nil

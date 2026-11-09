@@ -58,7 +58,9 @@ func NonReloadableFields() []string {
 // effective value differs between live and next, in NonReloadableFields
 // order; nil when next changes none of them. Values are compared after
 // defaults, so spelling out a default is not a change. Both configs must come
-// from Load or Parse.
+// from Load or Parse. The proxy compares against the config it was started
+// with; every config it has applied since agrees with that one on these
+// fields, so the live config works as live too.
 func NonReloadableChanges(live, next *Config) []string {
 	var out []string
 	for _, f := range nonReloadable {

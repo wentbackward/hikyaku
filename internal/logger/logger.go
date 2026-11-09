@@ -46,8 +46,27 @@ func Reload() { Apply(nil) }
 // MaxAllowedLevel (level 2 / headers), since Body and Content are no-op
 // functions that wouldn't emit regardless.
 func Apply(yamlLevel *int) {
+	l, src, requested := resolve(yamlLevel)
+	if l < requested {
+		log.Printf("[logger] level %d requested but clamped to %d (hardened build strips body/content logging)", requested, l)
+	}
+	current.Store(int32(l)) //nolint:gosec // l is in LevelError..LevelContent (resolve bounds it)
+	log.Printf("[logger] log level %d (%s)", l, src)
+}
+
+// Level returns the level Apply(yamlLevel) would set — config value, LOG_LEVEL
+// override, hardened cap — without setting it or logging. The proxy uses it to
+// cap a request's logging at the level its config generation asks for.
+func Level(yamlLevel *int) int {
+	l, _, _ := resolve(yamlLevel)
+	return l
+}
+
+// resolve computes the effective level for yamlLevel, its source, and the
+// level requested before the build's cap.
+func resolve(yamlLevel *int) (level int, src string, requested int) {
 	l := LevelError
-	src := "default"
+	src = "default"
 	if yamlLevel != nil && *yamlLevel >= LevelError && *yamlLevel <= LevelContent {
 		l = *yamlLevel
 		src = "config"
@@ -58,12 +77,7 @@ func Apply(yamlLevel *int) {
 			src = "env"
 		}
 	}
-	if l > MaxAllowedLevel {
-		log.Printf("[logger] level %d requested but clamped to %d (hardened build strips body/content logging)", l, MaxAllowedLevel)
-		l = MaxAllowedLevel
-	}
-	current.Store(int32(l))
-	log.Printf("[logger] log level %d (%s)", l, src)
+	return min(l, MaxAllowedLevel), src, l
 }
 
 // Get returns the current log level.

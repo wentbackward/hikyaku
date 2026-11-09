@@ -210,3 +210,25 @@ func TestHigherLevelIncludesLower(t *testing.T) {
 		t.Error("level 4 should include Content logs")
 	}
 }
+
+// Level computes what Apply would set (config, env override, build cap)
+// without changing the process level.
+func TestLevel_MatchesApplyWithoutSettingIt(t *testing.T) {
+	t.Cleanup(Reload)
+	t.Setenv("LOG_LEVEL", "")
+	Apply(nil)
+	two, four := 2, 4
+	if got := Level(&two); got != 2 {
+		t.Errorf("Level(2) = %d", got)
+	}
+	if got := Level(&four); got != min(4, MaxAllowedLevel) {
+		t.Errorf("Level(4) = %d, want %d", got, min(4, MaxAllowedLevel))
+	}
+	if Get() != LevelError {
+		t.Errorf("Level changed the process level to %d", Get())
+	}
+	t.Setenv("LOG_LEVEL", "1")
+	if got := Level(&four); got != 1 {
+		t.Errorf("LOG_LEVEL must win: Level(4) = %d", got)
+	}
+}

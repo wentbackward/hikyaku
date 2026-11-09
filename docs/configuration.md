@@ -909,24 +909,32 @@ Each endpoint forwards requests in the client's format — no protocol translati
 | `telemetry.prometheus.*` (`enabled`, `host`, `port`, `path`, `allow_plaintext`, `tls.cert`, `tls.key`) | the metrics listener is started once |
 | `journal.enabled`, `journal.otlp_endpoint` | the journal exporter is constructed once |
 
-A config file that changes any of them is **refused as a whole**: the proxy logs `config reload rejected: config changes fields a reload cannot apply (restart to change them): <fields>` and keeps running the previous config, including its routes and backends. Values are compared after defaults, so spelling out a default (`port: 4000`) is not a change. Restart the process to apply such a change.
+A config file that changes any of them is **refused as a whole**: the proxy logs `config reload rejected: config changes fields a reload cannot apply (restart to change them): <fields>` and keeps running the previous config, including its routes and backends. Values are compared after defaults, so spelling out a default (`port: 4000`) is not a change. Restart the process to apply such a change. The comparison is always against the config the process started with, so no sequence of reloads can move a startup-only field.
 
 Everything else is reloadable: `routes`, `backends`, `groups`, `load_balancing`, `defenders`, `sig_message_capture` (the capture handle is rebuilt and an armed window is cleared), `server.api_key`, `server.passthrough_unrouted`, `server.log_level`, `server.max_request_body_mb`, `server.drop_empty_content`, and `server.allow_plaintext` (a listen-policy input: re-checked on every reload, so a config that fails the policy is refused too). A config that fails to load is refused the same way. Each reload also re-probes the backends.
 
+Per-backend `max_concurrency` limits belong to the config that set them: a request holds a slot of the config it was routed with, so a reload starts the new config with fresh limits while requests still running finish under the old ones.
+
+`server.log_level` (or `LOG_LEVEL`) sets the process-wide level on each reload, and each request is also capped at the level of the config it was routed with: the lower of the two applies. A request routed with a config at level 0 never logs its headers or body, even if a later reload raised the level while it was running.
+
 ### Embedding: checked reloads and generation admission
 
-An embedding program applies a config with `Server.ApplyConfig(cfg, opts...)`, which runs exactly the SIGHUP checks: a restart-only change is refused with a `*hikyaku.NonReloadableError` whose `Fields` lists the YAML paths above (`hikyaku.NonReloadableFields()` returns the whole list, `hikyaku.NonReloadableChanges(live, next)` the fields `next` would change, so an editor can say "restart required" before applying), and the listen policy is enforced with the embedder's options. A refused config changes nothing. `Server.Reload` applies without these checks and is deprecated.
+An embedding program applies a config with `Server.ApplyConfig(cfg, opts...)`, which runs exactly the SIGHUP checks: a restart-only change is refused with a `*hikyaku.NonReloadableError` whose `Fields` lists the YAML paths above (`hikyaku.NonReloadableFields()` returns the whole list, `hikyaku.NonReloadableChanges(live, next)` the fields `next` would change, so an editor can say "restart required" before applying; pass `Server.Config()` or the config given to `New` as `live`, which agree on these fields), and the listen policy is enforced with the embedder's options. A refused config changes nothing. `Server.Reload` is deprecated: it refuses (and logs) a restart-only change the same way, but skips the listen policy.
+
+A `TransportFactory` is called once, in `New`, with generation 1's config; core never passes it a later one. Any field the factory reads is therefore restart-only in effect, and `ApplyConfig` cannot refuse a change to it because core does not know which fields a factory reads. An embedder that wants such a field to reload reconfigures its transport in place on each apply.
 
 Each applied config is a new **generation**: the config passed to `New` is generation 1 and every successful `ApplyConfig` publishes the next, even for an unchanged config. `Server.Generation()` returns the live one; `Generation.ID()` is its sequence number and `Generation.Config()` the exact `*Config` pointer passed to `New` or `ApplyConfig`, so an embedder can tie a generation to what it derived from that config (a digest, say) with no race against a concurrent apply.
 
-`hikyaku.WithGenerationAdmission(f)` installs a per-request fence for an embedder that binds the running config into its identity (an attested certificate carrying a config digest, for example). For every request that reaches routing on an endpoint that contacts an upstream (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/messages`, `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/api/tags`), core:
+`hikyaku.WithGenerationAdmission(f)` installs a per-request fence for an embedder that binds the running config into its identity (an attested certificate carrying a config digest, for example). For every request that reaches routing on an endpoint that contacts an upstream (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/messages`, `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/api/tags`), and for `/v1/models` (whose answer is the generation's route names), core:
 
 1. reads the whole request body,
 2. loads the generation the request will be served by, once,
 3. calls `f(ctx, gen)` with the inbound request context,
-4. and only if `f` returns nil goes on to balancer selection, journal export, capture and the backend connection, all with that same generation. The live state is never re-loaded for the request, even if a reload lands while `f` runs.
+4. and only if `f` returns nil goes on to request logging, balancer selection, concurrency limits, journal export, capture and the backend connection, all with that same generation. The live state is never re-loaded for the request, even if a reload lands while `f` runs.
 
-A host that holds a client's upload, reloads, then releases the body therefore cannot get the request served by a config the hook did not see. A non-nil error ends the request with no upstream contact: `503` with `{"error":"request not admitted"}`, or the status of a `*hikyaku.AdmissionError` in the error chain (400–599). The error text is logged, never sent to the client. `/health` and `/v1/models` contact no upstream and do not call the hook; neither do requests that end before routing (wrong method, unreadable or invalid body). The hook runs on the request path and must be cheap.
+The request's log lines are capped at the generation's configured level as well as the process-wide one (see above).
+
+A host that holds a client's upload, reloads, then releases the body therefore cannot get the request served by a config the hook did not see. A non-nil error ends the request with no upstream contact: `503` with `{"error":"request not admitted"}`, or the status of a `*hikyaku.AdmissionError` in the error chain (400–599). The error text is logged, never sent to the client. `/health` does not call the hook; neither do requests that end before routing (wrong method, unreadable or invalid body, or a body over `max_request_body_mb`, which is read from the live config before the body arrives). The hook runs on the request path and must be cheap.
 
 ## Environment variables
 

@@ -133,8 +133,11 @@ func New(version, buildMode string, cfg *Config, metrics *Metrics, j *Journal, o
 // can reach (mTLS, private CA, pins) is healthy to the balancer exactly when it
 // is reachable by the proxy. Server.OutboundTransport returns it, for an
 // embedder's own backend requests (startup probes, say).
-// The factory is called once, at construction; an embedder that changes policy
-// on reload reconfigures the transport it returned in place.
+// The factory is called once, at construction, with generation 1's config;
+// core never passes it a later one, so any config field the factory reads is
+// startup-only in effect (ApplyConfig cannot refuse changes to fields it does
+// not know the factory reads). An embedder that changes policy on reload
+// reconfigures the transport it returned in place.
 func WithTransportFactory(f TransportFactory) Option {
 	return proxy.WithTransportFactory(f)
 }
@@ -162,15 +165,18 @@ func WithCaptureFilter(f CaptureFilter) Option {
 // per-request fence for an embedder that binds the applied config into its
 // identity (pro's attested certificate binds a config digest). Core loads the
 // generation a proxied request will be served by once, after reading the
-// request body, and calls f with it before any upstream I/O (balancer
-// selection, journal export, capture, backend connection); the request is then
-// served by exactly that generation, never re-loaded, so a reload that lands
-// while a client's upload is held cannot slip another config past the hook. A
-// non-nil error ends the request with no upstream contact: 503, or the status
-// of an AdmissionError; the error is logged, not sent to the client. Tie a
-// generation to the embedder's own state through Generation.Config() — the
-// pointer passed to New or ApplyConfig — which needs no ordering with the
-// apply. nil admits every request.
+// request body, and calls f with it before any upstream I/O (request logging,
+// balancer selection, journal export, capture, backend connection); the
+// request is then served by exactly that generation, never re-loaded, so a
+// reload that lands while a client's upload is held cannot slip another config
+// past the hook. /v1/models (the generation's route names) is admitted the
+// same way; /health is not. A non-nil error ends the request with no upstream
+// contact: 503, or the status of an AdmissionError; the error is logged, not
+// sent to the client. The request's log lines are capped at the generation's
+// configured log level as well as the process-wide one set by ApplyLogLevel
+// (the lower wins). Tie a generation to the embedder's own state through
+// Generation.Config() — the pointer passed to New or ApplyConfig — which
+// needs no ordering with the apply. nil admits every request.
 func WithGenerationAdmission(f GenerationAdmission) Option {
 	return proxy.WithGenerationAdmission(f)
 }
@@ -184,7 +190,10 @@ func NonReloadableFields() []string {
 }
 
 // NonReloadableChanges returns the non-reloadable fields whose effective value
-// differs between live and next — the fields Server.ApplyConfig(next) would
+// differs between live and next. Server.ApplyConfig checks against the config
+// passed to New; every generation it publishes agrees with that config on
+// these fields, so passing the live config (Server.Config()) or the startup
+// config as live gives the same answer: the fields ApplyConfig(next) would
 // refuse, so an embedder can tell an operator "restart required" before
 // applying.
 func NonReloadableChanges(live, next *Config) []string {
