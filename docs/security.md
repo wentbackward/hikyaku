@@ -140,7 +140,9 @@ These are the features you need to know about — they exist for legitimate debu
 
 ### Log level 3
 
-`LOG_LEVEL=3` causes the proxy to log the first 80 bytes of every incoming request body to stdout. With typical chat JSON framing, that's enough to see the start of the user's message. All of stdout goes to `docker logs` and anywhere they're shipped.
+`LOG_LEVEL=3` causes the proxy to log the first 80 bytes of every incoming request body to stdout. With typical chat JSON framing, that's enough to see the start of the user's message. All of stdout goes to `docker logs` and anywhere they're shipped. It also logs the first 1 KB of every upstream error body, which providers often fill with the offending input.
+
+Levels 0-2 never log request or response content ([what each level may contain](logging.md#what-each-level-may-contain)).
 
 ### Log level 4
 
