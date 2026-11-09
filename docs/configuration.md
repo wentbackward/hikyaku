@@ -431,7 +431,7 @@ routes:
 
 `Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`, `Proxy-Authorization` and `Cookie` are credential headers. The caller's are removed before the rules run, and the backend's `api_key` is set before them:
 
-- `add` may set a credential header to a static value (for example `X-Corp-Auth` or `Authorization` for a self-hosted backend); it replaces the `api_key` header of the same name.
+- `add` may set a credential header to a static value (for example `X-Corp-Auth` or `Authorization` for a self-hosted backend); it replaces the `api_key` header of the same name. `Proxy-Authorization` is the exception: it is hop-by-hop and never reaches a backend (see below).
 - `remove` may drop one, the backend's own included.
 - A `rename` out of or into a credential header has no effect: a caller value never reaches a backend as, or from, a credential. The config still loads, and one `[config] WARNING:` line naming each backend and route with such a rule is logged on start and on every reload. A config that renamed `Authorization` to keep the caller's token for audit no longer forwards it.
 
@@ -439,7 +439,7 @@ See [security](security.md#upstream-credentials).
 
 **Hop-by-hop headers are not configurable**
 
-`Connection`, `Keep-Alive`, `Proxy-Connection`, `Te`, `Trailer`, `Transfer-Encoding` and `Upgrade` describe one connection, and the reverse proxy acts on them after the rules run: a `Connection` value would make it remove the headers it names, the backend key included. A rule that adds one, or renames another header into one, has no effect. The config still loads, and one `[config] WARNING:` line naming each backend and route with such a rule is logged on start and on every reload. `remove` and a rename away from one work as usual.
+`Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `Proxy-Connection`, `Te`, `Trailer`, `Transfer-Encoding` and `Upgrade` describe one connection, and the reverse proxy acts on them after the rules run: it strips `Proxy-Authenticate` and `Proxy-Authorization`, so a static value never reaches a backend, and a `Connection` value would make it remove the headers it names, the backend key included. A rule that adds one, or renames another header into one, has no effect. The config still loads, and one `[config] WARNING:` line naming each backend and route with such a rule is logged on start and on every reload. `remove` and a rename away from one work as usual.
 
 **`Accept-Encoding` is not configurable**
 

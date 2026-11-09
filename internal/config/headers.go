@@ -52,13 +52,17 @@ func warnIgnoredAcceptEncoding(cfg *Config) {
 }
 
 // hopByHopHeaders are the hop-by-hop request headers (RFC 9110 7.6.1) a
-// headers rule may not write. httputil.ReverseProxy acts on them after the
-// Director returns: a Connection value would make it delete the headers it
-// names, the backend key included, and the others describe the proxy's own
-// connection to the backend, which the transport owns.
+// headers rule may not write: httputil.ReverseProxy's own list. It acts on
+// them after the Director returns: a Connection value would make it delete
+// the headers it names, the backend key included; it strips the
+// Proxy-Authenticate and Proxy-Authorization a rule would set, so they never
+// reach a backend; and the others describe the proxy's own connection to the
+// backend, which the transport owns.
 var hopByHopHeaders = []string{
 	"Connection",
 	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
 	"Proxy-Connection",
 	"Te",
 	"Trailer",
@@ -114,7 +118,7 @@ func warnIgnoredHopByHop(cfg *Config) {
 	}
 	cfg.warnings = append(cfg.warnings, fmt.Sprintf(
 		"headers adds and renames into a hop-by-hop header (%s) are ignored (set in: %s): "+
-			"they apply to one connection only, and a Connection value would remove headers the proxy sets "+
+			"they apply to one connection only and never reach a backend, and a Connection value would remove headers the proxy sets "+
 			"(docs/security.md#upstream-credentials)",
 		strings.Join(hopByHopHeaders, ", "), strings.Join(where, ", ")))
 }

@@ -574,3 +574,16 @@ func TestApplyHeaderOps_SkipsHopByHopTargets(t *testing.T) {
 		}
 	}
 }
+
+// A static Proxy-Authorization from an add rule never reaches a backend (the
+// reverse proxy strips it as hop-by-hop), while other static credentials do.
+func TestCredentials_AddProxyAuthorizationNeverReachesBackend(t *testing.T) {
+	up := newRecordingUpstream(t)
+	s := newCredServer(t, up.URL, "openai", "", `
+    headers:
+      add:
+        Proxy-Authorization: Basic static
+        X-Api-Key: static-key`, "")
+	sendWithCallerCredentials(t, s, credLanes[0], nil)
+	assertOnlyCredential(t, up.last(t).header, map[string]string{"X-Api-Key": "static-key"})
+}

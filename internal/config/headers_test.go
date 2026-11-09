@@ -201,3 +201,22 @@ func TestIsHopByHopHeader_KnownNamesAnyCase(t *testing.T) {
 		}
 	}
 }
+
+// An add of Proxy-Authorization loads but warns: the reverse proxy strips it
+// as hop-by-hop after the rules run, so the static value never reaches a
+// backend.
+func TestHeaders_ProxyAuthorizationAddLoadsWithWarning(t *testing.T) {
+	cfg := parseHeadersConfig(t, "    headers:\n      add:\n        proxy-authorization: Basic static", "")
+	w := cfg.Warnings()
+	if len(w) != 1 {
+		t.Fatalf("want exactly one warning, got %d: %q", len(w), w)
+	}
+	for _, want := range []string{"Proxy-Authorization", "ignored", `backend "be"`} {
+		if !strings.Contains(w[0], want) {
+			t.Errorf("warning %q missing %q", w[0], want)
+		}
+	}
+	if !IsHopByHopHeader("Proxy-Authenticate") {
+		t.Error("Proxy-Authenticate is hop-by-hop to the reverse proxy too")
+	}
+}
