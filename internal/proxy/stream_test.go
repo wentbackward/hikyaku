@@ -241,14 +241,16 @@ func TestAnthropic_UsageWithoutCacheFields(t *testing.T) {
 	}
 }
 
-func TestOpenAI_UsageHasNoCacheClasses(t *testing.T) {
+// OpenAI's cached_tokens is inside prompt_tokens: reported as a cache class,
+// with the prompt net of it.
+func TestOpenAI_UsageReportsCachedTokensNetOfPrompt(t *testing.T) {
 	p := makeParser(t, "openai")
 	feedLines(p,
 		`data: {"choices":[{"delta":{"content":"Hi"},"index":0}]}`,
 		`data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":64}}}`,
 		`data: [DONE]`,
 	)
-	if got, want := p.usage(), (usageCounts{prompt: 100, completion: 50}); got != want {
+	if got, want := p.usage(), (usageCounts{prompt: 36, completion: 50, cacheRead: 64}); got != want {
 		t.Errorf("usage() = %+v, want %+v", got, want)
 	}
 }

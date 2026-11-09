@@ -101,20 +101,40 @@ func WithTransportFactory(f TransportFactory) Option {
 // authenticated principal). It fires once per request on both the streaming and
 // non-streaming lanes, including error responses (with zero tokens).
 type UsageEvent struct {
-	Ctx              context.Context
-	RequestID        string
-	VirtualModel     string // the route the caller requested
-	RealModel        string // the upstream model name
-	Backend          string // resolved backend id
-	BackendType      string // "openai" | "anthropic" | "ollama"
-	PromptTokens     int64  // uncached input tokens (Anthropic input_tokens; OpenAI prompt_tokens; Ollama prompt_eval_count)
-	CompletionTokens int64  // output tokens (Anthropic output_tokens; OpenAI completion_tokens; Ollama eval_count)
-	CacheReadTokens  int64  // Anthropic cache_read_input_tokens; 0 elsewhere
-	CacheWriteTokens int64  // Anthropic cache_creation_input_tokens; 0 elsewhere
-	ReasoningTokens  int64
-	Streamed         bool
-	Status           int
-	Duration         time.Duration
+	Ctx          context.Context
+	RequestID    string
+	VirtualModel string // the route the caller requested
+	RealModel    string // the upstream model name
+	Backend      string // resolved backend id
+	BackendType  string // "openai" | "anthropic" | "ollama"
+	// PromptTokens is uncached input on every lane, so total input is
+	// PromptTokens + CacheReadTokens + CacheWriteTokens and each class can
+	// be priced on its own. Anthropic: input_tokens (already uncached).
+	// OpenAI lane: prompt_tokens minus both cache classes (the provider
+	// counts them inside prompt_tokens), never below zero. Ollama:
+	// prompt_eval_count.
+	PromptTokens int64
+	// CompletionTokens is output tokens, reasoning included (Anthropic
+	// output_tokens; OpenAI completion_tokens; Ollama eval_count).
+	CompletionTokens int64
+	// CacheReadTokens is input served from the provider's prompt cache:
+	// Anthropic cache_read_input_tokens; OpenAI lane
+	// prompt_tokens_details.cached_tokens, or the top-level cached_tokens
+	// some providers (Moonshot) send when the details key is absent; 0 on
+	// Ollama.
+	CacheReadTokens int64
+	// CacheWriteTokens is input written to the provider's prompt cache:
+	// Anthropic cache_creation_input_tokens; OpenAI lane
+	// prompt_tokens_details.cache_write_tokens (Moonshot); 0 on Ollama.
+	CacheWriteTokens int64
+	// ReasoningTokens is informational: the part of CompletionTokens the
+	// provider reports as reasoning (OpenAI lane
+	// completion_tokens_details.reasoning_tokens). It is already inside
+	// CompletionTokens; do not add the two. 0 where not reported.
+	ReasoningTokens int64
+	Streamed        bool
+	Status          int
+	Duration        time.Duration
 	// EndReason says how the response ended. Status is the upstream's HTTP
 	// status, which is 200 for every streamed response however it ended, so
 	// an aborted or cut-off stream (whose final usage chunk never arrived and
@@ -163,10 +183,13 @@ func streamEndReason(trip *loopTrip, readErr error, reqCtx context.Context) EndR
 }
 
 // usageCounts is the per-request token tally a lane parser extracts from an
-// upstream response. The classes are kept separate on purpose: Anthropic's
-// input_tokens EXCLUDES cached tokens, so total input is
+// upstream response. The classes are kept separate on purpose: total input is
 // prompt + cacheRead + cacheWrite, and each class is priced differently.
-// Nothing is folded together here — that is the embedder's decision.
+// Anthropic's input_tokens already EXCLUDES cached tokens; the OpenAI lane's
+// prompt_tokens includes them, so its parsers net them out (netOfCache)
+// before the counts reach the UsageEvent. reasoning is a subset of
+// completion. Nothing is folded together here — that is the embedder's
+// decision.
 type usageCounts struct {
 	prompt, completion, cacheRead, cacheWrite, reasoning int64
 }
@@ -1352,7 +1375,8 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 						Backend: backendID, BackendType: backendType,
 						PromptTokens: counts.prompt, CompletionTokens: counts.completion,
 						CacheReadTokens: counts.cacheRead, CacheWriteTokens: counts.cacheWrite,
-						Streamed: true, Status: status, Duration: time.Since(t0),
+						ReasoningTokens: counts.reasoning,
+						Streamed:        true, Status: status, Duration: time.Since(t0),
 						EndReason: streamEndReason(trip, readErr, reqCtx), LoopChannel: loopChannel,
 					})
 					elapsed := time.Since(t0).Seconds()
@@ -1446,7 +1470,8 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 				Backend: backendID, BackendType: backendType,
 				PromptTokens: counts.prompt, CompletionTokens: counts.completion,
 				CacheReadTokens: counts.cacheRead, CacheWriteTokens: counts.cacheWrite,
-				Streamed: false, Status: resp.StatusCode, Duration: time.Since(t0),
+				ReasoningTokens: counts.reasoning,
+				Streamed:        false, Status: resp.StatusCode, Duration: time.Since(t0),
 				EndReason: EndComplete,
 			})
 
@@ -1702,7 +1727,9 @@ func detectProtocol(r *http.Request) string {
 // non-streaming upstream response, records them on the Prometheus counters and
 // returns them for the UsageEvent. Each lane reports counts in its own shape:
 //
-//   - openai:    usage.prompt_tokens / usage.completion_tokens
+//   - openai:    usage.prompt_tokens / usage.completion_tokens plus the cache
+//     classes and reasoning count (see openAIUsage); the metrics get
+//     prompt_tokens as reported, the returned counts the prompt net of cache
 //   - anthropic: usage.input_tokens / usage.output_tokens plus the two cache
 //     classes usage.cache_read_input_tokens / usage.cache_creation_input_tokens
 //   - ollama:    top-level prompt_eval_count / eval_count (no "usage" object;
@@ -1731,13 +1758,46 @@ func extractNonStreamingUsage(data []byte, backendID, model, backendType string,
 			completion: jsonCount(resp, "eval_count"),
 		}
 	default:
-		counts = usageCounts{
-			prompt:     jsonCount(usage, "prompt_tokens"),
-			completion: jsonCount(usage, "completion_tokens"),
-		}
+		// The metrics keep the provider's own prompt_tokens; the event
+		// gets the prompt net of the cache classes it includes.
+		provider := openAIUsage(usage)
+		provider.recordTokenMetrics(ctx, m, backendID, model)
+		return provider.netOfCache()
 	}
 	counts.recordTokenMetrics(ctx, m, backendID, model)
 	return counts
+}
+
+// openAIUsage reads an OpenAI-lane usage object (OpenAI, Moonshot and other
+// OpenAI-compatible providers). The returned prompt is the provider's
+// prompt_tokens, which INCLUDES the cache classes; netOfCache turns it into
+// uncached input. The cache read count is prompt_tokens_details.cached_tokens
+// when that key carries a value (an explicit 0 included), else Moonshot's
+// legacy top-level cached_tokens. reasoning_tokens is a subset of
+// completion_tokens, reported for information only. A nil usage yields zeros.
+func openAIUsage(usage map[string]interface{}) usageCounts {
+	promptDetails, _ := usage["prompt_tokens_details"].(map[string]interface{})
+	completionDetails, _ := usage["completion_tokens_details"].(map[string]interface{})
+	cacheRead := jsonCount(usage, "cached_tokens")
+	if v, ok := promptDetails["cached_tokens"]; ok && v != nil {
+		cacheRead = jsonCount(promptDetails, "cached_tokens")
+	}
+	return usageCounts{
+		prompt:     jsonCount(usage, "prompt_tokens"),
+		completion: jsonCount(usage, "completion_tokens"),
+		cacheRead:  cacheRead,
+		cacheWrite: jsonCount(promptDetails, "cache_write_tokens"),
+		reasoning:  jsonCount(completionDetails, "reasoning_tokens"),
+	}
+}
+
+// netOfCache returns c with the cache classes taken out of prompt, for a lane
+// whose prompt count includes them (OpenAI). The cache classes are kept as
+// reported; a prompt smaller than their sum (an inconsistent upstream) is
+// clamped at zero rather than going negative.
+func (c usageCounts) netOfCache() usageCounts {
+	c.prompt = max(c.prompt-c.cacheRead-c.cacheWrite, 0)
+	return c
 }
 
 // jsonCount reads a non-negative integer token count from a decoded JSON

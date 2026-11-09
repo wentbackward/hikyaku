@@ -65,8 +65,11 @@ type sseParser struct {
 	// Token accumulation
 	promptToks     int64
 	completionToks int64
-	cacheReadToks  int64 // Anthropic cache_read_input_tokens; 0 on OpenAI
-	cacheWriteToks int64 // Anthropic cache_creation_input_tokens; 0 on OpenAI
+	// promptToks is the provider's own prompt count: uncached on Anthropic
+	// (input_tokens), including both cache classes on OpenAI (prompt_tokens).
+	cacheReadToks  int64 // Anthropic cache_read_input_tokens; OpenAI cached_tokens
+	cacheWriteToks int64 // Anthropic cache_creation_input_tokens; OpenAI cache_write_tokens
+	reasoningToks  int64 // OpenAI completion_tokens_details.reasoning_tokens (inside completionToks)
 	thinkChars     int64 // length of thinking/reasoning content seen
 	contentChars   int64 // length of regular text content seen
 
@@ -302,13 +305,24 @@ func (p *sseParser) handleOpenAIEvent(evt map[string]interface{}) {
 	}
 
 	// Usage arrives in the final chunk when stream_options.include_usage=true
+	// (OpenAI sends it on a chunk with "choices": []). Each class keeps its
+	// last positive value; promptToks stays the provider's prompt_tokens,
+	// which includes the cache classes, and usage() nets them out.
 	if usage, ok := evt["usage"].(map[string]interface{}); ok {
-		if v, _ := usage["prompt_tokens"].(float64); v > 0 {
-			p.promptToks = int64(v)
-		}
-		if v, _ := usage["completion_tokens"].(float64); v > 0 {
-			p.completionToks = int64(v)
-		}
+		u := openAIUsage(usage)
+		keepPositive(&p.promptToks, u.prompt)
+		keepPositive(&p.completionToks, u.completion)
+		keepPositive(&p.cacheReadToks, u.cacheRead)
+		keepPositive(&p.cacheWriteToks, u.cacheWrite)
+		keepPositive(&p.reasoningToks, u.reasoning)
+	}
+}
+
+// keepPositive stores v in *dst when v is positive, so a later usage object
+// that omits a class does not erase the count an earlier one reported.
+func keepPositive(dst *int64, v int64) {
+	if v > 0 {
+		*dst = v
 	}
 }
 
@@ -402,9 +416,18 @@ func (p *sseParser) recordAnthropicTokens() {
 	}
 }
 
-// usage returns the token classes seen on this stream. Call after recordFinal.
+// usage returns the token classes seen on this stream, prompt as uncached
+// input on every lane. Call after recordFinal.
 func (p *sseParser) usage() usageCounts {
-	return usageCounts{prompt: p.promptToks, completion: p.completionToks, cacheRead: p.cacheReadToks, cacheWrite: p.cacheWriteToks}
+	c := usageCounts{
+		prompt: p.promptToks, completion: p.completionToks,
+		cacheRead: p.cacheReadToks, cacheWrite: p.cacheWriteToks,
+		reasoning: p.reasoningToks,
+	}
+	if p.backendType == "anthropic" {
+		return c
+	}
+	return c.netOfCache()
 }
 
 // recordFinal records per-request summary metrics once the stream is complete.
