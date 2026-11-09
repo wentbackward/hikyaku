@@ -47,9 +47,33 @@ principal. There every lane means the same thing, so total input is
 |---|---|---|---|
 | `PromptTokens` (uncached input) | `input_tokens` | `prompt_tokens` minus both cache classes (never below 0) | `prompt_eval_count` |
 | `CacheReadTokens` | `cache_read_input_tokens` | `prompt_tokens_details.cached_tokens`; when that key is absent or null, top-level `cached_tokens` (Moonshot) | 0 |
-| `CacheWriteTokens` | `cache_creation_input_tokens` | `prompt_tokens_details.cache_write_tokens` (Moonshot) | 0 |
+| `CacheWriteTokens` (every cache lifetime) | `cache_creation_input_tokens` | `prompt_tokens_details.cache_write_tokens` (Moonshot) | 0 |
+| `CacheWrite5mTokens` (informational, already inside `CacheWriteTokens`) | `cache_creation.ephemeral_5m_input_tokens` | `Msh-Usage-Cache-Write-Tokens-5m` response header (Moonshot) | 0 |
+| `CacheWrite1hTokens` (informational, already inside `CacheWriteTokens`) | `cache_creation.ephemeral_1h_input_tokens` | `Msh-Usage-Cache-Write-Tokens-1h` response header (Moonshot) | 0 |
 | `CompletionTokens` | `output_tokens` | `completion_tokens` | `eval_count` |
 | `ReasoningTokens` (informational, already inside `CompletionTokens`) | 0 | `completion_tokens_details.reasoning_tokens` | 0 |
+| `WebSearchRequests` (server-side web search calls, billed per call) | `server_tool_use.web_search_requests` | 0 | 0 |
+
+The two cache-write tiers split `CacheWriteTokens` by cache lifetime, which
+providers price differently; do not add them to it. Their sum never exceeds
+`CacheWriteTokens`: a reported split that would, or one with no total to
+split, is dropped (both 0). A remainder is cache write whose lifetime the
+provider did not report. A tier header counts only when it is a plain
+decimal integer within int64 (repeated values must agree; they are never
+summed).
+
+Streamed Anthropic responses carry the input classes in `message_start` and
+again, **cumulatively**, in `message_delta`. On a turn with server-side
+tools (web search) the final `message_delta` reports more input than
+`message_start`, so core takes every class but the output count from the
+last usage object that carries any (`message_start`, superseded whole by
+each `message_delta`), and `output_tokens` from the last `message_delta`.
+A `message_delta` with only `output_tokens`, or only zero input classes,
+leaves `message_start`'s classes in place. When a `message_delta` reports
+the same cache-write total without a `cache_creation` split, the earlier
+split still describes it and is kept; a changed total without a split has
+an unknown split (0). `llm_prompt_tokens_total` gets the same final
+`input_tokens`.
 
 Streamed OpenAI-lane responses carry these in the final usage chunk
 (`"choices": []`), which core requests with `stream_options.include_usage`.
