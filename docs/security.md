@@ -47,6 +47,16 @@ Standard Go `net/http` transport with system CA bundle. Any backend `base_url` s
 
 The load balancer's health, alive and metrics probes are sent through the same shared outbound transport as live requests — the same TLS floor, the same `TransportFactory` an embedder injects, and no `HTTP_PROXY` consultation — so a backend is healthy to the balancer exactly when the proxy can reach it.
 
+### Response encoding
+
+The proxy reads every response body it forwards (token metering, stream loop detection, capture), so it owns the encoding negotiation with the upstream rather than forwarding the client's `Accept-Encoding`:
+
+- **Every proxied request asks for `Accept-Encoding: identity`**, whatever the client or a `headers` rule asked for. Clients receive uncompressed responses with headers that describe them.
+- **An upstream that compresses anyway** (it ignored the request) is decoded before anything reads the body if the coding is `gzip`, `x-gzip` or `deflate`; `Content-Encoding` and the encoded `Content-Length` are dropped. Decoding starts on the first read, so streamed events reach the client as the upstream sends them.
+- **Any other coding** (`br`, `zstd`, several codings) is answered with `502 Bad Gateway`. Forwarding bytes the proxy cannot read would hand the client a response with no usage counted.
+
+Why identity rather than letting the transport negotiate gzip: the choice holds for every transport (core's own or one an embedder injects through `TransportFactory`, which may not decode transparently); streamed events are not held in an upstream compressor's buffer; and no decompressor state, which keeps a window of recent plaintext the proxy cannot wipe, is created on the normal path — consistent with the hardened build's aim of a short plaintext window. The cost is uncompressed bytes on the upstream leg, which is small next to model latency for chat responses; large embedding batches are the case where it is most visible.
+
 ### TLS with Tailscale
 
 Tailscale can issue a real (Let's Encrypt-backed) certificate for a node's MagicDNS name, which the proxy then terminates directly. **Compose does not provision this for you** — it only mounts files that already exist. The hardened build *requires* a working cert (you cannot terminate TLS at Tailscale and forward plaintext to hikyaku — hardened rejects plaintext), so the cert must be on disk and readable by the container.

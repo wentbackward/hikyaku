@@ -18,7 +18,6 @@ All metrics are exported via OpenTelemetry with a Prometheus exporter. Default e
 | `hikyaku_request_body_bytes_buffered` | Gauge | — | Bytes held in proxy buffers awaiting responses |
 | `hikyaku_stream_ratio` | Histogram | `route`, `backend`, `channel` | Stream loop detection: deflate ratio of each measured output window |
 | `hikyaku_stream_loop_trips_total` | Counter | `route`, `backend`, `channel`, `mode` | Stream loop detection trips |
-| `hikyaku_stream_loop_unguarded_total` | Counter | `route`, `backend`, `reason` | Streams on a guarded route that could not be measured |
 
 ## Token counters
 
@@ -59,6 +58,12 @@ reads `choices[0].usage` instead, where Moonshot's older streams put the
 final usage on the `finish_reason` chunk. Usage reported in both places is
 counted once.
 
+Counts are read from the plain response body on every lane, whatever
+`Accept-Encoding` the client sent: the proxy asks the upstream for an
+uncompressed answer, and a compressed answer is decoded first or refused
+with a 502, never passed on uncounted (see
+[response encoding](security.md#response-encoding)).
+
 ## Per-request usage events
 
 An embedder registered with `WithUsageObserver` receives one `UsageEvent`
@@ -87,11 +92,6 @@ Recorded only for streamed responses on routes where
 - `hikyaku_stream_loop_trips_total` — one per trip (at most one per
   channel per choice per stream). `mode` is `abort` (the stream was
   ended and the upstream request closed) or `shadow` (logged only).
-- `hikyaku_stream_loop_unguarded_total` — a stream on a guarded route
-  that could not be measured. `reason="content_encoding"`: the body
-  arrived in an encoding the proxy cannot read (the guard asks for an
-  uncompressed answer, so this means a `headers` rule or the upstream
-  forced one). Each is also logged once as `stream_loop_unguarded`.
 
 No metric carries response text.
 
@@ -104,7 +104,6 @@ No metric carries response text.
   for passthrough requests
 - **`channel`** — `reasoning` or `content`
 - **`mode`** — `abort` or `shadow`
-- **`reason`** — why a guarded stream went unmeasured (`content_encoding`)
 
 ## Histogram buckets
 

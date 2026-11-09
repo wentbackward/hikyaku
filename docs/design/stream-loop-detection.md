@@ -297,18 +297,16 @@ Choices made where the design was open:
 - **n > 1.** The abort chunk closes only the choices still open; a choice
   that already sent `finish_reason` is not finished twice (when every
   choice has finished, `choices` is empty and the error is still sent).
-- **Fail-open made visible.** The parsers read the bytes, so a guarded
-  stream does not forward the caller's `Accept-Encoding`. This matches an
-  existing assumption: the proxy's usage parsing (streamed and
-  non-streamed) already reads bodies as plain text and silently found no
-  counts in a compressed one. Go's transport then negotiates gzip itself
-  and decodes it transparently. The deletion runs before backend/route
-  header rules, so an operator who sets `Accept-Encoding` keeps it; a
-  body that still arrives encoded is passed through unmeasured, counted
-  in `hikyaku_stream_loop_unguarded_total{reason="content_encoding"}` and
-  logged once (no text). SSE `data:` lines are read with or without the
-  optional space (SSE spec), for every stream — this also fixes usage
-  parsing for upstreams that omit the space, and changes nothing else.
+- **Plain bytes only.** The parsers read the bytes. Every proxied request
+  now asks the upstream for identity and decodes an unasked gzip or deflate
+  answer (any other coding is a 502), so a guarded stream is always
+  readable; see [response encoding](../security.md#response-encoding).
+  (This design first dropped the caller's `Accept-Encoding` on guarded
+  streams only and counted encoded bodies as unguarded; that counter was
+  removed when the rule became proxy-wide.) SSE `data:` lines are read
+  with or without the optional space (SSE spec), for every stream — this
+  also fixes usage parsing for upstreams that omit the space, and changes
+  nothing else.
 - **YAML merge keys** (`<<: *anchor`, or a list) are resolved inside the
   strict block: merged values apply and merged keys are checked like
   direct ones.

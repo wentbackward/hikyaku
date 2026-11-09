@@ -433,6 +433,10 @@ routes:
 
 …in a single, readable config block.
 
+**`Accept-Encoding` is not configurable**
+
+The proxy reads every response body (usage metering, stream loop detection, capture), so it owns the upstream encoding negotiation: every proxied request asks the upstream for `Accept-Encoding: identity`, set after the header rules. The caller's `Accept-Encoding` is not forwarded, and a rule that adds or renames into `Accept-Encoding` has no effect. Clients receive uncompressed responses. See [security](security.md#response-encoding) for how an upstream that compresses anyway is handled.
+
 **Quirk: `X-Forwarded-For` removal**
 
 `httputil.ReverseProxy` auto-appends the client IP to `X-Forwarded-For` after the request leaves the proxy's hands. The standard library's documented opt-out is to set the slot to nil, which the proxy does internally when you list `X-Forwarded-For` under `remove`. Operators just need to add it to `remove` like any other header — the special handling is invisible.
@@ -783,15 +787,10 @@ measured (the tokens are already spent).
 A channel trips at most once per choice per stream; in shadow mode it
 keeps recording ratios afterwards.
 
-**Encoding.** The proxy reads the stream's bytes, so on a guarded
-stream it does not forward the caller's `Accept-Encoding`: the upstream
-answers uncompressed, or with gzip that Go's transport decodes before
-the proxy reads it. A backend or route `headers` rule that sets
-`Accept-Encoding` still wins; if the answer then arrives in an encoding
-the proxy cannot read, the stream passes through unmeasured and is
-counted in `hikyaku_stream_loop_unguarded_total{reason="content_encoding"}`
-with one `stream_loop_unguarded` log line (no text). SSE `data:` fields
-are read with or without the space after the colon.
+**Encoding.** Every stream the guard reads is plain text: the proxy asks
+the upstream for an uncompressed answer and decodes gzip or deflate
+before the guard (see [response encoding](security.md#response-encoding)).
+SSE `data:` fields are read with or without the space after the colon.
 
 **Accounting.** An aborted stream never receives the upstream's final
 usage chunk, so its token counts are partial or zero; they are never
