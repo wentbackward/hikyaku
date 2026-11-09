@@ -16,7 +16,9 @@ import (
 // message, as fmt.Errorf would produce, and it also keeps the format and
 // arguments so the log can render it without the values (SafeError). A config
 // value may be a secret typed into the wrong field, and validation messages
-// quote values, so at levels 0-2 every string argument is shown as its length.
+// quote values, so at levels 0-2 every string argument is shown as its
+// length, except one marked logSafe (a config identifier, the file's path),
+// which is shown as is.
 type Error struct {
 	format string
 	args   []any
@@ -53,8 +55,12 @@ func (e *Error) SafeError() string {
 	return fmt.Sprintf(strings.ReplaceAll(e.format, "%w", "%s"), args...)
 }
 
-// logSafe marks a string argument that is not a config value (the config
-// file's path, the name of the input): SafeError shows it as is.
+// logSafe marks a string argument that is not a config value: a config
+// identifier (backend id, route virtual_model, alias, block or key name) or
+// the config file's path or input name. SafeError shows it as is, so it
+// appears in the log at every level and in every build, hardened included;
+// identifiers name the entry an operator must fix and are logged per request
+// anyway.
 type logSafe string
 
 func safeArg(a any) any {
