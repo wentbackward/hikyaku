@@ -27,6 +27,7 @@ package hikyaku
 import (
 	"crypto/tls"
 	"net/http"
+	"net/url"
 
 	"github.com/wentbackward/hikyaku/internal/capture"
 	"github.com/wentbackward/hikyaku/internal/config"
@@ -259,6 +260,18 @@ func NewJournal(otlpEndpoint string) (*Journal, error) {
 func ApplyLogLevel(cfg *Config) {
 	logger.Apply(cfg.Server.LogLevel)
 }
+
+// SafeErr renders err for a log line at levels 0-2, as the proxy logs its
+// own errors: every quoted span (Go's HTTP transport quotes the bytes a
+// non-HTTP peer sent; the YAML decoder quotes the offending scalar, which
+// may be a secret) becomes <quoted len=N>, and a *url.Error's URL is shown
+// as scheme, host and path only. Embedders use it for config load, reload
+// and outbound errors they log themselves. See docs/logging.md.
+func SafeErr(err error) string { return logger.SafeErr(err) }
+
+// SafeURL renders u for a log line: scheme, host and path only, never user
+// info (a credential), a query string (caller text) or a fragment.
+func SafeURL(u *url.URL) string { return logger.SafeURL(u) }
 
 // ClientTLSConfig builds the outbound (proxy→backend) TLS config for the given
 // minimum version: nil in inspect builds (Go defaults) and a pinned floor in

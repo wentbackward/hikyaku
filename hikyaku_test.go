@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -216,5 +217,27 @@ func TestFacade_ParseConfigWithLookup(t *testing.T) {
 
 	if _, err := hikyaku.ParseConfigWithLookup(raw, nil); err == nil {
 		t.Fatal("a nil lookup must be refused")
+	}
+}
+
+// SafeErr and SafeURL give embedders the proxy's log-safe renderings: a
+// config error from the facade's own parser loses its quoted value but keeps
+// its position, and URLs lose user info and query strings.
+func TestFacade_SafeErrAndSafeURL(t *testing.T) {
+	_, err := hikyaku.ParseConfig([]byte("server:\n  allow_plaintext: true\nbackends:\n  - id: be\n    type: openai\n    base_url: http://127.0.0.1:1\n    max_concurrency: sk-hunter2-secret\n"))
+	if err == nil {
+		t.Fatal("ParseConfig accepted a string max_concurrency")
+	}
+	got := hikyaku.SafeErr(err)
+	if strings.Contains(got, "sk-hun") || !strings.Contains(got, "line 7") || !strings.Contains(got, "<quoted len=") {
+		t.Errorf("SafeErr(config error) = %q, want the position without the value", got)
+	}
+	ue := &url.Error{Op: "Post", URL: "http://u:pw@h:1/v1?q=secret", Err: errors.New(`malformed HTTP response "secret body"`)}
+	if got, want := hikyaku.SafeErr(ue), "Post http://h:1/v1: malformed HTTP response <quoted len=11>"; got != want {
+		t.Errorf("SafeErr(url.Error) = %q, want %q", got, want)
+	}
+	u, _ := url.Parse("https://u:pw@h/base?key=secret#f")
+	if got, want := hikyaku.SafeURL(u), "https://h/base"; got != want {
+		t.Errorf("SafeURL = %q, want %q", got, want)
 	}
 }
