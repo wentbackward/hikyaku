@@ -504,3 +504,24 @@ func TestCredentials_ConnectionListedCallerHeadersAreDropped(t *testing.T) {
 		t.Errorf("X-Keep = %q, want k", v)
 	}
 }
+
+// Every Connection key is read before anything is deleted: with two
+// case-variant keys, one listing the other, the names the second lists are
+// still dropped. (Deleting while iterating would skip the second key on some
+// map orders, so the check repeats.)
+func TestDropConnectionHeaders_CaseVariantKeysAllHonored(t *testing.T) {
+	for i := 0; i < 64; i++ {
+		h := http.Header{
+			"Connection": {"connection, X-Hop-A"},
+			"connection": {"X-Hop-B"},
+			"X-Hop-A":    {"a"},
+			"x-hop-b":    {"b"},
+			"X-Keep":     {"k"},
+		}
+		dropConnectionHeaders(h)
+		want := http.Header{"X-Keep": {"k"}}
+		if len(h) != len(want) || h.Get("X-Keep") != "k" {
+			t.Fatalf("iteration %d: headers after drop = %v, want only X-Keep", i, h)
+		}
+	}
+}

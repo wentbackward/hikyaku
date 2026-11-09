@@ -1090,19 +1090,27 @@ func safeHeaders(h http.Header) map[string]string {
 // key and any rule header the Director set. Doing it first leaves nothing
 // for that later pass to act on. This also ends protocol upgrades, which the
 // proxy does not support: every request is a buffered JSON body.
+//
+// The names are collected from every Connection key (any case) before
+// anything is deleted: deleting while iterating could remove a Connection key
+// not yet visited, and the names it lists would survive.
 func dropConnectionHeaders(h http.Header) {
+	var listed []string
 	for k, vs := range h {
 		if http.CanonicalHeaderKey(k) != "Connection" {
 			continue
 		}
+		listed = append(listed, k)
 		for _, v := range vs {
 			for _, name := range strings.Split(v, ",") {
 				if name = strings.TrimSpace(name); name != "" {
-					deleteHeaderAnyCase(h, name)
+					listed = append(listed, name)
 				}
 			}
 		}
-		delete(h, k)
+	}
+	for _, name := range listed {
+		deleteHeaderAnyCase(h, name)
 	}
 }
 
