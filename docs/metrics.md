@@ -32,16 +32,28 @@ response (or, for streams, from the final usage-bearing event or object):
 | `anthropic` | `usage.input_tokens` | `usage.output_tokens` |
 | `ollama` | `prompt_eval_count` | `eval_count` (chat, generate and embed lanes) |
 
-Anthropic's `input_tokens` **excludes** prompt-cache traffic, and the cache
-classes (`cache_read_input_tokens`, `cache_creation_input_tokens`) are
-deliberately **not** exported to Prometheus: `llm_prompt_tokens_total` keeps
-its documented meaning (the provider's uncached prompt count) rather than
-silently changing to a total that mixes three differently-priced classes. The
-per-class figures are delivered per request to an embedder through the
-`WithUsageObserver` seam (`UsageEvent.PromptTokens`, `CacheReadTokens`,
-`CacheWriteTokens`), where they can be priced and aggregated per principal.
-OpenAI's `prompt_tokens_details.cached_tokens` is a subset of `prompt_tokens`
-(already counted) and is not reported separately.
+The prompt-cache classes are deliberately **not** exported to Prometheus:
+`llm_prompt_tokens_total` keeps its documented meaning (the provider's own
+prompt field, as in the table) rather than silently changing to a figure
+that mixes differently-priced classes. That field means different things
+per lane: Anthropic's `input_tokens` **excludes** prompt-cache traffic,
+while OpenAI-lane `prompt_tokens` (OpenAI, Moonshot) **includes** it.
+
+The per-class figures are delivered per request to an embedder through the
+`WithUsageObserver` seam, where they can be priced and aggregated per
+principal. There every lane means the same thing, so total input is
+`PromptTokens + CacheReadTokens + CacheWriteTokens`:
+
+| `UsageEvent` field | `anthropic` | `openai` | `ollama` |
+|---|---|---|---|
+| `PromptTokens` (uncached input) | `input_tokens` | `prompt_tokens` minus both cache classes (never below 0) | `prompt_eval_count` |
+| `CacheReadTokens` | `cache_read_input_tokens` | `prompt_tokens_details.cached_tokens`; when that key is absent or null, top-level `cached_tokens` (Moonshot) | 0 |
+| `CacheWriteTokens` | `cache_creation_input_tokens` | `prompt_tokens_details.cache_write_tokens` (Moonshot) | 0 |
+| `CompletionTokens` | `output_tokens` | `completion_tokens` | `eval_count` |
+| `ReasoningTokens` (informational, already inside `CompletionTokens`) | 0 | `completion_tokens_details.reasoning_tokens` | 0 |
+
+Streamed OpenAI-lane responses carry these in the final usage chunk
+(`"choices": []`), which core requests with `stream_options.include_usage`.
 
 ## Per-request usage events
 
