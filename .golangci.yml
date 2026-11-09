@@ -47,6 +47,7 @@ linters:
         main:
           files:
             - $all
+            - "!$test"
           allow:
             - $gostd
             - github.com/wentbackward/hikyaku
@@ -54,7 +55,20 @@ linters:
             - go.opentelemetry.io
             - github.com/prometheus/client_golang
             - golang.org/x/sys/unix  # hardened-build process protections (mlock, prctl, rlimit)
-            - go/ast     # source-scan tests ($gostd omits the go/* packages)
+          deny:
+            - pkg: io/ioutil
+              desc: deprecated since Go 1.16; use io or os
+        test:
+          files:
+            - $test
+          allow:
+            - $gostd
+            - github.com/wentbackward/hikyaku
+            - gopkg.in/yaml.v3
+            - go.opentelemetry.io
+            - github.com/prometheus/client_golang
+            - golang.org/x/sys/unix
+            - go/ast     # source-scan tests only ($gostd omits the go/* packages)
             - go/parser
             - go/token
           deny:
