@@ -309,3 +309,24 @@ func TestIsBackendHealthy_UnknownBackendIsFalse(t *testing.T) {
 		t.Error("an unknown backend id must not report healthy")
 	}
 }
+
+// Without WithTransport, the alive checker shares the probe transport the
+// health client builds (the build's TLS floor, no HTTP_PROXY) instead of
+// falling back to Go's default transport.
+func TestNew_WithoutTransport_AliveCheckerSharesProbeTransport(t *testing.T) {
+	b := New(&config.Config{})
+	defer b.Stop()
+	if b.ac.client.Transport == nil {
+		t.Fatal("alive checker has no transport: it would use http.DefaultTransport, which honors HTTP_PROXY")
+	}
+	if b.ac.client.Transport != b.hc.transport {
+		t.Fatalf("alive checker transport %T is not the probe transport %T", b.ac.client.Transport, b.hc.transport)
+	}
+	tr, ok := b.hc.transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("probe transport = %T, want *http.Transport", b.hc.transport)
+	}
+	if tr.Proxy != nil {
+		t.Error("probe transport must not consult a proxy (HTTP_PROXY)")
+	}
+}

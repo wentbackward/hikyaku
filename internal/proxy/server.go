@@ -455,6 +455,14 @@ func (s *Server) acquireSemaphore(ctx context.Context, backendID string) (releas
 	}
 }
 
+// OutboundTransport returns the RoundTripper every request to a backend goes
+// through: live traffic, the balancer's probes and /api/tags. It is the
+// transport an embedder's TransportFactory supplied, or core's default (the
+// build's TLS floor, the configured pool, no HTTP_PROXY). An embedder sends its
+// own backend requests — startup probes, say — through it, so they reach a
+// backend exactly as the proxy does.
+func (s *Server) OutboundTransport() http.RoundTripper { return s.transport }
+
 // Config returns the current config (for use by main.go probes etc.)
 func (s *Server) Config() *config.Config {
 	return s.state.Load().cfg
