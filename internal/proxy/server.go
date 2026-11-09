@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -598,9 +599,15 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 
 	// ── L2: log incoming headers, L3: log body preview ────────────────────
 	logger.Headers("[%s] %s %s", rid, r.Method, r.URL.Path)
-	for k, vs := range r.Header {
-		for _, v := range vs {
-			logger.Headers("[%s]   %s: %s", rid, k, v)
+	if logger.Get() >= logger.LevelHeaders {
+		logged := safeHeaders(r.Header)
+		names := make([]string, 0, len(logged))
+		for k := range logged {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		for _, k := range names {
+			logger.Headers("[%s]   %s: %s", rid, k, logged[k])
 		}
 	}
 	preview := rawBody
@@ -1053,23 +1060,38 @@ func rawJSON(b []byte) json.RawMessage {
 	return json.RawMessage(q)
 }
 
-// safeHeaders returns a copy of h with sensitive values redacted.
+// safeHeaders returns a copy of h with sensitive values redacted: every
+// credential header (config.CredentialHeaders) and Set-Cookie.
 func safeHeaders(h http.Header) map[string]string {
 	out := make(map[string]string, len(h))
 	for k, vs := range h {
-		switch strings.ToLower(k) {
-		case "authorization", "x-api-key", "cookie", "set-cookie", "proxy-authorization":
+		if config.IsCredentialHeader(k) || http.CanonicalHeaderKey(k) == "Set-Cookie" {
 			out[k] = "[redacted]"
-		default:
-			out[k] = strings.Join(vs, ", ")
+			continue
 		}
+		out[k] = strings.Join(vs, ", ")
 	}
 	return out
+}
+
+// stripCredentials deletes every credential header (config.CredentialHeaders)
+// from h.
+func stripCredentials(h http.Header) {
+	for _, name := range config.CredentialHeaders() {
+		h.Del(name)
+	}
 }
 
 // director returns an httputil.ReverseProxy Director that rewrites the request
 // for the given backend. If pathOverride is non-empty, it replaces the request
 // path (used by completions/embeddings to force the backend path).
+//
+// Credentials: every caller credential header is stripped first, then only
+// the backend's own api_key is set, in its lane's header (a backend without
+// api_key gets none). The header rules run after that, so an operator's add
+// still sends a static credential, while a rename never moves a value out of
+// or into a credential header (applyHeaderOps). The body is the buffered
+// one, sent with a Content-Length: no chunking and no caller trailers.
 //
 // Accept-Encoding is set after the header operations: the proxy reads every
 // response body, so it asks for identity whatever the caller or a headers
@@ -1084,6 +1106,7 @@ func director(target *url.URL, backend *config.Backend, body []byte, pathOverrid
 			endpointPath = pathOverride
 		}
 		req.URL.Path = joinUpstreamPath(target.Path, endpointPath, backend.Type, backend.URLJoin)
+		stripCredentials(req.Header)
 		// Auth headers — auth_type overrides the default for the backend type.
 		// Default: "x-api-key" for anthropic, "bearer" for openai.
 		// Explicit "bearer" is needed for OAuth tokens on Anthropic.
@@ -1108,9 +1131,15 @@ func director(target *url.URL, backend *config.Backend, body []byte, pathOverrid
 		}
 
 		req.Body = io.NopCloser(bytes.NewReader(body))
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}
 		req.ContentLength = int64(len(body))
+		req.TransferEncoding = nil
+		req.Trailer = nil
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Del("Transfer-Encoding")
+		req.Header.Del("Trailer")
 
 		// Header manipulation: backend-level first (infrastructure), then
 		// route-level (request-specific) so route wins on conflict.
@@ -1222,8 +1251,13 @@ func routeHeaders(res *router.Resolution) config.HeadersOp {
 // rename → remove → add. Header names are case-insensitive (http.Header
 // canonicalises). Add overwrites; Remove drops; Rename copies values to the
 // new name and deletes the original (replacing the destination if it exists).
+// A rename out of or into a credential header is skipped (config warns at
+// load): it would forward a caller value as, or from, a credential.
 func applyHeaderOps(h http.Header, op config.HeadersOp) {
 	for src, dst := range op.Rename {
+		if config.IsCredentialHeader(src) || config.IsCredentialHeader(dst) {
+			continue
+		}
 		// Get returns the first value; use values for the full set.
 		vs := h.Values(src)
 		if len(vs) == 0 {

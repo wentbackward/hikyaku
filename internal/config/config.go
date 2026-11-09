@@ -142,14 +142,17 @@ func (s SystemPromptOp) IsZero() bool {
 }
 
 // HeadersOp manipulates outbound HTTP headers before forwarding to the
-// backend. Operations apply in the order: rename → remove → add. This lets
-// an operator rename Authorization → X-Original-Auth, then add a new
-// Authorization, in one block.
+// backend. Operations apply in the order: rename → remove → add, after the
+// proxy has stripped the caller's credential headers and set the backend's
+// own credential.
 //
 // Header names are case-insensitive (Go's http.Header normalizes them).
-// Add overwrites any existing value at that name. Remove drops the header
-// entirely. Rename copies the existing values to the new name and deletes
-// the original; if the destination already exists, it is replaced.
+// Add overwrites any existing value at that name (an operator's static
+// credential included). Remove drops the header entirely. Rename copies the
+// existing values to the new name and deletes the original; if the
+// destination already exists, it is replaced. A rename out of or into a
+// credential header (CredentialHeaders) has no effect, so a caller value
+// never reaches a backend as, or from, a credential.
 type HeadersOp struct {
 	Add    map[string]string `yaml:"add"`    // name → value
 	Remove []string          `yaml:"remove"` // names to drop
@@ -297,6 +300,7 @@ func parse(raw []byte, source string) (*Config, error) {
 	}
 	deprecateLoopDetection(&cfg)
 	warnIgnoredAcceptEncoding(&cfg)
+	warnIgnoredCredentialRename(&cfg)
 
 	cfg.backendByID = make(map[string]*Backend, len(cfg.Backends))
 	for i := range cfg.Backends {

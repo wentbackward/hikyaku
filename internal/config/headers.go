@@ -51,10 +51,50 @@ func warnIgnoredAcceptEncoding(cfg *Config) {
 		acceptEncodingHeader, strings.Join(where, ", ")))
 }
 
-// Warnings returns notices about configuration that loads but has no effect.
-// The caller logs them (the proxy server does, on start and on every reload).
+// renamesCredential reports whether op renames a header out of or into a
+// credential header. Such a rename has no effect: the proxy strips the
+// caller's credentials before the rules run, and never turns a caller value
+// into an upstream credential.
+func (h HeadersOp) renamesCredential() bool {
+	for src, dst := range h.Rename {
+		if IsCredentialHeader(src) || IsCredentialHeader(dst) {
+			return true
+		}
+	}
+	return false
+}
+
+// warnIgnoredCredentialRename records one warning listing every backend and
+// route whose headers rule renames out of or into a credential header. The
+// rule still loads, so existing configs keep working; that rename has no
+// effect.
+func warnIgnoredCredentialRename(cfg *Config) {
+	var where []string
+	for i := range cfg.Backends {
+		if cfg.Backends[i].Headers.renamesCredential() {
+			where = append(where, fmt.Sprintf("backend %q", cfg.Backends[i].ID))
+		}
+	}
+	for i := range cfg.Routes {
+		if cfg.Routes[i].Headers.renamesCredential() {
+			where = append(where, fmt.Sprintf("route %q", cfg.Routes[i].VirtualModel))
+		}
+	}
+	if len(where) == 0 {
+		return
+	}
+	cfg.warnings = append(cfg.warnings, fmt.Sprintf(
+		"headers renames out of or into a credential header (%s) are ignored (set in: %s): "+
+			"caller credentials never reach a backend; send a static credential with add, "+
+			"or the backend's api_key (docs/security.md#upstream-credentials)",
+		strings.Join(credentialHeaders, ", "), strings.Join(where, ", ")))
+}
+
+// Warnings returns notices about configuration that loads but has no effect
+// (a copy; the caller may keep or change it). The caller logs them (the
+// proxy server does, on start and on every reload).
 func (c *Config) Warnings() []string {
-	return c.warnings
+	return append([]string(nil), c.warnings...)
 }
 
 // credentialHeaders are the request headers that carry a credential. The
