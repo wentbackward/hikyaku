@@ -82,3 +82,32 @@ func TestEmptyDocumentAndNilLookup_RenderAsIs(t *testing.T) {
 		}
 	}
 }
+
+// Config identifiers (backend ids, route names, aliases) are shown, so a
+// hardened operator can find the offending entry; values stay lengths.
+func TestParseErrors_ShowIdentifiersHideValues(t *testing.T) {
+	cases := map[string]struct{ yaml, want string }{
+		"bad type": {
+			"backends:\n  - id: be-1\n    type: " + secretValue + "\n    base_url: http://h\n",
+			`backend "be-1": type must be openai, anthropic, or ollama, got "<len=17>"`,
+		},
+		"unknown backend": {
+			"backends:\n  - id: be-1\n    type: openai\n    base_url: http://h\nroutes:\n  - virtual_model: fast\n    backend: nope\n    real_model: x\n",
+			`route "fast": unknown backend "nope"`,
+		},
+		"alias collision": {
+			"backends:\n  - id: be-1\n    type: openai\n    base_url: http://h\nroutes:\n  - virtual_model: fast\n    backend: be-1\n    real_model: x\n  - virtual_model: slow\n    alias: [fast]\n    backend: be-1\n    real_model: y\n",
+			`route "slow": alias "fast" collides`,
+		},
+	}
+	for name, c := range cases {
+		_, err := Parse([]byte(c.yaml))
+		if err == nil {
+			t.Errorf("%s: Parse accepted the config", name)
+			continue
+		}
+		if got := logger.SafeErr(err); !strings.Contains(got, c.want) {
+			t.Errorf("%s: SafeErr = %q, want it to contain %q", name, got, c.want)
+		}
+	}
+}

@@ -107,6 +107,23 @@ func TestSafeErr_UnknownIsTypeAndLength(t *testing.T) {
 	if got := SafeErr(mime); !strings.HasSuffix(got, " reason=malformed_MIME_header_line>") {
 		t.Errorf("SafeErr(mime) = %q, want the reason named", got)
 	}
+	// A phrase the peer puts further into the text cannot choose the reason.
+	for _, e := range []error{
+		errors.New("upstream said: broken pipe and malformed HTTP response"),
+		fmt.Errorf("wrapped: %w", errors.New("prefix malformed MIME header line: x")),
+		errors.New("http: x malformed HTTP response"),
+	} {
+		if got := SafeErr(e); strings.Contains(got, "reason=") {
+			t.Errorf("SafeErr(%q) = %q, a phrase not at the start chose the reason", e, got)
+		}
+	}
+	// The phrase opening a link's own text, after a package prefix, is named.
+	if got := SafeErr(fmt.Errorf("net/http: TLS handshake timeout")); !strings.HasSuffix(got, " reason=TLS_handshake_timeout>") {
+		t.Errorf("SafeErr(prefixed phrase) = %q", got)
+	}
+	if got := SafeErr(fmt.Errorf("net/http: HTTP/1.x transport connection broken: %w", errors.New("peer bytes"))); !strings.HasSuffix(got, " reason=HTTP/1.x_transport_connection_broken>") {
+		t.Errorf("SafeErr(wrapper phrase) = %q", got)
+	}
 	// A known type nested in an unknown url.Error cause still hides the cause's text.
 	got := SafeErr(&url.Error{Op: "Get", URL: "http://h/", Err: errors.New("malformed " + secret)})
 	if strings.Contains(got, secret) || !strings.HasPrefix(got, "Get http://h/: <error type=") {

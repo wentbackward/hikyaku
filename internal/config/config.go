@@ -190,7 +190,7 @@ func (a *AliasList) UnmarshalYAML(node *yaml.Node) error {
 			return nil
 		}
 		if strings.ContainsAny(v, " \t") {
-			return errorf("alias %q looks like multiple names — use a YAML list: alias: [a, b]", v)
+			return errorf("alias %q looks like multiple names — use a YAML list: alias: [a, b]", logSafe(v))
 		}
 		*a = AliasList{v}
 		return nil
@@ -416,7 +416,7 @@ func normalizeMapToList(yamlText, blockName, keyField string) (string, error) {
 		}
 
 		// Neither pure map nor pure sequence — mixed format
-		return "", errorf("%s: mixed map and list syntax detected. Use either all map keys (e.g. 'foo:') or all list items (e.g. '- id: foo'), not both", blockName)
+		return "", errorf("%s: mixed map and list syntax detected. Use either all map keys (e.g. 'foo:') or all list items (e.g. '- id: foo'), not both", logSafe(blockName))
 	}
 
 	result, err := yaml.Marshal(&doc)
@@ -445,10 +445,10 @@ func expandPorts(backends []Backend) ([]Backend, error) {
 			continue
 		}
 		if !strings.Contains(b.ID, "{port}") {
-			return nil, errorf("backend %q: id must contain {port} when ports is set", b.ID)
+			return nil, errorf("backend %q: id must contain {port} when ports is set", logSafe(b.ID))
 		}
 		if !strings.Contains(b.BaseURL, "{port}") {
-			return nil, errorf("backend %q: base_url must contain {port} when ports is set", b.ID)
+			return nil, errorf("backend %q: base_url must contain {port} when ports is set", logSafe(b.ID))
 		}
 		for _, port := range b.Ports {
 			ps := strconv.Itoa(port)
@@ -574,20 +574,20 @@ func validateBackends(backends []Backend) (map[string]bool, error) {
 			return nil, errorf("backend missing id")
 		}
 		if b.BaseURL == "" {
-			return nil, errorf("backend %q: base_url required", b.ID)
+			return nil, errorf("backend %q: base_url required", logSafe(b.ID))
 		}
 		if b.Type != "openai" && b.Type != "anthropic" && b.Type != "ollama" {
-			return nil, errorf("backend %q: type must be openai, anthropic, or ollama, got %q", b.ID, b.Type)
+			return nil, errorf("backend %q: type must be openai, anthropic, or ollama, got %q", logSafe(b.ID), b.Type)
 		}
 		switch b.URLJoin {
 		case "", "openai", "rfc3986":
 			// ok; "" means default (openai) at use site
 		default:
-			return nil, errorf("backend %q: url_join must be openai or rfc3986, got %q", b.ID, b.URLJoin)
+			return nil, errorf("backend %q: url_join must be openai or rfc3986, got %q", logSafe(b.ID), b.URLJoin)
 		}
 		if b.Default {
 			if defaultID != "" {
-				return nil, errorf("multiple backends marked default: %q and %q", defaultID, b.ID)
+				return nil, errorf("multiple backends marked default: %q and %q", logSafe(defaultID), logSafe(b.ID))
 			}
 			defaultID = b.ID
 		}
@@ -604,22 +604,22 @@ func validateRoutes(routes []Route, backendIDs map[string]bool) error {
 			return errorf("route missing virtual_model")
 		}
 		if seen[r.VirtualModel] {
-			return errorf("duplicate virtual_model %q", r.VirtualModel)
+			return errorf("duplicate virtual_model %q", logSafe(r.VirtualModel))
 		}
 		seen[r.VirtualModel] = true
 
 		// backend: and backend_group: are mutually exclusive
 		if r.Backend != "" && r.BackendGroup != "" {
-			return errorf("route %q: must specify exactly one of backend or backend_group", r.VirtualModel)
+			return errorf("route %q: must specify exactly one of backend or backend_group", logSafe(r.VirtualModel))
 		}
 		if r.Backend == "" && r.BackendGroup == "" && r.AutoRoute == nil {
-			return errorf("route %q: must have backend, backend_group, or auto_route", r.VirtualModel)
+			return errorf("route %q: must have backend, backend_group, or auto_route", logSafe(r.VirtualModel))
 		}
 		if r.Backend != "" && !backendIDs[r.Backend] {
-			return errorf("route %q: unknown backend %q", r.VirtualModel, r.Backend)
+			return errorf("route %q: unknown backend %q", logSafe(r.VirtualModel), logSafe(r.Backend))
 		}
 		if r.AutoRoute != nil && (r.AutoRoute.Text == "" || r.AutoRoute.Vision == "") {
-			return errorf("route %q: auto_route requires text and vision", r.VirtualModel)
+			return errorf("route %q: auto_route requires text and vision", logSafe(r.VirtualModel))
 		}
 		// system_prompt: at most one of prepend / append / replace
 		set := 0
@@ -633,7 +633,7 @@ func validateRoutes(routes []Route, backendIDs map[string]bool) error {
 			set++
 		}
 		if set > 1 {
-			return errorf("route %q: system_prompt may set at most one of prepend/append/replace", r.VirtualModel)
+			return errorf("route %q: system_prompt may set at most one of prepend/append/replace", logSafe(r.VirtualModel))
 		}
 	}
 
@@ -643,10 +643,10 @@ func validateRoutes(routes []Route, backendIDs map[string]bool) error {
 		r := &routes[i]
 		for _, a := range r.Alias {
 			if a == "" {
-				return errorf("route %q: empty alias", r.VirtualModel)
+				return errorf("route %q: empty alias", logSafe(r.VirtualModel))
 			}
 			if seen[a] {
-				return errorf("route %q: alias %q collides with an existing virtual_model or alias", r.VirtualModel, a)
+				return errorf("route %q: alias %q collides with an existing virtual_model or alias", logSafe(r.VirtualModel), logSafe(a))
 			}
 			seen[a] = true
 		}

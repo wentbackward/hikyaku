@@ -47,10 +47,10 @@ func hardenedBackendPolicy(b *Backend) error {
 	}
 	u, err := url.Parse(b.BaseURL)
 	if err != nil {
-		return errorf("hardened build: backend %q: cannot parse base_url %q: %w", b.ID, b.BaseURL, err)
+		return errorf("hardened build: backend %q: cannot parse base_url %q: %w", logSafe(b.ID), b.BaseURL, err)
 	}
 	if !strings.EqualFold(u.Scheme, "https") {
-		return errorf("hardened build: openai backend %q must use an https:// base_url (got %q)", b.ID, b.BaseURL)
+		return errorf("hardened build: openai backend %q must use an https:// base_url (got %q)", logSafe(b.ID), b.BaseURL)
 	}
 	return nil
 }

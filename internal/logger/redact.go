@@ -53,8 +53,10 @@ type SafeError interface {
 //
 // An error with no known type in its chain renders as
 // <error type=T1,T2,... len=N> (the chain's types and the text's length,
-// plus "timeout" when it reports one and reason=<phrase> when its text
-// contains one of knownReasons), never its text.
+// plus "timeout" when it reports one and reason=<phrase> when a chain
+// link's own text opens with one of knownReasons), never its text. N is the
+// length of the full text, so it reflects the size of whatever the error
+// carries.
 func SafeErr(err error) string {
 	if err == nil {
 		return "<nil>"
@@ -72,20 +74,19 @@ func SafeErr(err error) string {
 		extra = " timeout"
 	}
 	text := err.Error()
-	for _, r := range knownReasons {
-		if strings.Contains(text, r) {
-			extra += " reason=" + strings.ReplaceAll(r, " ", "_")
-			break
-		}
+	if r := knownReason(err); r != "" {
+		extra += " reason=" + strings.ReplaceAll(r, " ", "_")
 	}
 	return fmt.Sprintf("<error type=%s len=%d%s>", strings.Join(types, ","), len(text), extra)
 }
 
-// knownReasons are fixed phrases of the standard library's untyped errors.
-// When an unknown error's text contains one, the rendering names the phrase,
-// which is this constant and never the text around it: the bytes the
-// library appends (a peer's reply, a header line) stay out of the log.
-// Longer phrases come first so the most specific one wins.
+// knownReasons are fixed phrases that open the standard library's untyped
+// errors. The rendering names a phrase only when a chain link's own text
+// (its text without its cause's, after a known package prefix) starts with
+// it, and prints this constant, never the error's text. A phrase further
+// into the text, where the library pastes a peer's bytes, is ignored, so a
+// peer cannot choose the reason. Longer phrases come first so the most
+// specific one wins.
 var knownReasons = []string{
 	"malformed MIME header initial line",
 	"malformed MIME header line",
@@ -95,14 +96,40 @@ var knownReasons = []string{
 	"server gave HTTP response to HTTPS client",
 	"timeout awaiting response headers",
 	"TLS handshake timeout",
+	"HTTP/1.x transport connection broken",
 	"invalid header field",
 	"too many transfer encodings",
 	"unsupported transfer encoding",
 	"bad Content-Length",
 	"invalid byte in chunk length",
-	"transport connection broken",
-	"connection reset by peer",
-	"broken pipe",
+}
+
+// knownPrefixes are package prefixes the standard library puts before its
+// error phrases.
+var knownPrefixes = []string{"net/http: ", "http: ", "net/textproto: "}
+
+// knownReason returns the phrase that opens the own text of the innermost
+// chain link that has one, or "".
+func knownReason(err error) string {
+	var links []error
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		links = append(links, e)
+	}
+	for i := len(links) - 1; i >= 0; i-- {
+		own := links[i].Error()
+		if i+1 < len(links) {
+			own = strings.TrimSuffix(own, links[i+1].Error())
+		}
+		for _, p := range knownPrefixes {
+			own = strings.TrimPrefix(own, p)
+		}
+		for _, r := range knownReasons {
+			if strings.HasPrefix(own, r) {
+				return r
+			}
+		}
+	}
+	return ""
 }
 
 // BodyErr logs err's full text on the body path (level 3; a no-op in

@@ -199,16 +199,16 @@ func validateStreamLoop(cfg *Config) error {
 			continue
 		}
 		if r.Defenders.StreamLoopDetection.Samples != nil {
-			return errorf("route %q: defenders.stream_loop_detection.samples is only valid under the global defenders block", r.VirtualModel)
+			return errorf("route %q: defenders.stream_loop_detection.samples is only valid under the global defenders block", logSafe(r.VirtualModel))
 		}
 		if err := cfg.GetStreamLoopDetection(r).validate(); err != nil {
-			return errorf("route %q: defenders.stream_loop_detection.%w", r.VirtualModel, err)
+			return errorf("route %q: defenders.stream_loop_detection.%w", logSafe(r.VirtualModel), err)
 		}
 	}
 	for i := range cfg.Backends {
 		b := &cfg.Backends[i]
 		if b.Defenders != nil && b.Defenders.StreamLoopDetection != nil {
-			return errorf("backend %q: defenders.stream_loop_detection is not supported on a backend; set it globally or per route", b.ID)
+			return errorf("backend %q: defenders.stream_loop_detection is not supported on a backend; set it globally or per route", logSafe(b.ID))
 		}
 	}
 	return nil
@@ -308,7 +308,7 @@ func allowKeys(n *yaml.Node, where string, allowed ...string) error {
 			continue
 		}
 		if !slices.Contains(allowed, k.Value) {
-			return errorf("line %d: %s: unknown key %q (allowed: %s)", k.Line, where, k.Value, strings.Join(allowed, ", "))
+			return errorf("line %d: %s: unknown key %q (allowed: %s)", k.Line, logSafe(where), k.Value, logSafe(strings.Join(allowed, ", ")))
 		}
 	}
 	return nil
@@ -329,7 +329,7 @@ func allowMergedKeys(v *yaml.Node, where string, allowed []string) error {
 		}
 		return nil
 	default:
-		return errorf("line %d: %s: a merge key (<<) must refer to a mapping or a list of mappings", v.Line, where)
+		return errorf("line %d: %s: a merge key (<<) must refer to a mapping or a list of mappings", v.Line, logSafe(where))
 	}
 }
 
