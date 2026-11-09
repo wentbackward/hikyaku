@@ -7,6 +7,7 @@ package proxy
 // traffic under -tags hardened.
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -42,6 +43,27 @@ func TestLog_HeaderLevelKeepsStructure(t *testing.T) {
 	} {
 		if !strings.Contains(run.log, want) {
 			t.Errorf("level-2 log missing %q:\n%s", want, run.log)
+		}
+	}
+}
+
+// The inspect build's [lb] lines name the affinity key only as a short hash,
+// for a header key and a first-user-message fingerprint alike.
+func TestLog_AffinityKeyLoggedAsHash(t *testing.T) {
+	run := runMarkerTraffic(t, "0")
+	lines := regexp.MustCompile(`\[lb\] group g1 +→ lb-[ab] +\(pool=2, affinity=([^)]*)\)`).FindAllStringSubmatch(run.log, -1)
+	if len(lines) != 4 {
+		t.Fatalf("want 4 [lb] selection lines, got %d:\n%s", len(lines), run.log)
+	}
+	hash := regexp.MustCompile(`^[0-9a-f]{8}$`)
+	for _, l := range lines {
+		if !hash.MatchString(l[1]) {
+			t.Errorf("affinity logged as %q, want an 8-hex-digit hash", l[1])
+		}
+	}
+	for _, l := range regexp.MustCompile(`\[lb\] affinity key=(\S*)`).FindAllStringSubmatch(run.log, -1) {
+		if !hash.MatchString(l[1]) {
+			t.Errorf("affinity key logged as %q, want an 8-hex-digit hash", l[1])
 		}
 	}
 }

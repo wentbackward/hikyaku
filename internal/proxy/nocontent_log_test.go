@@ -8,16 +8,20 @@ package proxy
 // carry request or response content, in either build.
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/wentbackward/hikyaku/internal/config"
 	"github.com/wentbackward/hikyaku/internal/logger"
+	"github.com/wentbackward/hikyaku/internal/telemetry"
 )
 
 // logMarker is the unique content marker. It stands for prompt text, tool
@@ -295,7 +299,109 @@ func runMarkerTraffic(t *testing.T, level string) markerRun {
 		upstream.Close()
 	}
 
+	// A peer that does not speak HTTP: Go's transport quotes the bytes it
+	// got back (malformed HTTP response / status code) in its error, which
+	// the proxy logs at levels 0 and 1.
+	for _, lane := range markerLanes {
+		for _, reply := range rawMarkerReplies {
+			for _, stream := range []bool{false, true} {
+				raw := startRawUpstream(t, reply)
+				s := newCredServer(t, raw, lane.backendType, "", "", "")
+				client.WriteString(sendMarkerRequest(t, s, lane.path, lane.request(stream)))
+			}
+		}
+	}
+
+	// Load-balanced routes: the affinity key is a caller header value or a
+	// fingerprint of the first user message, and the inspect build logs
+	// [lb] lines about it at level 0. Two requests each, so the second
+	// finds the first one's pin.
+	for _, key := range []string{"header:X-Session-ID", "first_user_message"} {
+		a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { markerLanes[0].ok(w, false) }))
+		b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { markerLanes[0].ok(w, false) }))
+		s := newGroupedMarkerServer(t, a.URL, b.URL, key)
+		for range 2 {
+			client.WriteString(sendMarkerRequest(t, s, "/v1/chat/completions", markerLanes[0].request(false)))
+		}
+		a.Close()
+		b.Close()
+	}
+
 	return markerRun{log: buf.String(), upstream: up.saw(), client: client.String()}
+}
+
+// rawMarkerReplies are answers from a peer that is not an HTTP server, both
+// echoing the marker: a JSON body with no status line, and a status line
+// whose code is not a number.
+var rawMarkerReplies = []string{
+	`{"error":"` + logMarker + `"}` + "\r\n",
+	"HTTP/1.1 " + logMarker + " echoed\r\nContent-Length: 0\r\n\r\n",
+}
+
+// startRawUpstream listens on loopback and answers every request with the
+// raw bytes reply, then closes the connection. It returns the base URL.
+func startRawUpstream(t *testing.T, reply string) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				if req, err := http.ReadRequest(bufio.NewReader(c)); err == nil {
+					_, _ = io.Copy(io.Discard, req.Body)
+				}
+				_, _ = c.Write([]byte(reply))
+			}(conn)
+		}
+	}()
+	return "http://" + ln.Addr().String()
+}
+
+// newGroupedMarkerServer builds a proxy whose route m balances over two
+// openai backends with the given affinity key, logging at the process level.
+func newGroupedMarkerServer(t *testing.T, urlA, urlB, affinityKey string) *Server {
+	t.Helper()
+	yaml := fmt.Sprintf(`
+server:
+  allow_plaintext: true
+backends:
+  - id: lb-a
+    type: openai
+    base_url: %q
+    group: g1
+  - id: lb-b
+    type: openai
+    base_url: %q
+    group: g1
+groups:
+  g1:
+    strategy: sticky_least_loaded
+    affinity:
+      key: %q
+      prefix_bytes: 1024
+      ttl_seconds: 3600
+      max_entries: 100
+    overload:
+      max_concurrency: 4
+routes:
+  - virtual_model: m
+    backend_group: g1
+    real_model: real-m
+`, urlA, urlB, affinityKey)
+	cfg, err := config.Load(writeTestConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	metrics, _, _ := telemetry.Init()
+	return New("test", "inspect", cfg, metrics, nil)
 }
 
 // sendMarkerRequest serves s on a loopback listener, posts body to path
@@ -316,6 +422,7 @@ func sendMarkerRequest(t *testing.T, s *Server, path, body string) string {
 	req.Header.Set("X-Title", logMarker+" title")
 	req.Header.Set("X-Auth-Token", logMarker+" token")
 	req.Header.Set("User-Agent", "marker-test/1.0 ("+logMarker+")")
+	req.Header.Set("X-Session-ID", logMarker+" session") // a header affinity key
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("POST %s: %v", path, err)
@@ -326,12 +433,12 @@ func sendMarkerRequest(t *testing.T, s *Server, path, body string) string {
 }
 
 // assertNoMarkerInLog fails with the offending lines when the log carries the
-// marker.
+// marker, in any letter case (a header affinity key is lowercased).
 func assertNoMarkerInLog(t *testing.T, run markerRun) {
 	t.Helper()
 	var leaks []string
 	for _, line := range strings.Split(run.log, "\n") {
-		if strings.Contains(line, logMarker) {
+		if strings.Contains(strings.ToLower(line), strings.ToLower(logMarker)) {
 			leaks = append(leaks, line)
 		}
 	}
