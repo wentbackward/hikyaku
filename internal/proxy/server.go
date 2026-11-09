@@ -252,7 +252,7 @@ func New(version, buildMode string, cfg *config.Config, metrics *telemetry.Metri
 	s.buildSemaphores(cfg)
 	s.applyCaptureConfig(cfg)
 	s.applyLoopSamplerConfig(cfg)
-	logConfigDeprecations(cfg)
+	logConfigNotices(cfg)
 	// Apply options before anything that depends on them: the balancer's probes
 	// go through the outbound transport an option may replace. cfg is already
 	// stored, so options may read s.state.Load().cfg.
@@ -315,11 +315,14 @@ func (s *Server) applyLoopSamplerConfig(cfg *config.Config) {
 	}
 }
 
-// logConfigDeprecations logs each deprecation notice the loader recorded, so
-// an operator sees it once on start and once per reload.
-func logConfigDeprecations(cfg *config.Config) {
+// logConfigNotices logs each deprecation and warning notice the loader
+// recorded, so an operator sees it once on start and once per reload.
+func logConfigNotices(cfg *config.Config) {
 	for _, d := range cfg.Deprecations() {
 		log.Printf("[config] DEPRECATED: %s", d)
+	}
+	for _, w := range cfg.Warnings() {
+		log.Printf("[config] WARNING: %s", w)
 	}
 }
 
@@ -387,7 +390,7 @@ func (s *Server) reload(cfg *config.Config) {
 	}
 	s.applyCaptureConfig(cfg)
 	s.applyLoopSamplerConfig(cfg)
-	logConfigDeprecations(cfg)
+	logConfigNotices(cfg)
 
 	log.Printf("[reload] %d backends, %d routes", len(cfg.Backends), len(cfg.Routes))
 	for i := range cfg.Backends {

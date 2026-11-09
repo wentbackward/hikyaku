@@ -239,6 +239,7 @@ type Config struct {
 	backendByID  map[string]*Backend
 	routeByModel map[string]*Route
 	deprecations []string // notices for deprecated keys found at load
+	warnings     []string // notices for settings that load but have no effect
 }
 
 // ── Loader ────────────────────────────────────────────────────────────────────
@@ -295,6 +296,7 @@ func parse(raw []byte, source string) (*Config, error) {
 		return nil, err
 	}
 	deprecateLoopDetection(&cfg)
+	warnIgnoredAcceptEncoding(&cfg)
 
 	cfg.backendByID = make(map[string]*Backend, len(cfg.Backends))
 	for i := range cfg.Backends {
