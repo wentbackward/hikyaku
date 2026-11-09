@@ -195,7 +195,7 @@ The hardened tag **compiles out** (not just disables) the following:
 | LOG_LEVEL 4 (full content) | Active at level 4 | `Content()` is a no-op; level clamped at 2 |
 | Journal `system_text` | Up to 2KB per request | Empty |
 | Journal `last_user_text` | Up to 8KB per request | Empty |
-| Affinity-key log lines | `[lb] affinity key=…` printed | Compiled out — prompt fingerprints never logged |
+| Affinity-key log lines | `[lb] affinity key=…` printed as an 8-hex-digit SHA-256 prefix of the key | Compiled out — prompt fingerprints never logged |
 
 In addition to compiling out the exposure features above, the hardened build **adds** the following enforcement and memory protections:
 
