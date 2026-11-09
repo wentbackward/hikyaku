@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/wentbackward/hikyaku/internal/config"
+	"github.com/wentbackward/hikyaku/internal/logger"
 )
 
 // loopSamplesCompiledIn reports whether this build can write tripping-window
@@ -106,7 +107,7 @@ func (s *loopSampler) save(g *streamLoopGuard, t *loopTrip, window []byte, windo
 		}
 		if err != nil {
 			s.written.Add(-1)
-			log.Printf("[stream_loop] sample write failed for %s: %v", rec.RequestID, err)
+			log.Printf("[stream_loop] sample write failed for %s: %s", rec.RequestID, logger.SafeErr(err))
 		}
 	}()
 }

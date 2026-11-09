@@ -106,6 +106,14 @@ func (l reqLog) Body(format string, args ...interface{}) {
 	}
 }
 
+// BodyErr logs err's full text on the body path when it differs from its
+// level 0-2 rendering (logger.BodyErr), within this request's level.
+func (l reqLog) BodyErr(prefix string, err error) {
+	if l.level() >= logger.LevelBody {
+		logger.BodyErr(prefix, err)
+	}
+}
+
 func (l reqLog) Content(format string, args ...interface{}) {
 	if l.level() >= logger.LevelContent {
 		logger.Content(format, args...) // a no-op in hardened builds
@@ -179,6 +187,15 @@ func (e *AdmissionError) Error() string {
 
 func (e *AdmissionError) Unwrap() error { return e.Err }
 
+// SafeError renders the refusal for the log: the status and the hook's
+// error through logger.SafeErr.
+func (e *AdmissionError) SafeError() string {
+	if e.Err == nil {
+		return fmt.Sprintf("request not admitted (status %d)", e.Status)
+	}
+	return fmt.Sprintf("request not admitted (status %d): %s", e.Status, logger.SafeErr(e.Err))
+}
+
 // admit runs the admission hook, if any, for a request about to be served by
 // st. On refusal it writes the error response and returns false; the caller
 // must return without touching an upstream.
@@ -196,6 +213,7 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request, rid string, st *r
 		status = ae.Status
 	}
 	log.Printf("[proxy] [%s] %s %s not admitted (generation %d): %s", rid, r.Method, r.URL.Path, st.id, logger.SafeErr(err))
+	st.log.BodyErr("["+rid+"] not admitted, detail", err)
 	jsonError(w, "request not admitted", status)
 	return false
 }
@@ -458,7 +476,7 @@ func newCapture(cfg *config.Config) *capture.Capture {
 		MaxMessages:  cfg.SigMessageCapture.MaxMessages,
 	})
 	if err != nil {
-		log.Printf("[capture] init failed: %v (disabling)", err)
+		log.Printf("[capture] init failed: %s (disabling)", logger.SafeErr(err))
 		return nil
 	}
 	if c != nil {
@@ -475,7 +493,7 @@ func newConfiguredLoopSampler(cfg *config.Config) *loopSampler {
 	sc := cfg.StreamLoopSamples()
 	ls, err := newLoopSampler(sc)
 	if err != nil {
-		log.Printf("[stream_loop] samples disabled: %v", err)
+		log.Printf("[stream_loop] samples disabled: %s", logger.SafeErr(err))
 		ls = nil
 	}
 	switch {
@@ -586,6 +604,7 @@ func (s *Server) Reload(cfg *config.Config) {
 	defer s.reloadMu.Unlock()
 	if err := s.checkStartupFields(cfg); err != nil {
 		log.Printf("[reload] config rejected: %s (keeping old config)", logger.SafeErr(err))
+		logger.BodyErr("[reload] config rejected, detail", err)
 		return
 	}
 	s.reload(cfg)
@@ -1177,6 +1196,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 			rlog.Request("[%s] %s %s model=%s backend=%s url=%s status=502 dur=%.3fs ERROR: %v",
 				rid, r.Method, r.URL.Path, logVirtual, backendID, logger.SafeURL(r.URL), elapsed, logger.SafeErr(err))
 			log.Printf("[proxy] upstream error backend=%s: %v", backendID, logger.SafeErr(err))
+			rlog.BodyErr("["+rid+"] upstream error detail", err)
 			capCtx.finishError(t0, "upstream error: "+err.Error())
 			jsonError(w, "upstream error: "+err.Error(), http.StatusBadGateway)
 		},
@@ -1254,7 +1274,7 @@ func (c *captureCtx) finishSuccess(t0 time.Time, resp capture.ResponseSnapshot) 
 	c.payload.Response = resp
 	c.payload.Timing = timing(t0)
 	if err := c.slot.Write(c.payload); err != nil {
-		log.Printf("[capture] write failed for %s: %v", c.payload.RequestID, err)
+		log.Printf("[capture] write failed for %s: %s", c.payload.RequestID, logger.SafeErr(err))
 	}
 }
 
@@ -1266,7 +1286,7 @@ func (c *captureCtx) finishError(t0 time.Time, msg string) {
 	c.payload.Response = capture.ResponseSnapshot{Error: msg}
 	c.payload.Timing = timing(t0)
 	if err := c.slot.Write(c.payload); err != nil {
-		log.Printf("[capture] write failed for %s: %v", c.payload.RequestID, err)
+		log.Printf("[capture] write failed for %s: %s", c.payload.RequestID, logger.SafeErr(err))
 	}
 }
 

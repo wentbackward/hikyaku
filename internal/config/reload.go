@@ -78,6 +78,10 @@ type NonReloadableError struct {
 	Fields []string
 }
 
+// SafeError is Error: the fields are YAML paths from NonReloadableFields,
+// never config values.
+func (e *NonReloadableError) SafeError() string { return e.Error() }
+
 func (e *NonReloadableError) Error() string {
 	return fmt.Sprintf("config changes fields a reload cannot apply (restart to change them): %s",
 		strings.Join(e.Fields, ", "))

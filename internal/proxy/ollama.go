@@ -112,6 +112,7 @@ func (s *Server) handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("[proxy] /api/tags upstream error backend=%s: %v", backend.ID, logger.SafeErr(err))
+		st.log.BodyErr("[proxy] /api/tags upstream error detail", err)
 		jsonError(w, "upstream error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -119,6 +120,7 @@ func (s *Server) handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 
 	if _, err := decodeUpstreamBody(resp); err != nil {
 		log.Printf("[proxy] /api/tags upstream error backend=%s: %v", backend.ID, logger.SafeErr(err))
+		st.log.BodyErr("[proxy] /api/tags upstream error detail", err)
 		jsonError(w, err.Error(), http.StatusBadGateway)
 		return
 	}

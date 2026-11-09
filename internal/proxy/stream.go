@@ -832,9 +832,16 @@ func (b *idleTimeoutBody) Read(p []byte) (int, error) {
 	case <-b.timer.C:
 		// Close underlying reader to unblock readLoop goroutine
 		_ = b.rc.Close()
-		return 0, fmt.Errorf("backend idle timeout (%s)", b.timeout)
+		return 0, idleTimeoutError{b.timeout}
 	}
 }
+
+// idleTimeoutError is the read error of a backend that sent nothing for its
+// timeout_seconds. Its text is fixed apart from the configured duration.
+type idleTimeoutError struct{ timeout time.Duration }
+
+func (e idleTimeoutError) Error() string     { return fmt.Sprintf("backend idle timeout (%s)", e.timeout) }
+func (e idleTimeoutError) SafeError() string { return e.Error() }
 
 func (b *idleTimeoutBody) Close() error {
 	b.timer.Stop()

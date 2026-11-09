@@ -187,11 +187,11 @@ func overlayStreamLoopChannel(dst *StreamLoopChannel, src *StreamLoopChannelConf
 func validateStreamLoop(cfg *Config) error {
 	if g := cfg.Defenders.StreamLoopDetection; g != nil && g.Samples != nil && g.Samples.MaxSamples != nil {
 		if m := *g.Samples.MaxSamples; m < 0 || m > MaxStreamLoopMaxSamples {
-			return fmt.Errorf("defenders.stream_loop_detection.samples: max_samples must be between 0 and %d, got %d", MaxStreamLoopMaxSamples, m)
+			return errorf("defenders.stream_loop_detection.samples: max_samples must be between 0 and %d, got %d", MaxStreamLoopMaxSamples, m)
 		}
 	}
 	if err := cfg.GetStreamLoopDetection(nil).validate(); err != nil {
-		return fmt.Errorf("defenders.stream_loop_detection.%w", err)
+		return errorf("defenders.stream_loop_detection.%w", err)
 	}
 	for i := range cfg.Routes {
 		r := &cfg.Routes[i]
@@ -199,16 +199,16 @@ func validateStreamLoop(cfg *Config) error {
 			continue
 		}
 		if r.Defenders.StreamLoopDetection.Samples != nil {
-			return fmt.Errorf("route %q: defenders.stream_loop_detection.samples is only valid under the global defenders block", r.VirtualModel)
+			return errorf("route %q: defenders.stream_loop_detection.samples is only valid under the global defenders block", r.VirtualModel)
 		}
 		if err := cfg.GetStreamLoopDetection(r).validate(); err != nil {
-			return fmt.Errorf("route %q: defenders.stream_loop_detection.%w", r.VirtualModel, err)
+			return errorf("route %q: defenders.stream_loop_detection.%w", r.VirtualModel, err)
 		}
 	}
 	for i := range cfg.Backends {
 		b := &cfg.Backends[i]
 		if b.Defenders != nil && b.Defenders.StreamLoopDetection != nil {
-			return fmt.Errorf("backend %q: defenders.stream_loop_detection is not supported on a backend; set it globally or per route", b.ID)
+			return errorf("backend %q: defenders.stream_loop_detection is not supported on a backend; set it globally or per route", b.ID)
 		}
 	}
 	return nil
@@ -216,10 +216,10 @@ func validateStreamLoop(cfg *Config) error {
 
 func (d StreamLoopDetection) validate() error {
 	if err := d.Reasoning.validate(); err != nil {
-		return fmt.Errorf("channels.reasoning: %w", err)
+		return errorf("channels.reasoning: %w", err)
 	}
 	if err := d.Content.validate(); err != nil {
-		return fmt.Errorf("channels.content: %w", err)
+		return errorf("channels.content: %w", err)
 	}
 	return nil
 }
@@ -228,25 +228,25 @@ func (c StreamLoopChannel) validate() error {
 	switch c.Mode {
 	case StreamLoopAbort, StreamLoopShadow, StreamLoopOff:
 	default:
-		return fmt.Errorf("mode must be abort, shadow or off, got %q", c.Mode)
+		return errorf("mode must be abort, shadow or off, got %q", c.Mode)
 	}
 	if c.WindowChars < 1 || c.WindowChars > MaxStreamLoopWindowChars {
-		return fmt.Errorf("window_chars must be between 1 and %d, got %d", MaxStreamLoopWindowChars, c.WindowChars)
+		return errorf("window_chars must be between 1 and %d, got %d", MaxStreamLoopWindowChars, c.WindowChars)
 	}
 	if c.WarmupWindows < 0 {
-		return fmt.Errorf("warmup_windows must be >= 0, got %d", c.WarmupWindows)
+		return errorf("warmup_windows must be >= 0, got %d", c.WarmupWindows)
 	}
 	if c.ConsecutiveWindows < 1 {
-		return fmt.Errorf("consecutive_windows must be >= 1, got %d", c.ConsecutiveWindows)
+		return errorf("consecutive_windows must be >= 1, got %d", c.ConsecutiveWindows)
 	}
 	if !(c.Threshold > 0 && c.Threshold < 1) {
-		return fmt.Errorf("threshold must be in (0, 1), got %g", c.Threshold)
+		return errorf("threshold must be in (0, 1), got %g", c.Threshold)
 	}
 	if !(c.HardThreshold > 0 && c.HardThreshold < 1) {
-		return fmt.Errorf("hard_threshold must be in (0, 1), got %g", c.HardThreshold)
+		return errorf("hard_threshold must be in (0, 1), got %g", c.HardThreshold)
 	}
 	if c.HardThreshold > c.Threshold {
-		return fmt.Errorf("hard_threshold (%g) must be <= threshold (%g)", c.HardThreshold, c.Threshold)
+		return errorf("hard_threshold (%g) must be <= threshold (%g)", c.HardThreshold, c.Threshold)
 	}
 	return nil
 }
@@ -308,7 +308,7 @@ func allowKeys(n *yaml.Node, where string, allowed ...string) error {
 			continue
 		}
 		if !slices.Contains(allowed, k.Value) {
-			return fmt.Errorf("line %d: %s: unknown key %q (allowed: %s)", k.Line, where, k.Value, strings.Join(allowed, ", "))
+			return errorf("line %d: %s: unknown key %q (allowed: %s)", k.Line, where, k.Value, strings.Join(allowed, ", "))
 		}
 	}
 	return nil
@@ -329,7 +329,7 @@ func allowMergedKeys(v *yaml.Node, where string, allowed []string) error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("line %d: %s: a merge key (<<) must refer to a mapping or a list of mappings", v.Line, where)
+		return errorf("line %d: %s: a merge key (<<) must refer to a mapping or a list of mappings", v.Line, where)
 	}
 }
 

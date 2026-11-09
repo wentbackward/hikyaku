@@ -4,8 +4,6 @@ package config
 
 import (
 	"crypto/tls"
-	"errors"
-	"fmt"
 	"net/url"
 	"os"
 	"regexp"
@@ -21,10 +19,10 @@ var envVarRe = regexp.MustCompile(`\$\{([^}]+)\}`)
 // (empty, whitespace, or comments only). An empty config is never intentional
 // — it is what a SIGHUP reload sees when it races a non-atomic rewrite of the
 // file — so it is reported explicitly rather than loaded as "no backends".
-var ErrEmptyDocument = errors.New("empty document (no YAML content)")
+var ErrEmptyDocument = errorf("empty document (no YAML content)")
 
 // ErrNilLookup is returned by ParseWithLookup when it is given no resolver.
-var ErrNilLookup = errors.New("config: nil ${NAME} lookup function")
+var ErrNilLookup = errorf("config: nil ${NAME} lookup function")
 
 // ── Schema ────────────────────────────────────────────────────────────────────
 
@@ -83,12 +81,12 @@ func (p *PortRange) UnmarshalYAML(value *yaml.Node) error {
 		// Try as range "lo-hi"
 		parts := strings.SplitN(value.Value, "-", 2)
 		if len(parts) != 2 {
-			return fmt.Errorf("ports: invalid range %q (expected \"lo-hi\")", value.Value)
+			return errorf("ports: invalid range %q (expected \"lo-hi\")", value.Value)
 		}
 		lo, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
 		hi, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
 		if err1 != nil || err2 != nil || lo > hi {
-			return fmt.Errorf("ports: invalid range %q", value.Value)
+			return errorf("ports: invalid range %q", value.Value)
 		}
 		for i := lo; i <= hi; i++ {
 			*p = append(*p, i)
@@ -98,13 +96,13 @@ func (p *PortRange) UnmarshalYAML(value *yaml.Node) error {
 		for _, child := range value.Content {
 			n, err := strconv.Atoi(child.Value)
 			if err != nil {
-				return fmt.Errorf("ports: non-integer value %q", child.Value)
+				return errorf("ports: non-integer value %q", child.Value)
 			}
 			*p = append(*p, n)
 		}
 		return nil
 	default:
-		return fmt.Errorf("ports: expected number, list, or range string")
+		return errorf("ports: expected number, list, or range string")
 	}
 }
 
@@ -192,12 +190,12 @@ func (a *AliasList) UnmarshalYAML(node *yaml.Node) error {
 			return nil
 		}
 		if strings.ContainsAny(v, " \t") {
-			return fmt.Errorf("alias %q looks like multiple names — use a YAML list: alias: [a, b]", v)
+			return errorf("alias %q looks like multiple names — use a YAML list: alias: [a, b]", v)
 		}
 		*a = AliasList{v}
 		return nil
 	}
-	return fmt.Errorf("alias: expected a string or a list of strings")
+	return errorf("alias: expected a string or a list of strings")
 }
 
 type Route struct {
@@ -254,7 +252,7 @@ type Config struct {
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", path, err)
+		return nil, errorf("read %s: %w", logSafe(path), err)
 	}
 	return parse(raw, path, os.Getenv)
 }
@@ -294,7 +292,7 @@ func parse(raw []byte, source string, lookup func(string) string) (*Config, erro
 	// Allows: backends: {foo: {type: openai, ...}}  →  backends: [{id: foo, type: openai, ...}]
 	expanded, err := normalizeMapToList(expanded, "backends", "id")
 	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", source, err)
+		return nil, errorf("parse %s: %w", logSafe(source), err)
 	}
 	expanded, err = normalizeMapToList(expanded, "routes", "virtual_model")
 	if err != nil {
@@ -303,7 +301,7 @@ func parse(raw []byte, source string, lookup func(string) string) (*Config, erro
 
 	var cfg Config
 	if err := yaml.Unmarshal([]byte(expanded), &cfg); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
+		return nil, errorf("parse config: %w", yamlError{err})
 	}
 
 	cfg.Backends, err = expandPorts(cfg.Backends)
@@ -352,7 +350,7 @@ func parse(raw []byte, source string, lookup func(string) string) (*Config, erro
 func normalizeMapToList(yamlText, blockName, keyField string) (string, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal([]byte(yamlText), &doc); err != nil {
-		return yamlText, fmt.Errorf("normalizeMapToList: parse yaml: %w", err)
+		return yamlText, errorf("normalizeMapToList: parse yaml: %w", yamlError{err})
 	}
 
 	// The root node is a Document node containing a Mapping node. An empty
@@ -418,12 +416,12 @@ func normalizeMapToList(yamlText, blockName, keyField string) (string, error) {
 		}
 
 		// Neither pure map nor pure sequence — mixed format
-		return "", fmt.Errorf("%s: mixed map and list syntax detected. Use either all map keys (e.g. 'foo:') or all list items (e.g. '- id: foo'), not both", blockName)
+		return "", errorf("%s: mixed map and list syntax detected. Use either all map keys (e.g. 'foo:') or all list items (e.g. '- id: foo'), not both", blockName)
 	}
 
 	result, err := yaml.Marshal(&doc)
 	if err != nil {
-		return yamlText, fmt.Errorf("normalizeMapToList: marshal yaml: %w", err)
+		return yamlText, errorf("normalizeMapToList: marshal yaml: %w", err)
 	}
 	return strings.TrimSpace(string(result)), nil
 }
@@ -447,10 +445,10 @@ func expandPorts(backends []Backend) ([]Backend, error) {
 			continue
 		}
 		if !strings.Contains(b.ID, "{port}") {
-			return nil, fmt.Errorf("backend %q: id must contain {port} when ports is set", b.ID)
+			return nil, errorf("backend %q: id must contain {port} when ports is set", b.ID)
 		}
 		if !strings.Contains(b.BaseURL, "{port}") {
-			return nil, fmt.Errorf("backend %q: base_url must contain {port} when ports is set", b.ID)
+			return nil, errorf("backend %q: base_url must contain {port} when ports is set", b.ID)
 		}
 		for _, port := range b.Ports {
 			ps := strconv.Itoa(port)
@@ -545,7 +543,7 @@ func validate(cfg *Config) error {
 	case "", "1.2", "1.3":
 		// ok; "" means default (1.3) at use site
 	default:
-		return fmt.Errorf("server.min_tls_version must be \"1.2\" or \"1.3\", got %q", cfg.Server.MinTLSVersion)
+		return errorf("server.min_tls_version must be \"1.2\" or \"1.3\", got %q", cfg.Server.MinTLSVersion)
 	}
 	ids, err := validateBackends(cfg.Backends)
 	if err != nil {
@@ -573,23 +571,23 @@ func validateBackends(backends []Backend) (map[string]bool, error) {
 	for i := range backends {
 		b := &backends[i]
 		if b.ID == "" {
-			return nil, fmt.Errorf("backend missing id")
+			return nil, errorf("backend missing id")
 		}
 		if b.BaseURL == "" {
-			return nil, fmt.Errorf("backend %q: base_url required", b.ID)
+			return nil, errorf("backend %q: base_url required", b.ID)
 		}
 		if b.Type != "openai" && b.Type != "anthropic" && b.Type != "ollama" {
-			return nil, fmt.Errorf("backend %q: type must be openai, anthropic, or ollama, got %q", b.ID, b.Type)
+			return nil, errorf("backend %q: type must be openai, anthropic, or ollama, got %q", b.ID, b.Type)
 		}
 		switch b.URLJoin {
 		case "", "openai", "rfc3986":
 			// ok; "" means default (openai) at use site
 		default:
-			return nil, fmt.Errorf("backend %q: url_join must be openai or rfc3986, got %q", b.ID, b.URLJoin)
+			return nil, errorf("backend %q: url_join must be openai or rfc3986, got %q", b.ID, b.URLJoin)
 		}
 		if b.Default {
 			if defaultID != "" {
-				return nil, fmt.Errorf("multiple backends marked default: %q and %q", defaultID, b.ID)
+				return nil, errorf("multiple backends marked default: %q and %q", defaultID, b.ID)
 			}
 			defaultID = b.ID
 		}
@@ -603,25 +601,25 @@ func validateRoutes(routes []Route, backendIDs map[string]bool) error {
 	for i := range routes {
 		r := &routes[i]
 		if r.VirtualModel == "" {
-			return fmt.Errorf("route missing virtual_model")
+			return errorf("route missing virtual_model")
 		}
 		if seen[r.VirtualModel] {
-			return fmt.Errorf("duplicate virtual_model %q", r.VirtualModel)
+			return errorf("duplicate virtual_model %q", r.VirtualModel)
 		}
 		seen[r.VirtualModel] = true
 
 		// backend: and backend_group: are mutually exclusive
 		if r.Backend != "" && r.BackendGroup != "" {
-			return fmt.Errorf("route %q: must specify exactly one of backend or backend_group", r.VirtualModel)
+			return errorf("route %q: must specify exactly one of backend or backend_group", r.VirtualModel)
 		}
 		if r.Backend == "" && r.BackendGroup == "" && r.AutoRoute == nil {
-			return fmt.Errorf("route %q: must have backend, backend_group, or auto_route", r.VirtualModel)
+			return errorf("route %q: must have backend, backend_group, or auto_route", r.VirtualModel)
 		}
 		if r.Backend != "" && !backendIDs[r.Backend] {
-			return fmt.Errorf("route %q: unknown backend %q", r.VirtualModel, r.Backend)
+			return errorf("route %q: unknown backend %q", r.VirtualModel, r.Backend)
 		}
 		if r.AutoRoute != nil && (r.AutoRoute.Text == "" || r.AutoRoute.Vision == "") {
-			return fmt.Errorf("route %q: auto_route requires text and vision", r.VirtualModel)
+			return errorf("route %q: auto_route requires text and vision", r.VirtualModel)
 		}
 		// system_prompt: at most one of prepend / append / replace
 		set := 0
@@ -635,7 +633,7 @@ func validateRoutes(routes []Route, backendIDs map[string]bool) error {
 			set++
 		}
 		if set > 1 {
-			return fmt.Errorf("route %q: system_prompt may set at most one of prepend/append/replace", r.VirtualModel)
+			return errorf("route %q: system_prompt may set at most one of prepend/append/replace", r.VirtualModel)
 		}
 	}
 
@@ -645,10 +643,10 @@ func validateRoutes(routes []Route, backendIDs map[string]bool) error {
 		r := &routes[i]
 		for _, a := range r.Alias {
 			if a == "" {
-				return fmt.Errorf("route %q: empty alias", r.VirtualModel)
+				return errorf("route %q: empty alias", r.VirtualModel)
 			}
 			if seen[a] {
-				return fmt.Errorf("route %q: alias %q collides with an existing virtual_model or alias", r.VirtualModel, a)
+				return errorf("route %q: alias %q collides with an existing virtual_model or alias", r.VirtualModel, a)
 			}
 			seen[a] = true
 		}
@@ -721,7 +719,7 @@ func (c *Config) ValidateListenPolicy(opts ...ListenPolicyOption) error {
 	// GetCertificate) satisfies the TLS requirement without cert/key files.
 	gatewayTLS := pol.externalGatewayTLS || (c.Server.TLS.Cert != "" && c.Server.TLS.Key != "")
 	if !gatewayTLS && !c.Server.AllowPlaintext {
-		return fmt.Errorf("server: refusing to start without TLS. " +
+		return errorf("server: refusing to start without TLS. " +
 			"Set server.tls.cert + server.tls.key for HTTPS, or " +
 			"set server.allow_plaintext: true to acknowledge plaintext " +
 			"operation (appropriate on Tailscale or a trusted private network)")
@@ -736,7 +734,7 @@ func (c *Config) ValidateListenPolicy(opts ...ListenPolicyOption) error {
 	if metricsTLS || isLoopbackHost(p.Host) || p.AllowPlaintext {
 		return nil
 	}
-	return fmt.Errorf("telemetry.prometheus: refusing to bind %s:%d plaintext. "+
+	return errorf("telemetry.prometheus: refusing to bind %s:%d plaintext. "+
 		"Keep host=127.0.0.1 (default), set telemetry.prometheus.tls.cert + key, "+
 		"or set telemetry.prometheus.allow_plaintext: true", p.Host, p.Port)
 }

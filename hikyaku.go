@@ -262,11 +262,14 @@ func ApplyLogLevel(cfg *Config) {
 }
 
 // SafeErr renders err for a log line at levels 0-2, as the proxy logs its
-// own errors: every quoted span (Go's HTTP transport quotes the bytes a
-// non-HTTP peer sent; the YAML decoder quotes the offending scalar, which
-// may be a secret) becomes <quoted len=N>, and a *url.Error's URL is shown
-// as scheme, host and path only. Embedders use it for config load, reload
-// and outbound errors they log themselves. See docs/logging.md.
+// own errors: by allowlist, from the structure of known error types (URL,
+// network, DNS, TLS and x509, file, core's config errors, standard
+// sentinels), never by editing the text. Any other error is rendered as its
+// types and length, <error type=... len=N>. Peer bytes in an error (a
+// non-HTTP backend's reply, a malformed header line) and config values (a
+// secret typed into the wrong field) therefore never reach the log.
+// Embedders use it for the config load, reload and outbound errors they log
+// themselves. See docs/logging.md.
 func SafeErr(err error) string { return logger.SafeErr(err) }
 
 // SafeURL renders u for a log line: scheme, host and path only, never user

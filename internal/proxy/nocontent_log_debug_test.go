@@ -69,7 +69,7 @@ func TestLog_AffinityKeyLoggedAsHash(t *testing.T) {
 }
 
 // The upstream error body is content: it is logged only at level 3, on the
-// body path, in the default build. This also proves the harness can see the
+// body path, in the default build, as is the full text of an upstream error. This also proves the harness can see the
 // marker when a level is allowed to log it.
 func TestLog_UpstreamErrorBodyOnlyAtBodyLevel(t *testing.T) {
 	run := runMarkerTraffic(t, "3")
@@ -87,5 +87,11 @@ func TestLog_UpstreamErrorBodyOnlyAtBodyLevel(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("level 3 should log the upstream error body:\n%s", run.log)
+	}
+	if !strings.Contains(run.log, "[body] ") || !strings.Contains(run.log, "upstream error detail: ") {
+		t.Errorf("level 3 should log the full text of upstream errors on the body path:\n%s", run.log)
+	}
+	if !strings.Contains(run.log, "reason=malformed_MIME_header_line>") {
+		t.Errorf("levels 0-2 should name a known transport failure:\n%s", run.log)
 	}
 }

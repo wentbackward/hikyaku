@@ -3,7 +3,6 @@
 package config
 
 import (
-	"fmt"
 	"net/url"
 	"strings"
 )
@@ -16,7 +15,7 @@ import (
 func hardenedListenPolicy(c *Config, pol listenPolicy) error {
 	gatewayTLS := pol.externalGatewayTLS || (c.Server.TLS.Cert != "" && c.Server.TLS.Key != "")
 	if !gatewayTLS {
-		return fmt.Errorf("hardened build: gateway TLS is mandatory — set server.tls.cert + " +
+		return errorf("hardened build: gateway TLS is mandatory — set server.tls.cert + " +
 			"server.tls.key, or supply a runtime/attested certificate via the embedding API " +
 			"(see WithExternalGatewayTLS); allow_plaintext is ignored in hardened builds")
 	}
@@ -25,7 +24,7 @@ func hardenedListenPolicy(c *Config, pol listenPolicy) error {
 	if p.Enabled {
 		metricsTLS := p.TLS.Cert != "" && p.TLS.Key != ""
 		if !metricsTLS && !isLoopbackHost(p.Host) {
-			return fmt.Errorf("hardened build: telemetry.prometheus on %s:%d must use TLS "+
+			return errorf("hardened build: telemetry.prometheus on %s:%d must use TLS "+
 				"(set telemetry.prometheus.tls.cert + key) or bind loopback; "+
 				"allow_plaintext is ignored in hardened builds", p.Host, p.Port)
 		}
@@ -48,10 +47,10 @@ func hardenedBackendPolicy(b *Backend) error {
 	}
 	u, err := url.Parse(b.BaseURL)
 	if err != nil {
-		return fmt.Errorf("hardened build: backend %q: cannot parse base_url %q: %w", b.ID, b.BaseURL, err)
+		return errorf("hardened build: backend %q: cannot parse base_url %q: %w", b.ID, b.BaseURL, err)
 	}
 	if !strings.EqualFold(u.Scheme, "https") {
-		return fmt.Errorf("hardened build: openai backend %q must use an https:// base_url (got %q)", b.ID, b.BaseURL)
+		return errorf("hardened build: openai backend %q must use an https:// base_url (got %q)", b.ID, b.BaseURL)
 	}
 	return nil
 }

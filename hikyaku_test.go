@@ -221,19 +221,19 @@ func TestFacade_ParseConfigWithLookup(t *testing.T) {
 }
 
 // SafeErr and SafeURL give embedders the proxy's log-safe renderings: a
-// config error from the facade's own parser loses its quoted value but keeps
-// its position, and URLs lose user info and query strings.
+// config error from the facade's own parser keeps its position and YAML type
+// but not the value, an error of no known type is its type and length, and
+// URLs lose user info and query strings.
 func TestFacade_SafeErrAndSafeURL(t *testing.T) {
 	_, err := hikyaku.ParseConfig([]byte("server:\n  allow_plaintext: true\nbackends:\n  - id: be\n    type: openai\n    base_url: http://127.0.0.1:1\n    max_concurrency: sk-hunter2-secret\n"))
 	if err == nil {
 		t.Fatal("ParseConfig accepted a string max_concurrency")
 	}
-	got := hikyaku.SafeErr(err)
-	if strings.Contains(got, "sk-hun") || !strings.Contains(got, "line 7") || !strings.Contains(got, "<quoted len=") {
-		t.Errorf("SafeErr(config error) = %q, want the position without the value", got)
+	if got, want := hikyaku.SafeErr(err), "parse config: yaml: unmarshal errors: line 7: cannot unmarshal a !!str value into this field"; got != want {
+		t.Errorf("SafeErr(config error) = %q, want %q", got, want)
 	}
 	ue := &url.Error{Op: "Post", URL: "http://u:pw@h:1/v1?q=secret", Err: errors.New(`malformed HTTP response "secret body"`)}
-	if got, want := hikyaku.SafeErr(ue), "Post http://h:1/v1: malformed HTTP response <quoted len=11>"; got != want {
+	if got, want := hikyaku.SafeErr(ue), "Post http://h:1/v1: <error type=*errors.errorString len=37 reason=malformed_HTTP_response>"; got != want {
 		t.Errorf("SafeErr(url.Error) = %q, want %q", got, want)
 	}
 	u, _ := url.Parse("https://u:pw@h/base?key=secret#f")

@@ -39,9 +39,11 @@ func main() {
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
+		logger.BodyErr("config, detail", err)
 		log.Fatalf("config: %s", configError(err))
 	}
 	if err := cfg.ValidateListenPolicy(); err != nil {
+		logger.BodyErr("listen policy, detail", err)
 		log.Fatalf("%s", configError(err))
 	}
 	logger.Apply(cfg.Server.LogLevel)
@@ -145,6 +147,7 @@ func main() {
 			switch {
 			case err != nil:
 				log.Printf("[hikyaku] config reload failed: %s (keeping old config)", configError(err))
+				logger.BodyErr("[hikyaku] config reload failed, detail", err)
 				logger.Apply(srv.Config().Server.LogLevel)
 			default:
 				// ApplyConfig enforces the TLS policy on reload too, and
@@ -153,6 +156,7 @@ func main() {
 				// than run a config other than the file's.
 				if perr := srv.ApplyConfig(newCfg); perr != nil {
 					log.Printf("[hikyaku] config reload rejected: %s (keeping old config)", configError(perr))
+					logger.BodyErr("[hikyaku] config reload rejected, detail", perr)
 					logger.Apply(srv.Config().Server.LogLevel)
 				} else {
 					logger.Apply(newCfg.Server.LogLevel)
@@ -239,6 +243,7 @@ func probeBackends(cfg *config.Config, rt http.RoundTripper) {
 		resp, err := client.Do(req)
 		if err != nil {
 			log.Printf("[probe] backend %-12s UNREACHABLE: %s", b.ID, logger.SafeErr(err))
+			logger.BodyErr("[probe] backend "+b.ID+" UNREACHABLE, detail", err)
 			logVirtualModels(byBackend[b.ID])
 			continue
 		}
@@ -267,7 +272,7 @@ func probeBackends(cfg *config.Config, rt http.RoundTripper) {
 		upstreamModels := []string{}
 		if json.Unmarshal(body, &result) == nil {
 			for _, m := range result.Data {
-				upstreamModels = append(upstreamModels, m.ID)
+				upstreamModels = append(upstreamModels, logModelID(m.ID))
 			}
 		}
 
@@ -282,8 +287,16 @@ func logVirtualModels(vmodels []vmodel) {
 	}
 }
 
-// configError renders a config load, validation or reload error for the log.
-// The YAML decoder quotes the offending scalar (cannot unmarshal !!str
-// `...`), which may be a secret typed into the wrong field, so every quoted
-// span is reduced to its length; the line, column and type remain.
+// configError renders a config load, validation or reload error for the log
+// (logger.SafeErr): config errors render without their values, which may be
+// secrets typed into the wrong field, and YAML errors keep only the line,
+// column and YAML type. The full text is on the body path (logger.BodyErr).
 func configError(err error) string { return logger.SafeErr(err) }
+
+// maxLogModelID caps an upstream model id on the probe line.
+const maxLogModelID = 128
+
+// logModelID renders a model id from a backend's /models reply, which is
+// upstream-supplied text: as is when it is a short token, otherwise its
+// length (logger.SafeToken).
+func logModelID(id string) string { return logger.SafeToken(id, maxLogModelID) }

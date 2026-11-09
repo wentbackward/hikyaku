@@ -32,6 +32,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/wentbackward/hikyaku/internal/config"
+	"github.com/wentbackward/hikyaku/internal/logger"
 	"github.com/wentbackward/hikyaku/internal/telemetry"
 )
 
@@ -321,22 +322,14 @@ func logValue(s string) string {
 // maxLogUpstreamID caps the upstream response id on the trip line.
 const maxLogUpstreamID = 64
 
-// logUpstreamID renders the upstream's response id: bare when it is at most
-// maxLogUpstreamID token characters, otherwise only its length. The id is
+// logUpstreamID renders the upstream's response id: as is when it is at most
+// maxLogUpstreamID token characters, otherwise its length. The id is
 // upstream-supplied, so its size and contents are not ours to trust.
 func logUpstreamID(s string) string {
 	if s == "" {
 		return `""`
 	}
-	if len(s) > maxLogUpstreamID {
-		return fmt.Sprintf("<len=%d>", len(s))
-	}
-	for _, r := range s {
-		if !logSafeRune(r) {
-			return fmt.Sprintf("<len=%d>", len(s))
-		}
-	}
-	return s
+	return logger.SafeToken(s, maxLogUpstreamID)
 }
 
 func logSafeRune(r rune) bool {

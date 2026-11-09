@@ -39,6 +39,11 @@ const maxCodingInError = 64
 // cannot decode.
 type errUnreadableEncoding struct{ coding string }
 
+// SafeError names the problem without the upstream's coding value.
+func (e errUnreadableEncoding) SafeError() string {
+	return fmt.Sprintf("upstream answered in a content encoding the proxy cannot read (len=%d)", len(e.coding))
+}
+
 func (e errUnreadableEncoding) Error() string {
 	c := e.coding
 	if len(c) > maxCodingInError {
