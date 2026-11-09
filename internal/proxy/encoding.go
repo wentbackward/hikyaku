@@ -1,8 +1,11 @@
 package proxy
 
 import (
+	"bufio"
+	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -66,8 +69,7 @@ func decodeUpstreamBody(resp *http.Response) (decoded bool, err error) {
 	case "gzip", "x-gzip":
 		open = func(r io.Reader) (io.Reader, error) { return gzip.NewReader(r) }
 	case "deflate":
-		// HTTP's "deflate" is the zlib format (RFC 9110 §8.4.1.2).
-		open = func(r io.Reader) (io.Reader, error) { return zlib.NewReader(r) }
+		open = openDeflate
 	default:
 		return false, errUnreadableEncoding{coding: coding}
 	}
@@ -77,6 +79,28 @@ func decodeUpstreamBody(resp *http.Response) (decoded bool, err error) {
 	resp.ContentLength = -1
 	resp.Uncompressed = true
 	return true, nil
+}
+
+// openDeflate decodes HTTP's "deflate" coding. RFC 9110 §8.4.1.2 defines it
+// as the zlib format, but some servers send raw deflate under that name, so a
+// body that does not start with a valid zlib header is read as raw deflate.
+func openDeflate(r io.Reader) (io.Reader, error) {
+	br := bufio.NewReader(r)
+	h, err := br.Peek(2)
+	if len(h) == 0 && errors.Is(err, io.EOF) {
+		return br, nil // an empty body decodes to nothing
+	}
+	if len(h) == 2 && isZlibHeader(h[0], h[1]) {
+		return zlib.NewReader(br)
+	}
+	return flate.NewReader(br), nil
+}
+
+// isZlibHeader reports whether cmf, flg form a zlib header (RFC 1950 §2.2):
+// compression method 8 (deflate), a window of at most 32 KiB, and a check
+// value that makes the pair a multiple of 31.
+func isZlibHeader(cmf, flg byte) bool {
+	return cmf&0x0f == 8 && cmf>>4 <= 7 && (uint16(cmf)<<8|uint16(flg))%31 == 0
 }
 
 // decodingBody decodes src with the decoder open returns, opened on the first
