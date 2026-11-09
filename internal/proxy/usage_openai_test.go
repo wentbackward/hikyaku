@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -406,4 +407,153 @@ func TestOpenAIUsage_TopLevelAndChoiceUsageNeverDoubleCount(t *testing.T) {
 			t.Errorf("usage() = %+v, want %+v", got, want)
 		}
 	})
+}
+
+// Subtracting both cache classes in one expression could overflow int64 when
+// they are huge; netting clamps after each class, so the prompt is 0.
+func TestOpenAIUsage_NetOfCacheDoesNotOverflow(t *testing.T) {
+	const usage = `{"prompt_tokens":1,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":6.9e18,"cache_write_tokens":6.9e18}}`
+	want := usageCounts{prompt: 0, completion: 1, cacheRead: 6.9e18, cacheWrite: 6.9e18}
+
+	body := `{"choices":[],"usage":` + usage + `}`
+	if got := extractNonStreamingUsage([]byte(body), "be", "real-m", "openai", nullMetrics(t), t.Context()); got != want {
+		t.Errorf("extractNonStreamingUsage = %+v, want %+v", got, want)
+	}
+	p := makeParser(t, "openai")
+	feedLines(p, `data: {"choices":[],"usage":`+usage+`}`, `data: [DONE]`)
+	p.recordFinal()
+	if got := p.usage(); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+}
+
+// jsonCount accepts only finite counts in [0, 2^63): converting a float64 at
+// or above 2^63 to int64 is implementation-defined in Go (MinInt64 on amd64).
+func TestJSONCount_RejectsValuesOutsideInt64(t *testing.T) {
+	cases := []struct {
+		v    interface{}
+		want int64
+	}{
+		{float64(42), 42},
+		{float64(0), 0},
+		{float64(-1), 0},
+		{0x1p63, 0},
+		{1e19, 0},
+		{9223372036854774784.0, 9223372036854774784}, // largest float64 below 2^63
+		{math.Inf(1), 0},
+		{math.Inf(-1), 0},
+		{math.NaN(), 0},
+		{"12", 0},
+		{nil, 0},
+	}
+	for _, tc := range cases {
+		if got := jsonCount(map[string]interface{}{"k": tc.v}, "k"); got != tc.want {
+			t.Errorf("jsonCount(%v) = %d, want %d", tc.v, got, tc.want)
+		}
+	}
+}
+
+// A count of 1e19 (beyond int64) in any class, on any lane, reads as zero
+// instead of wrapping to a negative number.
+func TestUsage_CountBeyondInt64IsZeroInEveryClass(t *testing.T) {
+	const huge = "1e19"
+	openAI := []struct {
+		name, usage string
+		want        usageCounts
+	}{
+		{"prompt_tokens", `{"prompt_tokens":` + huge + `,"completion_tokens":2}`, usageCounts{completion: 2}},
+		{"completion_tokens", `{"prompt_tokens":5,"completion_tokens":` + huge + `}`, usageCounts{prompt: 5}},
+		{"details.cached_tokens", `{"prompt_tokens":5,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":` + huge + `}}`, usageCounts{prompt: 5, completion: 2}},
+		{"top-level cached_tokens", `{"prompt_tokens":5,"completion_tokens":2,"cached_tokens":` + huge + `}`, usageCounts{prompt: 5, completion: 2}},
+		{"details.cache_write_tokens", `{"prompt_tokens":5,"completion_tokens":2,"prompt_tokens_details":{"cache_write_tokens":` + huge + `}}`, usageCounts{prompt: 5, completion: 2}},
+		{"reasoning_tokens", `{"prompt_tokens":5,"completion_tokens":2,"completion_tokens_details":{"reasoning_tokens":` + huge + `}}`, usageCounts{prompt: 5, completion: 2}},
+	}
+	for _, tc := range openAI {
+		t.Run("openai/"+tc.name+"/NonStreaming", func(t *testing.T) {
+			body := `{"choices":[],"usage":` + tc.usage + `}`
+			if got := extractNonStreamingUsage([]byte(body), "be", "real-m", "openai", nullMetrics(t), t.Context()); got != tc.want {
+				t.Errorf("got %+v, want %+v", got, tc.want)
+			}
+		})
+		t.Run("openai/"+tc.name+"/Streaming", func(t *testing.T) {
+			p := makeParser(t, "openai")
+			feedLines(p, `data: {"choices":[],"usage":`+tc.usage+`}`, `data: [DONE]`)
+			p.recordFinal()
+			if got := p.usage(); got != tc.want {
+				t.Errorf("got %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+
+	anthropic := []struct {
+		name, input, output string
+		want                usageCounts
+	}{
+		{"input_tokens", `{"input_tokens":` + huge + `}`, `{"output_tokens":2}`, usageCounts{completion: 2}},
+		{"output_tokens", `{"input_tokens":5}`, `{"output_tokens":` + huge + `}`, usageCounts{prompt: 5}},
+		{"cache_read_input_tokens", `{"input_tokens":5,"cache_read_input_tokens":` + huge + `}`, `{"output_tokens":2}`, usageCounts{prompt: 5, completion: 2}},
+		{"cache_creation_input_tokens", `{"input_tokens":5,"cache_creation_input_tokens":` + huge + `}`, `{"output_tokens":2}`, usageCounts{prompt: 5, completion: 2}},
+	}
+	for _, tc := range anthropic {
+		t.Run("anthropic/"+tc.name+"/NonStreaming", func(t *testing.T) {
+			// The non-streamed message carries all classes in one usage object.
+			merged := strings.TrimSuffix(tc.input, "}") + "," + strings.TrimPrefix(tc.output, "{")
+			body := `{"type":"message","content":[],"usage":` + merged + `}`
+			if got := extractNonStreamingUsage([]byte(body), "be", "real-m", "anthropic", nullMetrics(t), t.Context()); got != tc.want {
+				t.Errorf("got %+v, want %+v", got, tc.want)
+			}
+		})
+		t.Run("anthropic/"+tc.name+"/Streaming", func(t *testing.T) {
+			p := makeParser(t, "anthropic")
+			feedLines(p,
+				`data: {"type":"message_start","message":{"usage":`+tc.input+`}}`,
+				`data: {"type":"message_delta","usage":`+tc.output+`}`,
+				`data: {"type":"message_stop"}`,
+			)
+			p.recordFinal()
+			if got := p.usage(); got != tc.want {
+				t.Errorf("got %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("ollama/NonStreaming", func(t *testing.T) {
+		body := `{"done":true,"prompt_eval_count":` + huge + `,"eval_count":` + huge + `}`
+		if got := extractNonStreamingUsage([]byte(body), "be", "real-m", "ollama", nullMetrics(t), t.Context()); got != (usageCounts{}) {
+			t.Errorf("got %+v, want zero", got)
+		}
+	})
+}
+
+// The last usage object a stream reports is taken whole: its classes are
+// never mixed with an earlier object's. Here an early choice-level usage
+// carries a legacy top-level cached_tokens of 50 and the final usage chunk
+// an explicit details.cached_tokens of 0; the final object wins entirely.
+func TestOpenAIStreamParser_LastUsageObjectWinsWhole(t *testing.T) {
+	p := makeParser(t, "openai")
+	feedLines(p,
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop","usage":{"prompt_tokens":100,"completion_tokens":10,"cached_tokens":50}}]}`,
+		`data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":0}}}`,
+		`data: [DONE]`,
+	)
+	p.recordFinal()
+	if got, want := p.usage(), (usageCounts{prompt: 100, completion: 20}); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+}
+
+// An empty or all-zero usage object after the real one (a provider that
+// sends usage on every chunk) does not erase the counts.
+func TestOpenAIStreamParser_EmptyUsageObjectDoesNotEraseCounts(t *testing.T) {
+	p := makeParser(t, "openai")
+	feedLines(p,
+		`data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":60}}}`,
+		`data: {"choices":[],"usage":{}}`,
+		`data: {"choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0}}`,
+		`data: [DONE]`,
+	)
+	p.recordFinal()
+	if got, want := p.usage(), (usageCounts{prompt: 40, completion: 20, cacheRead: 60}); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
 }
