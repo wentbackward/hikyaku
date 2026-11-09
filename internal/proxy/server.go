@@ -1157,27 +1157,13 @@ func director(target *url.URL, backend *config.Backend, body []byte, pathOverrid
 		req.URL.Path = joinUpstreamPath(target.Path, endpointPath, backend.Type, backend.URLJoin)
 		dropConnectionHeaders(req.Header)
 		stripCredentials(req.Header)
-		// Auth headers — auth_type overrides the default for the backend type.
-		// Default: "x-api-key" for anthropic, "bearer" for openai.
-		// Explicit "bearer" is needed for OAuth tokens on Anthropic.
-		if backend.APIKey != "" {
-			authType := backend.AuthType
-			if authType == "" {
-				if backend.Type == "anthropic" {
-					authType = "x-api-key"
-				} else {
-					authType = "bearer"
-				}
-			}
-			if authType == "x-api-key" {
-				req.Header.Set("x-api-key", backend.APIKey)
-			} else {
-				req.Header.Set("Authorization", "Bearer "+backend.APIKey)
-			}
-			// Anthropic always needs a version header
-			if backend.Type == "anthropic" && req.Header.Get("anthropic-version") == "" {
-				req.Header.Set("anthropic-version", "2023-06-01")
-			}
+		// The backend's own credential, in its lane's header (auth_type
+		// overrides the default; explicit "bearer" serves OAuth tokens on
+		// Anthropic).
+		backend.SetCredential(req.Header)
+		// Anthropic always needs a version header
+		if backend.APIKey != "" && backend.Type == "anthropic" && req.Header.Get("anthropic-version") == "" {
+			req.Header.Set("anthropic-version", "2023-06-01")
 		}
 
 		req.Body = io.NopCloser(bytes.NewReader(body))

@@ -30,8 +30,9 @@ type Option func(*Balancer)
 // RoundTripper. A probe must see a backend exactly as live traffic does: with
 // the same client certificate, CA bundle, certificate pins or attested leg an
 // embedder's TransportFactory supplies, a backend that only that transport can
-// reach is healthy to the balancer, not just to the proxy. A nil rt leaves the
-// probe clients building their own transports, as they do without the option.
+// reach is healthy to the balancer, not just to the proxy. A nil rt is the same
+// as no option: the balancer builds one probe transport (the config's pool, the
+// build's TLS floor, no HTTP_PROXY) that every probe shares.
 func WithTransport(rt http.RoundTripper) Option {
 	return func(b *Balancer) { b.transport = rt }
 }
@@ -113,7 +114,9 @@ func New(cfg *config.Config, opts ...Option) *Balancer {
 		o(b)
 	}
 	b.hc = newHCClient(cfg, b.transport)
-	b.ac = newAliveChecker(b.transport)
+	// The alive checker shares the health client's transport: the injected
+	// one, or the probe transport newHCClient built, never Go's default.
+	b.ac = newAliveChecker(b.hc.transport)
 
 	for name, grpCfg := range cfg.Groups {
 		states := make(map[string]*BackendState, len(cfg.Backends))

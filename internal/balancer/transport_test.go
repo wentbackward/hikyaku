@@ -264,8 +264,8 @@ func TestNew_WithoutTransport_KeepsOwnProbeClients(t *testing.T) {
 	case want != nil && tr.TLSClientConfig.MinVersion != want.MinVersion:
 		t.Errorf("TLS MinVersion = %x, want %x", tr.TLSClientConfig.MinVersion, want.MinVersion)
 	}
-	if b.ac.client.Transport != nil {
-		t.Errorf("alive client transport = %T, want nil (Go's default) when none is injected", b.ac.client.Transport)
+	if b.ac.client.Transport != b.hc.transport {
+		t.Errorf("alive client transport = %T, want the balancer's own probe transport when none is injected", b.ac.client.Transport)
 	}
 }
 
@@ -295,8 +295,8 @@ func TestNew_WithNilTransport_KeepsOwnProbeClients(t *testing.T) {
 	if _, ok := b.hc.transport.(*http.Transport); !ok {
 		t.Errorf("health transport = %T, want the balancer's own *http.Transport for a nil injection", b.hc.transport)
 	}
-	if b.ac.client.Transport != nil {
-		t.Errorf("alive client transport = %T, want nil for a nil injection", b.ac.client.Transport)
+	if b.ac.client.Transport != b.hc.transport {
+		t.Errorf("alive client transport = %T, want the balancer's own probe transport for a nil injection", b.ac.client.Transport)
 	}
 }
 

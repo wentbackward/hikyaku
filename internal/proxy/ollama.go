@@ -55,6 +55,12 @@ func (s *Server) handleOllamaEmbed(w http.ResponseWriter, r *http.Request) {
 // ollama backend. MVP: no virtual-model rewriting — clients see the backend's
 // real model names. Parallel to /v1/models, but we deliberately skip the
 // rewrite pass until there's a real need.
+//
+// The request goes through the server's outbound transport, like every other
+// backend request (a TransportFactory's, or core's default: the build's TLS
+// floor, no HTTP_PROXY). It is built fresh, so no caller header reaches the
+// backend; it carries only the backend's own credential, asks for identity
+// encoding, and a redirect is answered to the caller rather than followed.
 func (s *Server) handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -85,11 +91,14 @@ func (s *Server) handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "failed to build upstream request: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if backend.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+backend.APIKey)
-	}
+	backend.SetCredential(req.Header)
+	req.Header.Set("Accept-Encoding", upstreamAcceptEncoding)
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{
+		Transport:     s.transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("[proxy] /api/tags upstream error backend=%s: %v", backend.ID, err)
 		jsonError(w, "upstream error: "+err.Error(), http.StatusBadGateway)
@@ -97,12 +106,22 @@ func (s *Server) handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if _, err := decodeUpstreamBody(resp); err != nil {
+		log.Printf("[proxy] /api/tags upstream error backend=%s: %v", backend.ID, err)
+		jsonError(w, err.Error(), http.StatusBadGateway)
+		return
+	}
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		jsonError(w, "failed to read upstream response: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+	if loc := resp.Header.Get("Location"); loc != "" {
+		w.Header().Set("Location", loc)
+	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(data)
 }

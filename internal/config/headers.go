@@ -126,3 +126,26 @@ func IsCredentialHeader(name string) bool {
 	}
 	return false
 }
+
+// SetCredential sets the backend's own api_key on h, in the header its lane
+// expects: x-api-key when auth_type is x-api-key (the default for anthropic
+// backends), otherwise Authorization: Bearer. A backend without api_key sets
+// nothing. It only adds: callers strip any credential already in h first.
+func (b *Backend) SetCredential(h http.Header) {
+	if b.APIKey == "" {
+		return
+	}
+	authType := b.AuthType
+	if authType == "" {
+		if b.Type == "anthropic" {
+			authType = "x-api-key"
+		} else {
+			authType = "bearer"
+		}
+	}
+	if authType == "x-api-key" {
+		h.Set("x-api-key", b.APIKey)
+	} else {
+		h.Set("Authorization", "Bearer "+b.APIKey)
+	}
+}

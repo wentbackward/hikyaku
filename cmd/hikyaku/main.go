@@ -17,7 +17,6 @@ import (
 	"github.com/wentbackward/hikyaku/internal/journal"
 	"github.com/wentbackward/hikyaku/internal/logger"
 	"github.com/wentbackward/hikyaku/internal/proxy"
-	"github.com/wentbackward/hikyaku/internal/sectls"
 	"github.com/wentbackward/hikyaku/internal/telemetry"
 )
 
@@ -64,13 +63,15 @@ func main() {
 		log.Println("[hikyaku] journal enabled")
 	}
 
-	// ── Startup backend probes ─────────────────────────────────────────────
-	probeBackends(cfg)
-
 	// ── Proxy server ───────────────────────────────────────────────────────
 	proxyMux := http.NewServeMux()
 	srv := proxy.New(Version, BuildMode, cfg, metrics, j)
 	srv.RegisterRoutes(proxyMux)
+
+	// ── Startup backend probes ─────────────────────────────────────────────
+	// Through the server's outbound transport, so a probe reaches a backend
+	// exactly as live traffic does.
+	probeBackends(cfg, srv.OutboundTransport())
 
 	proxyAddr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	proxyServer := &http.Server{
@@ -157,7 +158,7 @@ func main() {
 					logger.Apply(newCfg.Server.LogLevel)
 				}
 			}
-			probeBackends(srv.Config())
+			probeBackends(srv.Config(), srv.OutboundTransport())
 		}
 	}()
 
@@ -195,8 +196,9 @@ type vmodel struct {
 }
 
 // probeBackends checks each configured backend at startup, logs its status
-// and the virtual models that map to it.
-func probeBackends(cfg *config.Config) {
+// and the virtual models that map to it. Probes go through rt, the server's
+// outbound transport, and carry only the backend's own credential.
+func probeBackends(cfg *config.Config, rt http.RoundTripper) {
 	// Build backend → virtual models index
 	byBackend := make(map[string][]vmodel, len(cfg.Backends))
 	for i := range cfg.Routes {
@@ -208,8 +210,9 @@ func probeBackends(cfg *config.Config) {
 	}
 
 	client := &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: sectls.ClientConfig(cfg.MinTLS())},
+		Timeout:       10 * time.Second,
+		Transport:     rt,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 
 	for i := range cfg.Backends {
@@ -231,9 +234,7 @@ func probeBackends(cfg *config.Config) {
 			log.Printf("[probe] backend %-12s ERROR building request: %v", b.ID, err)
 			continue
 		}
-		if b.APIKey != "" {
-			req.Header.Set("Authorization", "Bearer "+b.APIKey)
-		}
+		b.SetCredential(req.Header)
 
 		resp, err := client.Do(req)
 		if err != nil {

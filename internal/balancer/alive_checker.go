@@ -17,7 +17,7 @@ type aliveChecker struct {
 }
 
 // newAliveChecker creates a new alive checker. Probes are sent through rt, the
-// server's outbound transport; a nil rt means Go's default transport, as before.
+// balancer's probe transport (see New); rt must not be nil.
 func newAliveChecker(rt http.RoundTripper) *aliveChecker {
 	return &aliveChecker{
 		client: &http.Client{
