@@ -57,6 +57,20 @@ The proxy reads every response body it forwards (token metering, stream loop det
 
 Why identity rather than letting the transport negotiate gzip: the choice holds for every transport (core's own or one an embedder injects through `TransportFactory`, which may not decode transparently); streamed events are not held in an upstream compressor's buffer; and no decompressor state, which keeps a window of recent plaintext the proxy cannot wipe, is created on the normal path — consistent with the hardened build's aim of a short plaintext window. The cost is uncompressed bytes on the upstream leg, which is small next to model latency for chat responses; large embedding batches are the case where it is most visible.
 
+### Upstream credentials
+
+A caller's credentials never reach a backend. Before forwarding, the proxy removes every credential header from the caller's request — `Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`, `Proxy-Authorization` and `Cookie` — and then sets only the backend's own `api_key`, in the header its lane uses (`auth_type`; see [configuration](configuration.md#authentication)). A backend without `api_key` receives no credential header at all. This also keeps the shared `server.api_key` a client never forwards: it authenticates the client at the proxy and stops there.
+
+The request body is the one the proxy buffered and rewrote, sent with a `Content-Length`: no chunked transfer coding, and none of the caller's trailers (a trailer can carry a credential too).
+
+`headers` rules run after this, so they act on the outbound request, never on caller credentials:
+
+- **`add`** may set a credential header with a static operator value (for example a self-hosted backend's own auth header); it overrides the backend `api_key` header of the same name.
+- **`remove`** may drop a credential header, the backend's own included.
+- **`rename`** out of or into a credential header has no effect: out of one there is nothing left to move, and into one would send a caller-controlled value as an upstream credential. The config still loads; one `[config] WARNING:` line naming each backend and route with such a rule is logged on start and on every reload.
+
+The level-2 header log and capture files redact every credential header and `Set-Cookie`.
+
 ### TLS with Tailscale
 
 Tailscale can issue a real (Let's Encrypt-backed) certificate for a node's MagicDNS name, which the proxy then terminates directly. **Compose does not provision this for you** — it only mounts files that already exist. The hardened build *requires* a working cert (you cannot terminate TLS at Tailscale and forward plaintext to hikyaku — hardened rejects plaintext), so the cert must be on disk and readable by the container.
@@ -107,6 +121,8 @@ Startup refuses to bind plaintext on a non-loopback host unless one of condition
 
 A single shared bearer token in `server.api_key`. Clients send `Authorization: Bearer <token>`. Comparison is constant-time (`crypto/subtle.ConstantTimeCompare`) to avoid leaking the token via response timing.
 
+The client's `Authorization` header is consumed at the proxy and never forwarded to a backend (see [Upstream credentials](#upstream-credentials)).
+
 If `api_key` is empty, authentication is disabled entirely — any request is accepted. Only use this on a loopback-only bind or inside a fully trusted network.
 
 The token is static. To rotate, update config.yaml and send SIGHUP; in-flight requests finish under the old key.
@@ -129,7 +145,7 @@ When `journal.enabled: true`, the journal emits a structured OTel log record per
 
 ### SIGUSR1 message capture
 
-When `sig_message_capture.enabled: true` and `sig_message_capture.output_folder` is set, the operator can send SIGUSR1 to arm a bounded capture window. The next *N* requests are each written as one JSON file containing the full incoming body, the resolved body as sent to the backend, and the response body (or raw SSE stream). Headers like Authorization are redacted; message content is preserved verbatim. Files are written mode 0600 in the configured folder.
+When `sig_message_capture.enabled: true` and `sig_message_capture.output_folder` is set, the operator can send SIGUSR1 to arm a bounded capture window. The next *N* requests are each written as one JSON file containing the full incoming body, the resolved body as sent to the backend, and the response body (or raw SSE stream). Credential headers (Authorization, API keys, cookies) are redacted; message content is preserved verbatim. Files are written mode 0600 in the configured folder.
 
 This is a deliberate diagnostic feature — typical use is "something is broken, capture 5 requests, `docker cp` them out, inspect, move on." It's disabled by default and never writes without an explicit folder configured. See [docs/logging.md](logging.md#full-body-message-capture-sigusr1) for the full reference.
 

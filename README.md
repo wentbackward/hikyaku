@@ -250,10 +250,10 @@ routes:
     headers:
       remove: [X-Forwarded-For, User-Agent]
       add:    { X-Tenant-Id: "${TENANT_ID}" }
-      rename: { Authorization: X-Original-Auth }
+      rename: { X-Client-Trace: X-Upstream-Trace }
 ```
 
-Backend headers apply first; route headers apply on top, route wins on conflict. Full reference in [docs/configuration.md](docs/configuration.md#outbound-header-manipulation).
+Backend headers apply first; route headers apply on top, route wins on conflict. Caller credential headers are never forwarded, and a rename out of or into one has no effect. Full reference in [docs/configuration.md](docs/configuration.md#outbound-header-manipulation).
 
 ### Recipes
 

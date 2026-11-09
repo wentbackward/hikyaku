@@ -41,7 +41,7 @@ journal:
 # Disabled unless both enabled: true AND output_folder are set — there is no
 # default folder, by design. Each captured request writes one JSON file with
 # the incoming body, resolved body (as sent to backend), and response body.
-# Headers like Authorization are redacted in the capture.
+# Credential headers (Authorization, API keys, cookies) are redacted in the capture.
 sig_message_capture:
   enabled: false
   output_folder: ""     # e.g. /var/log/hikyaku/capture — REQUIRED when enabled
@@ -69,7 +69,7 @@ backends:
   - id: vllm-27b
     type: openai          # openai | anthropic
     base_url: "http://localhost:3022"
-    api_key: "${VLLM_API_KEY}"  # omit or leave blank if no auth
+    api_key: "${VLLM_API_KEY}"  # omit or leave blank if no auth (caller credentials are never forwarded)
     timeout_seconds: 300
     default: true         # target for passthrough_unrouted and /v1/models (at most one backend)
 

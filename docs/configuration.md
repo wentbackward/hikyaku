@@ -108,7 +108,7 @@ Both formats produce identical results. If you specify an explicit `id` inside t
 - **`type`** — `openai`, `anthropic`, or `ollama`. Determines auth header format, stream parsing, and `enable_thinking` translation. Must match the protocol the client speaks: OpenAI format (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`) routes to `openai` backends; Anthropic format (`/v1/messages`) routes to `anthropic` backends; Ollama-native format (`/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/api/tags`) routes to `ollama` backends.
 - **`base_url`** — the full base URL for the backend. Include any version or path segments (e.g. `https://api.openai.com/v1/`, `https://api.novita.ai/openai/v1/`, `http://gpu-server:8000/v1/`, `https://token-plan.maas.aliyuncs.com/compatible-mode/v1/`).
 - **`url_join`** — `openai` (default) or `rfc3986`. Controls how the request path is combined with `base_url`. See [URL composition](#url-composition) below.
-- **`api_key`** — static key or OAuth token. Sent to the backend using the auth header format determined by `auth_type`. If empty, the client's original auth headers pass through to the backend.
+- **`api_key`** — static key or OAuth token. Sent to the backend using the auth header format determined by `auth_type`. If empty, the backend receives no credential header: the caller's credentials are never forwarded ([security](security.md#upstream-credentials)).
 - **`auth_type`** — `bearer` or `x-api-key`. Controls which HTTP header carries the API key. Default: `bearer` for `openai` backends, `x-api-key` for `anthropic` backends. Override to `bearer` when using OAuth tokens with Anthropic.
 - **`timeout_seconds`** — idle timeout per request. If no bytes flow for this duration, the request is cancelled. Default: 300.
 - **`max_concurrency`** — maximum number of in-flight requests to this backend. When the limit is reached, new requests queue until a slot opens or the client disconnects. `0` (default) means unlimited.
@@ -222,7 +222,7 @@ Override `auth_type` when the default doesn't match your provider's expectations
     auth_type: x-api-key           # send key as x-api-key instead of Bearer
 ```
 
-If `api_key` is empty, the proxy does not set any auth headers, and the client's original `Authorization` or `x-api-key` header passes through to the backend unchanged.
+The caller's credential headers (`Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`, `Proxy-Authorization`, `Cookie`) are always removed before forwarding; only the backend's `api_key` is sent. If `api_key` is empty, the backend receives no credential header. To send a static credential in another header, use a `headers` `add` rule. See [security](security.md#upstream-credentials).
 
 ## Routes
 
@@ -386,7 +386,7 @@ routes:
 
 ### Outbound header manipulation
 
-Routes and backends can each declare a `headers:` block that mutates the HTTP headers sent to the upstream. Three operations: `add`, `remove`, `rename`. Applied per request in the order **rename → remove → add** so a single block can rename `Authorization` to preserve audit, drop it, and add a fresh one — all in one config block.
+Routes and backends can each declare a `headers:` block that mutates the HTTP headers sent to the upstream. Three operations: `add`, `remove`, `rename`. Applied per request in the order **rename → remove → add**, after the proxy has removed the caller's credential headers and set the backend's `api_key` (see [Credential headers](#credential-headers) below).
 
 ```yaml
 backends:
@@ -409,13 +409,13 @@ routes:
       add:
         X-Tenant-Id: "${TENANT_ID}"
       rename:
-        Authorization: X-Original-Auth      # audit-preserve client auth before backend.headers adds a fresh one
+        X-Client-Trace: X-Upstream-Trace    # pass a caller header on under the name the upstream expects
 ```
 
 **Scopes and precedence**
 
 - **Backend** `headers` apply to every request to that backend (typical use: static infrastructure headers like a corporate auth token).
-- **Route** `headers` apply on top of backend's, after them, so route wins on per-name conflict (typical use: per-virtual-model tenant tags, audit preservation).
+- **Route** `headers` apply on top of backend's, after them, so route wins on per-name conflict (typical use: per-virtual-model tenant tags).
 
 **Operation semantics**
 
@@ -425,13 +425,17 @@ routes:
 
 **Order of operations within one block**
 
-`rename → remove → add`. Designed so an operator can:
+`rename → remove → add`. A rename runs on what the caller sent, then remove and add shape the result; add always has the last word.
 
-1. Rename `Authorization` to `X-Original-Auth` (preserve client auth)
-2. (skip — nothing to remove in this case)
-3. Add a new `Authorization` from a backend secret
+**Credential headers**
 
-…in a single, readable config block.
+`Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`, `Proxy-Authorization` and `Cookie` are credential headers. The caller's are removed before the rules run, and the backend's `api_key` is set before them:
+
+- `add` may set a credential header to a static value (for example `X-Corp-Auth` or `Authorization` for a self-hosted backend); it replaces the `api_key` header of the same name.
+- `remove` may drop one, the backend's own included.
+- A `rename` out of or into a credential header has no effect: a caller value never reaches a backend as, or from, a credential. The config still loads, and one `[config] WARNING:` line naming each backend and route with such a rule is logged on start and on every reload. A config that renamed `Authorization` to keep the caller's token for audit no longer forwards it.
+
+See [security](security.md#upstream-credentials).
 
 **`Accept-Encoding` is not configurable**
 

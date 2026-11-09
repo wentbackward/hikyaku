@@ -50,6 +50,7 @@
 - **TLS enforcement** — refuses to start without TLS unless explicitly opted in (inspect); mandatory in hardened
 - **Configurable TLS floor** — `server.min_tls_version` (`1.3` default, `1.2` for lagging infra); applied inbound + outbound
 - **Constant-time auth** — bearer token comparison
+- **No credential passthrough** — caller `Authorization`, API-key headers, `Proxy-Authorization`, `Cookie` and trailers are stripped before forwarding; only the backend's own `api_key` is sent ([security](docs/security.md#upstream-credentials))
 - **Secret resolution** — `${ENV_VAR}` syntax, never stored in config
 - **Keyed affinity fingerprints** — HMAC-SHA256 with a per-process random key (hardened); affinity logs gated
 - **Request-buffer zeroing** — resolved outbound body wiped after forward (all builds); raw inbound body wiped early (hardened)

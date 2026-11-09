@@ -39,7 +39,7 @@ Set in `config.yaml` under `server.log_level`, or via the `LOG_LEVEL` environmen
 |---|---|
 | `0` | Errors only (default) |
 | `1` | One line per request — method, path, virtual model → real model, backend, status, duration |
-| `2` | Level 1 + incoming request headers + transformation summary (backend, target URL, model rewrite, auth type, merged params) |
+| `2` | Level 1 + incoming request headers (credential headers redacted) + transformation summary (backend, target URL, model rewrite, auth type, merged params) |
 | `3` | Level 2 + first 80 characters of the request body |
 | `4` | Level 3 + full message text content (request and response) |
 
@@ -172,7 +172,7 @@ One file per request: `{YYYYMMDDTHHMMSS.sssZ}-{request_id}.json`, mode `0600`.
 - `resolved` is the body as sent to the backend (after defaults, caller overrides, clamp, and protocol-specific translation).
 - Streaming responses are captured as raw SSE bytes under `response.sse`; non-streaming responses are captured under `response.body`.
 - Per-response capture is capped at 5 MB; over-cap bodies set `response.truncated: true`.
-- `Authorization`, `x-api-key`, `Cookie`, `Set-Cookie`, and `Proxy-Authorization` headers are redacted.
+- Credential headers (`Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`, `Proxy-Authorization`, `Cookie`) and `Set-Cookie` are redacted, here and in the level-2 header log.
 
 ### Programmatic arming and filters (embedders)
 
