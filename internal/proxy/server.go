@@ -111,6 +111,7 @@ type UsageEvent struct {
 	CompletionTokens int64  // output tokens (Anthropic output_tokens; OpenAI completion_tokens; Ollama eval_count)
 	CacheReadTokens  int64  // Anthropic cache_read_input_tokens; 0 elsewhere
 	CacheWriteTokens int64  // Anthropic cache_creation_input_tokens; 0 elsewhere
+	ReasoningTokens  int64
 	Streamed         bool
 	Status           int
 	Duration         time.Duration
@@ -167,7 +168,7 @@ func streamEndReason(trip *loopTrip, readErr error, reqCtx context.Context) EndR
 // prompt + cacheRead + cacheWrite, and each class is priced differently.
 // Nothing is folded together here — that is the embedder's decision.
 type usageCounts struct {
-	prompt, completion, cacheRead, cacheWrite int64
+	prompt, completion, cacheRead, cacheWrite, reasoning int64
 }
 
 // recordTokenMetrics adds c to the per-backend Prometheus token counters and

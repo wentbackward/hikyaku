@@ -164,9 +164,11 @@ func TestWithUsageObserver_NonStreaming_Anthropic_CacheTokens(t *testing.T) {
 	}
 }
 
-// OpenAI has no cache classes on this seam: both must stay zero, not be
-// inferred from prompt_tokens_details or folded into PromptTokens.
-func TestWithUsageObserver_NonStreaming_OpenAI_CacheTokensZero(t *testing.T) {
+// OpenAI reports cached prompt tokens INSIDE prompt_tokens
+// (prompt_tokens_details.cached_tokens), so the observer gets them as
+// CacheReadTokens and PromptTokens net of them: every lane's PromptTokens
+// means uncached input.
+func TestWithUsageObserver_NonStreaming_OpenAI_CachedTokensNetOfPrompt(t *testing.T) {
 	var events []UsageEvent
 	s, backend := usageServer(t, "openai", map[string]interface{}{
 		"choices": []interface{}{map[string]interface{}{
@@ -187,8 +189,8 @@ func TestWithUsageObserver_NonStreaming_OpenAI_CacheTokensZero(t *testing.T) {
 		t.Fatalf("observer fired %d times, want exactly 1", len(events))
 	}
 	ev := events[0]
-	if ev.PromptTokens != 11 || ev.CompletionTokens != 7 || ev.CacheReadTokens != 0 || ev.CacheWriteTokens != 0 {
-		t.Errorf("got %d/%d cache %d/%d, want 11/7 cache 0/0", ev.PromptTokens, ev.CompletionTokens, ev.CacheReadTokens, ev.CacheWriteTokens)
+	if ev.PromptTokens != 3 || ev.CompletionTokens != 7 || ev.CacheReadTokens != 8 || ev.CacheWriteTokens != 0 {
+		t.Errorf("got %d/%d cache %d/%d, want 3/7 cache 8/0", ev.PromptTokens, ev.CompletionTokens, ev.CacheReadTokens, ev.CacheWriteTokens)
 	}
 }
 

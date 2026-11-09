@@ -404,7 +404,7 @@ func (p *sseParser) recordAnthropicTokens() {
 
 // usage returns the token classes seen on this stream. Call after recordFinal.
 func (p *sseParser) usage() usageCounts {
-	return usageCounts{p.promptToks, p.completionToks, p.cacheReadToks, p.cacheWriteToks}
+	return usageCounts{prompt: p.promptToks, completion: p.completionToks, cacheRead: p.cacheReadToks, cacheWrite: p.cacheWriteToks}
 }
 
 // recordFinal records per-request summary metrics once the stream is complete.

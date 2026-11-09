@@ -1,0 +1,1 @@
+{"id":"chatcmpl-fixture03","object":"chat.completion","created":1730000000,"model":"moonshot-v1-8k","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1500,"completion_tokens":40,"total_tokens":1540,"cached_tokens":1024}}

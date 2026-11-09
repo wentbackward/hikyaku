@@ -1,0 +1,10 @@
+data: {"id":"chatcmpl-fixture04","object":"chat.completion.chunk","created":1730000000,"model":"gpt-4o-2024-08-06","system_fingerprint":"fp_fixture","choices":[{"index":0,"delta":{"role":"assistant","content":"","refusal":null},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-fixture04","object":"chat.completion.chunk","created":1730000000,"model":"gpt-4o-2024-08-06","system_fingerprint":"fp_fixture","choices":[{"index":0,"delta":{"content":"ok"},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"chatcmpl-fixture04","object":"chat.completion.chunk","created":1730000000,"model":"gpt-4o-2024-08-06","system_fingerprint":"fp_fixture","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}],"usage":null}
+
+data: {"id":"chatcmpl-fixture04","object":"chat.completion.chunk","created":1730000000,"model":"gpt-4o-2024-08-06","system_fingerprint":"fp_fixture","choices":[],"usage":{"prompt_tokens":2006,"completion_tokens":300,"total_tokens":2306,"prompt_tokens_details":{"cached_tokens":1920,"audio_tokens":0},"completion_tokens_details":{"reasoning_tokens":128,"audio_tokens":0,"accepted_prediction_tokens":0,"rejected_prediction_tokens":0}}}
+
+data: [DONE]
+
