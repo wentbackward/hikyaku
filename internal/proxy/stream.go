@@ -94,6 +94,11 @@ type sseParser struct {
 	// the message_delta output_tokens, merged the same way.
 	anthropicIn           usageCounts
 	anthropicOutputTokens int64
+	// anthropicFlushed is set by the first flush (message_stop, [DONE] or
+	// recordFinal). That flush is final: usage in any later event is
+	// ignored and later flushes are no-ops, so nothing is counted twice and
+	// a stray event after message_stop cannot overwrite the real usage.
+	anthropicFlushed bool
 
 	// L4 content capture
 	captureContent bool
@@ -346,7 +351,7 @@ func (p *sseParser) handleAnthropicEvent(evt map[string]interface{}) {
 			if id, _ := msg["id"].(string); id != "" {
 				p.loop.setUpstreamID(id)
 			}
-			if usage, ok := msg["usage"].(map[string]interface{}); ok {
+			if usage, ok := msg["usage"].(map[string]interface{}); ok && !p.anthropicFlushed {
 				p.mergeAnthropicUsage(usage)
 			}
 		}
@@ -383,7 +388,7 @@ func (p *sseParser) handleAnthropicEvent(evt map[string]interface{}) {
 		// output_tokens arrive here, and the input classes again. Both are
 		// cumulative, so the last (largest) delta is final; on a server-tool
 		// turn its input_tokens exceed message_start's.
-		if usage, ok := evt["usage"].(map[string]interface{}); ok {
+		if usage, ok := evt["usage"].(map[string]interface{}); ok && !p.anthropicFlushed {
 			p.anthropicOutputTokens = max(p.anthropicOutputTokens, jsonCount(usage, "output_tokens"))
 			p.mergeAnthropicUsage(usage)
 		}
@@ -423,12 +428,16 @@ func (p *sseParser) mergeAnthropicUsage(usage map[string]interface{}) {
 	}
 }
 
-// recordAnthropicTokens flushes the counts accumulated across Anthropic events
-// into the per-stream totals and the Prometheus counters. It runs on
-// message_stop, on [DONE] and in recordFinal; the accumulators are zeroed after each
-// flush so a second flush is a no-op rather than a double count, while the
-// totals it exposes via usage() persist.
+// recordAnthropicTokens flushes the counts accumulated across Anthropic
+// events into the per-stream totals and the Prometheus counters. It runs on
+// message_stop, on [DONE] and in recordFinal; only the first call flushes
+// (anthropicFlushed), so the counters are added once and usage arriving
+// after it is ignored.
 func (p *sseParser) recordAnthropicTokens() {
+	if p.anthropicFlushed {
+		return
+	}
+	p.anthropicFlushed = true
 	attrs := telemetry.BackendAttrs(p.backendID, p.model)
 	if in := p.anthropicIn; in.hasCounts() {
 		p.promptToks = in.prompt
@@ -440,12 +449,10 @@ func (p *sseParser) recordAnthropicTokens() {
 		if in.prompt > 0 {
 			p.metrics.PromptTokens.Add(p.ctx, in.prompt, attrs)
 		}
-		p.anthropicIn = usageCounts{}
 	}
 	if p.anthropicOutputTokens > 0 {
 		p.completionToks = p.anthropicOutputTokens
 		p.metrics.CompletionTokens.Add(p.ctx, p.anthropicOutputTokens, attrs)
-		p.anthropicOutputTokens = 0
 	}
 }
 
@@ -474,7 +481,8 @@ func (p *sseParser) recordFinal() {
 	// error, loop abort, or an upstream that just stopped) still reports
 	// the usage it carried so far: message_start's input classes are billed
 	// input whether or not the stream finished. EndReason tells the
-	// embedder the counts may be partial. A no-op after message_stop.
+	// embedder the counts may be partial. A no-op after message_stop
+	// (the first flush is final).
 	if p.backendType == "anthropic" {
 		p.recordAnthropicTokens()
 	}

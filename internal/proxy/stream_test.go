@@ -164,17 +164,17 @@ func TestAnthropic_OutputTokensFromMessageDelta(t *testing.T) {
 	}
 }
 
-func TestAnthropic_TokensResetAfterMessageStop(t *testing.T) {
+func TestAnthropic_MessageStopFlushIsFinal(t *testing.T) {
 	p := makeParser(t, "anthropic")
 	feedLines(p,
 		`data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}`,
 		`data: {"type":"message_delta","usage":{"output_tokens":3}}`,
 		`data: {"type":"message_stop"}`,
 	)
-	// After message_stop the counters should be flushed (reset to 0)
-	if p.anthropicIn.prompt != 0 || p.anthropicOutputTokens != 0 {
-		t.Errorf("tokens should be zeroed after flush, got in=%d out=%d",
-			p.anthropicIn.prompt, p.anthropicOutputTokens)
+	// message_stop flushes the counts into the totals, and that flush is final.
+	if !p.anthropicFlushed || p.promptToks != 5 || p.completionToks != 3 {
+		t.Errorf("after message_stop: flushed=%v prompt=%d completion=%d, want true/5/3",
+			p.anthropicFlushed, p.promptToks, p.completionToks)
 	}
 }
 

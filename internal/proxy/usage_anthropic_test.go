@@ -679,3 +679,50 @@ func TestOpenAIStream_CutAfterUsageChunkReportsIt(t *testing.T) {
 		})
 	}
 }
+
+// The first flush (message_stop) is final: usage in an event after it is
+// ignored, so llm_prompt_tokens_total is not counted twice and the real
+// usage is not overwritten by the stray event at recordFinal.
+func TestAnthropicStream_UsageAfterMessageStopIsIgnored(t *testing.T) {
+	m, lr := newLoopMetrics(t)
+	p := newSSEParser("be", "real-m", "anthropic", time.Now(), m, t.Context())
+	feedLines(p,
+		`data: {"type":"message_start","message":{"id":"m1","usage":{"input_tokens":100,"cache_read_input_tokens":50}}}`,
+		`data: {"type":"message_delta","usage":{"output_tokens":500}}`,
+		`data: {"type":"message_stop"}`,
+		`data: {"type":"message_start","message":{"id":"m2","usage":{"input_tokens":7}}}`,
+		`data: {"type":"message_delta","usage":{"input_tokens":3,"output_tokens":1}}`,
+	)
+	p.recordFinal()
+	if got, want := p.usage(), (usageCounts{prompt: 100, completion: 500, cacheRead: 50}); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+	if got := lr.promptTokensTotal(t); got != 100 {
+		t.Errorf("llm_prompt_tokens_total = %d, want 100", got)
+	}
+}
+
+// A stream the loop guard aborts reports the usage seen up to the trip,
+// and nothing after it: the parser stops at the tripping line.
+func TestAnthropicStream_LoopAbortReportsUsageBeforeTrip(t *testing.T) {
+	cfg := enabledLoopCfg()
+	cfg.Reasoning.WarmupWindows = 0
+	p, _ := newGuardedSSEParser(t, "anthropic", cfg)
+	in := "event: message_start\n" + sseEvent(map[string]interface{}{"type": "message_start", "message": map[string]interface{}{
+		"id": "msg_1", "usage": map[string]interface{}{"input_tokens": 77, "cache_read_input_tokens": 5}}}) +
+		"event: content_block_delta\n" + sseEvent(map[string]interface{}{"type": "content_block_delta", "index": 0,
+		"delta": map[string]interface{}{"type": "thinking_delta", "thinking": loopText(2000)}}) +
+		"event: message_delta\n" + sseEvent(map[string]interface{}{"type": "message_delta",
+		"usage": map[string]interface{}{"input_tokens": 9000, "output_tokens": 400}}) +
+		"event: message_stop\n" + sseEvent(map[string]interface{}{"type": "message_stop"})
+	if _, tail := p.feed([]byte(in)); tail == nil {
+		t.Fatal("thinking loop did not trip")
+	}
+	p.recordFinal()
+	if p.abortTrip() == nil {
+		t.Fatal("no loop trip recorded")
+	}
+	if got, want := p.usage(), (usageCounts{prompt: 77, cacheRead: 5}); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+}
