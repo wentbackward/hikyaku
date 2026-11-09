@@ -29,9 +29,30 @@ func TestConfigError_DropsQuotedValues(t *testing.T) {
 	if strings.Contains(got, "sk-hun") || strings.Contains(got, "hunter2") {
 		t.Errorf("configError kept the value: %q", got)
 	}
-	for _, want := range []string{"line 7", "<quoted len="} {
+	for _, want := range []string{"line 7", "!!str"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("configError = %q, want it to contain %q", got, want)
 		}
+	}
+}
+
+// A scalar holding a backquote cannot split the redaction: the YAML type
+// error is rendered from its structure, so nothing of the value remains.
+func TestConfigError_BackquotedValue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	yaml := "server:\n  allow_plaintext: true\nbackends:\n  - id: be\n    type: openai\n    base_url: http://127.0.0.1:1\n    max_concurrency: \"a`b sk-hunter2-secret\"\n"
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("config.Load accepted a string max_concurrency")
+	}
+	got := configError(err)
+	if strings.Contains(got, "hunter2") || strings.Contains(got, "sk-") {
+		t.Errorf("configError kept part of the value: %q", got)
+	}
+	if !strings.Contains(got, "line 7") {
+		t.Errorf("configError = %q, want the line", got)
 	}
 }

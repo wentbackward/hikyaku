@@ -312,6 +312,13 @@ func runMarkerTraffic(t *testing.T, level string) markerRun {
 		}
 	}
 
+	// /api/tags fetches the model list itself, through the same transport,
+	// and logs its own upstream errors.
+	for _, reply := range rawMarkerReplies {
+		s := newCredServer(t, startRawUpstream(t, reply), "ollama", "", "", "")
+		client.WriteString(getMarkerPath(t, s, "/api/tags"))
+	}
+
 	// Load-balanced routes: the affinity key is a caller header value or a
 	// fingerprint of the first user message, and the inspect build logs
 	// [lb] lines about it at level 0. Two requests each, so the second
@@ -336,6 +343,11 @@ func runMarkerTraffic(t *testing.T, level string) markerRun {
 var rawMarkerReplies = []string{
 	`{"error":"` + logMarker + `"}` + "\r\n",
 	"HTTP/1.1 " + logMarker + " echoed\r\nContent-Length: 0\r\n\r\n",
+	// net/textproto puts the bad header line in its error, unquoted.
+	"HTTP/1.1 200 OK\r\nX-Echo: " + logMarker + "\x01\r\n\r\n",
+	"HTTP/1.1 200 OK\r\n " + logMarker + "\r\n\r\n",
+	// A content coding the proxy cannot read, in single quotes.
+	"HTTP/1.1 200 OK\r\nContent-Encoding: '" + logMarker + "'\r\nContent-Length: 0\r\n\r\n",
 }
 
 // startRawUpstream listens on loopback and answers every request with the
@@ -429,6 +441,28 @@ func sendMarkerRequest(t *testing.T, s *Server, path, body string) string {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	got, _ := io.ReadAll(resp.Body) // a cut stream ends in an error; keep what arrived
+	return string(got)
+}
+
+// getMarkerPath serves s on a loopback listener and GETs path, with the
+// marker in the query string and a custom header.
+func getMarkerPath(t *testing.T, s *Server, path string) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	s.RegisterRoutes(mux)
+	front := httptest.NewServer(mux)
+	defer front.Close()
+	req, err := http.NewRequest(http.MethodGet, front.URL+path+"?q="+logMarker, http.NoBody)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("X-Title", logMarker+" title")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	got, _ := io.ReadAll(resp.Body)
 	return string(got)
 }
 
