@@ -7,9 +7,11 @@ package proxy
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -444,4 +446,131 @@ func TestEncoding_DecodedStreamFlushesIncrementally(t *testing.T) {
 		t.Errorf("rest of stream = %q", tail)
 	}
 	assertCounted(t, events)
+}
+
+// A backend headers rule that sets Accept-Encoding loads, and the server logs
+// one warning that it is ignored on start and on every reload.
+func TestEncoding_AcceptEncodingRuleWarnedOnStartAndReload(t *testing.T) {
+	logs := captureLog(t)
+	cfg, err := config.Load(writeTestConfig(t, `
+server:
+  allow_plaintext: true
+backends:
+  - id: be
+    type: openai
+    base_url: "http://127.0.0.1:1"
+    headers:
+      add:
+        Accept-Encoding: gzip
+routes:
+  - virtual_model: m
+    backend: be
+`))
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	m, _, _ := telemetry.Init()
+	srv := New("test", "test", cfg, m, nil)
+	const line = "[config] WARNING: headers rules that set Accept-Encoding are ignored"
+	if n := strings.Count(logs.String(), line); n != 1 {
+		t.Fatalf("warning lines after start = %d, want 1:\n%s", n, logs.String())
+	}
+	srv.Reload(srv.Config())
+	if n := strings.Count(logs.String(), line); n != 2 {
+		t.Fatalf("warning lines after reload = %d, want 2", n)
+	}
+}
+
+// A gzip stream that breaks off (no final block or trailer) or is not gzip
+// at all is passed on as far as it decodes: the client's read ends with an
+// unexpected EOF, the usage event ends with upstream_error, and the usage
+// parsed before the break is reported.
+func TestEncoding_BrokenGzipStreamEndsAsUpstreamError(t *testing.T) {
+	lane := encodingLanes[1]
+	truncated := func() []byte {
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		_, _ = io.WriteString(zw, lane.payload)
+		_ = zw.Flush() // no Close: the final block and the trailer never come
+		return buf.Bytes()
+	}()
+	for _, tc := range []struct {
+		name                 string
+		body                 []byte
+		prompt, completion   int64
+		wantPayloadDelivered bool
+	}{
+		{name: "truncated", body: truncated, prompt: 11, completion: 7, wantPayloadDelivered: true},
+		{name: "not-gzip", body: []byte("this is not a gzip stream")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.Header().Set("Content-Type", lane.contentType)
+				w.Header().Set("Content-Encoding", "gzip")
+				_, _ = w.Write(tc.body)
+			}))
+			t.Cleanup(up.Close)
+			events := make(chan UsageEvent, 4)
+			ps := newEncodingProxy(t, lane.backendType, up.URL, "", func(ev UsageEvent) { events <- ev })
+			req, _ := http.NewRequest(http.MethodPost, ps.URL+lane.path, bytes.NewReader(encodingRequestBody(lane)))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := rawClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status %d, want 200 (headers precede the body)", resp.StatusCode)
+			}
+			got, err := io.ReadAll(resp.Body)
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Errorf("client read ended with %v, want unexpected EOF", err)
+			}
+			if tc.wantPayloadDelivered && string(got) != lane.payload {
+				t.Errorf("decoded part not delivered: %q", got)
+			}
+			ev := nextUsage(t, events)
+			if ev.EndReason != EndUpstreamError {
+				t.Errorf("EndReason = %q, want %q", ev.EndReason, EndUpstreamError)
+			}
+			if ev.PromptTokens != tc.prompt || ev.CompletionTokens != tc.completion {
+				t.Errorf("usage = %d/%d, want %d/%d", ev.PromptTokens, ev.CompletionTokens, tc.prompt, tc.completion)
+			}
+		})
+	}
+}
+
+// HTTP's deflate coding is the zlib format, but some servers send raw
+// deflate under that name; both are decoded and counted on every lane.
+func TestEncoding_DeflateAcceptsZlibAndRawDeflate(t *testing.T) {
+	rawDeflate := func(payload string) []byte {
+		var buf bytes.Buffer
+		fw, _ := flate.NewWriter(&buf, flate.DefaultCompression)
+		_, _ = io.WriteString(fw, payload)
+		_ = fw.Close()
+		return buf.Bytes()
+	}
+	for _, lane := range encodingLanes {
+		for _, format := range []string{"zlib", "raw"} {
+			t.Run(lane.name+"/"+format, func(t *testing.T) {
+				body := encodeAs(t, "deflate", lane.payload)
+				if format == "raw" {
+					body = rawDeflate(lane.payload)
+				}
+				up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					_, _ = io.Copy(io.Discard, r.Body)
+					w.Header().Set("Content-Type", lane.contentType)
+					w.Header().Set("Content-Encoding", "deflate")
+					_, _ = w.Write(body)
+				}))
+				t.Cleanup(up.Close)
+				events := make(chan UsageEvent, 4)
+				ps := newEncodingProxy(t, lane.backendType, up.URL, "", func(ev UsageEvent) { events <- ev })
+				resp, got := sendWithAcceptEncoding(t, ps, lane, "")
+				assertPlainResponse(t, resp, got, lane)
+				assertCounted(t, events)
+			})
+		}
+	}
 }
