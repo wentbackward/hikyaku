@@ -919,6 +919,8 @@ Per-backend `max_concurrency` limits belong to the config that set them: a reque
 
 ### Embedding: checked reloads and generation admission
 
+An embedding program reads config YAML it holds in memory with `hikyaku.ParseConfig(raw)`, which runs exactly the load pipeline (`${VAR}` expansion from the process environment, defaults, validation). `hikyaku.ParseConfigWithLookup(raw, lookup)` is the same pipeline with each `${NAME}` resolved by `lookup(NAME)` instead of the process environment, which it never reads: an embedder that validates YAML for a router whose environment is not its own passes that environment as `lookup`. Expansion is a single pass (a looked-up value is not expanded again), a name `lookup` returns `""` for expands to `""` as an unset variable does, and a nil `lookup` is an error. `ParseConfigWithLookup(raw, os.Getenv)` returns the same config as `ParseConfig(raw)`; `ParseConfig` and `LoadConfig` always use the process environment.
+
 An embedding program applies a config with `Server.ApplyConfig(cfg, opts...)`, which runs exactly the SIGHUP checks: a restart-only change is refused with a `*hikyaku.NonReloadableError` whose `Fields` lists the YAML paths above (`hikyaku.NonReloadableFields()` returns the whole list, `hikyaku.NonReloadableChanges(live, next)` the fields `next` would change, so an editor can say "restart required" before applying; pass `Server.Config()` or the config given to `New` as `live`, which agree on these fields), and the listen policy is enforced with the embedder's options. A refused config changes nothing. `Server.Reload` is deprecated: it refuses (and logs) a restart-only change the same way, but skips the listen policy.
 
 A `TransportFactory` is called once, in `New`, with generation 1's config; core never passes it a later one. Any field the factory reads is therefore restart-only in effect, and `ApplyConfig` cannot refuse a change to it because core does not know which fields a factory reads. An embedder that wants such a field to reload reconfigures its transport in place on each apply.
@@ -938,7 +940,7 @@ A host that holds a client's upload, reloads, then releases the body therefore c
 
 ## Environment variables
 
-Any `${VAR_NAME}` in the config file is expanded from the environment at load time. Unset variables expand to empty strings.
+Any `${VAR_NAME}` in the config file is expanded from the environment at load time. Unset variables expand to empty strings. (An embedding program can supply its own variables instead; see [Embedding](#embedding-checked-reloads-and-generation-admission).)
 
 ```yaml
 api_key: "${MY_SECRET}"          # resolved from environment
