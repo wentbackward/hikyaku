@@ -525,3 +525,52 @@ func TestDropConnectionHeaders_CaseVariantKeysAllHonored(t *testing.T) {
 		}
 	}
 }
+
+// A headers rule cannot write a hop-by-hop header: a rename of a caller
+// header into Connection (or an add of one) would let the reverse proxy's
+// post-Director pass drop the backend key again. Such rules are skipped
+// (config warns at load); the backend key and the rule headers survive.
+func TestCredentials_RulesCannotWriteHopByHopHeaders(t *testing.T) {
+	up := newRecordingUpstream(t)
+	s := newCredServer(t, up.URL, "openai", "", `
+    api_key: be-key
+    headers:
+      add:
+        X-Tenant-Id: tenant-a
+        Keep-Alive: timeout=5
+        Upgrade: websocket`, `
+    headers:
+      rename:
+        X-Caller-Conn: Connection
+        X-Caller-Te: Te`)
+	sendWithCallerCredentials(t, s, credLanes[0], map[string]string{
+		"X-Caller-Conn": "Authorization, X-Tenant-Id",
+		"X-Caller-Te":   "trailers",
+	})
+	got := up.last(t).header
+	assertOnlyCredential(t, got, map[string]string{"Authorization": "Bearer be-key"})
+	if v := got.Get("X-Tenant-Id"); v != "tenant-a" {
+		t.Errorf("X-Tenant-Id = %q, want tenant-a", v)
+	}
+	for _, name := range []string{"Connection", "Keep-Alive", "Upgrade", "Te"} {
+		if v := got.Get(name); v != "" {
+			t.Errorf("%s reached the backend through a headers rule: %q", name, v)
+		}
+	}
+}
+
+func TestApplyHeaderOps_SkipsHopByHopTargets(t *testing.T) {
+	for _, name := range []string{"Connection", "keep-alive", "Proxy-Connection", "TE", "Trailer", "Transfer-Encoding", "upgrade"} {
+		h := http.Header{"X-Src": {"v"}}
+		applyHeaderOps(h, config.HeadersOp{
+			Rename: map[string]string{"X-Src": name},
+			Add:    map[string]string{name: "added"},
+		})
+		if v := h.Get(name); v != "" {
+			t.Errorf("%s: rule wrote %q, want the rule skipped", name, v)
+		}
+		if v := h.Get("X-Src"); v != "v" {
+			t.Errorf("%s: skipped rename must leave the source, got %q", name, v)
+		}
+	}
+}

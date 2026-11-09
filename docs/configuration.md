@@ -437,6 +437,10 @@ routes:
 
 See [security](security.md#upstream-credentials).
 
+**Hop-by-hop headers are not configurable**
+
+`Connection`, `Keep-Alive`, `Proxy-Connection`, `Te`, `Trailer`, `Transfer-Encoding` and `Upgrade` describe one connection, and the reverse proxy acts on them after the rules run: a `Connection` value would make it remove the headers it names, the backend key included. A rule that adds one, or renames another header into one, has no effect. The config still loads, and one `[config] WARNING:` line naming each backend and route with such a rule is logged on start and on every reload. `remove` and a rename away from one work as usual.
+
 **`Accept-Encoding` is not configurable**
 
 The proxy reads every response body (usage metering, stream loop detection, capture), so it owns the upstream encoding negotiation: every proxied request asks the upstream for `Accept-Encoding: identity`, set after the header rules. The caller's `Accept-Encoding` is not forwarded, and a rule that adds or renames into `Accept-Encoding` has no effect: the config still loads, and one `[config] WARNING:` line naming each backend and route with such a rule is logged on start and on every reload. Clients receive uncompressed responses. See [security](security.md#response-encoding) for how an upstream that compresses anyway is handled.

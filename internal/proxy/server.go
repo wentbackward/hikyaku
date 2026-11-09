@@ -1296,10 +1296,13 @@ func routeHeaders(res *router.Resolution) config.HeadersOp {
 // canonicalises). Add overwrites; Remove drops; Rename copies values to the
 // new name and deletes the original (replacing the destination if it exists).
 // A rename out of or into a credential header is skipped (config warns at
-// load): it would forward a caller value as, or from, a credential.
+// load): it would forward a caller value as, or from, a credential. An add of
+// a hop-by-hop header, or a rename into one, is skipped too (config warns):
+// the reverse proxy acts on those after the Director, and a Connection value
+// would make it remove the backend key.
 func applyHeaderOps(h http.Header, op config.HeadersOp) {
 	for src, dst := range op.Rename {
-		if config.IsCredentialHeader(src) || config.IsCredentialHeader(dst) {
+		if config.IsCredentialHeader(src) || config.IsCredentialHeader(dst) || config.IsHopByHopHeader(dst) {
 			continue
 		}
 		// Get returns the first value; use values for the full set.
@@ -1325,6 +1328,9 @@ func applyHeaderOps(h http.Header, op config.HeadersOp) {
 		h.Del(name)
 	}
 	for name, value := range op.Add {
+		if config.IsHopByHopHeader(name) {
+			continue
+		}
 		h.Set(name, value)
 	}
 }

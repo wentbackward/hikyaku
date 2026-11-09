@@ -301,6 +301,7 @@ func parse(raw []byte, source string) (*Config, error) {
 	deprecateLoopDetection(&cfg)
 	warnIgnoredAcceptEncoding(&cfg)
 	warnIgnoredCredentialRename(&cfg)
+	warnIgnoredHopByHop(&cfg)
 
 	cfg.backendByID = make(map[string]*Backend, len(cfg.Backends))
 	for i := range cfg.Backends {

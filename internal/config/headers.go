@@ -51,6 +51,74 @@ func warnIgnoredAcceptEncoding(cfg *Config) {
 		acceptEncodingHeader, strings.Join(where, ", ")))
 }
 
+// hopByHopHeaders are the hop-by-hop request headers (RFC 9110 7.6.1) a
+// headers rule may not write. httputil.ReverseProxy acts on them after the
+// Director returns: a Connection value would make it delete the headers it
+// names, the backend key included, and the others describe the proxy's own
+// connection to the backend, which the transport owns.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Connection",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// IsHopByHopHeader reports whether name (any case) is a hop-by-hop header a
+// headers rule may not write.
+func IsHopByHopHeader(name string) bool {
+	canonical := http.CanonicalHeaderKey(name)
+	for _, hop := range hopByHopHeaders {
+		if canonical == hop {
+			return true
+		}
+	}
+	return false
+}
+
+// writesHopByHop reports whether op adds a hop-by-hop header or renames
+// another header into one.
+func (h HeadersOp) writesHopByHop() bool {
+	for name := range h.Add {
+		if IsHopByHopHeader(name) {
+			return true
+		}
+	}
+	for _, dst := range h.Rename {
+		if IsHopByHopHeader(dst) {
+			return true
+		}
+	}
+	return false
+}
+
+// warnIgnoredHopByHop records one warning listing every backend and route
+// whose headers rule adds or renames into a hop-by-hop header. The rule
+// still loads, so existing configs keep working; the proxy skips that part.
+func warnIgnoredHopByHop(cfg *Config) {
+	var where []string
+	for i := range cfg.Backends {
+		if cfg.Backends[i].Headers.writesHopByHop() {
+			where = append(where, fmt.Sprintf("backend %q", cfg.Backends[i].ID))
+		}
+	}
+	for i := range cfg.Routes {
+		if cfg.Routes[i].Headers.writesHopByHop() {
+			where = append(where, fmt.Sprintf("route %q", cfg.Routes[i].VirtualModel))
+		}
+	}
+	if len(where) == 0 {
+		return
+	}
+	cfg.warnings = append(cfg.warnings, fmt.Sprintf(
+		"headers adds and renames into a hop-by-hop header (%s) are ignored (set in: %s): "+
+			"they apply to one connection only, and a Connection value would remove headers the proxy sets "+
+			"(docs/security.md#upstream-credentials)",
+		strings.Join(hopByHopHeaders, ", "), strings.Join(where, ", ")))
+}
+
 // renamesCredential reports whether op renames a header out of or into a
 // credential header. Such a rename has no effect: the proxy strips the
 // caller's credentials before the rules run, and never turns a caller value

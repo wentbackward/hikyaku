@@ -72,6 +72,7 @@ The request body is the one the proxy buffered and rewrote, sent with a `Content
 - **`add`** may set a credential header with a static operator value (for example a self-hosted backend's own auth header); it overrides the backend `api_key` header of the same name.
 - **`remove`** may drop a credential header, the backend's own included.
 - **`rename`** out of or into a credential header has no effect: out of one there is nothing left to move, and into one would send a caller-controlled value as an upstream credential. The config still loads; one `[config] WARNING:` line naming each backend and route with such a rule is logged on start and on every reload.
+- **`add`** or **`rename`** into a hop-by-hop header (`Connection`, `Keep-Alive`, `Proxy-Connection`, `Te`, `Trailer`, `Transfer-Encoding`, `Upgrade`) has no effect: the reverse proxy acts on those after the rules run, so a `Connection` value (for example a caller header renamed into it) would remove the backend key again. The config still loads, with one `[config] WARNING:` line naming each backend and route with such a rule.
 
 The level-2 header log and capture files redact every credential header and `Set-Cookie`.
 

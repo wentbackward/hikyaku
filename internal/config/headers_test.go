@@ -148,3 +148,56 @@ func TestWarnings_ReturnsCopy(t *testing.T) {
 		t.Error("Warnings must return a copy of the internal slice")
 	}
 }
+
+// A rule that adds or renames into a hop-by-hop header loads but is reported
+// once, naming every place it is set: the proxy skips it, because a
+// Connection value would let the reverse proxy drop headers the proxy set.
+func TestHeaders_HopByHopRuleLoadsWithWarning(t *testing.T) {
+	cfg := parseHeadersConfig(t,
+		"    headers:\n      add:\n        keep-alive: timeout=5",
+		"    headers:\n      rename:\n        X-Foo: Connection")
+	w := cfg.Warnings()
+	if len(w) != 1 {
+		t.Fatalf("want exactly one warning, got %d: %q", len(w), w)
+	}
+	for _, want := range []string{"hop-by-hop", "ignored", "Connection", `backend "be"`, `route "m"`} {
+		if !strings.Contains(w[0], want) {
+			t.Errorf("warning %q missing %q", w[0], want)
+		}
+	}
+	for _, unwanted := range []string{`"other"`, `"plain"`} {
+		if strings.Contains(w[0], unwanted) {
+			t.Errorf("warning names a place without the rule (%s): %q", unwanted, w[0])
+		}
+	}
+	if got := cfg.Routes[0].Headers.Rename["X-Foo"]; got != "Connection" {
+		t.Errorf("the rule must still load unchanged, got %q", got)
+	}
+}
+
+// Removing a hop-by-hop header, or renaming one away, writes none and does
+// not warn.
+func TestHeaders_HopByHopRemoveAndRenameAwayDoNotWarn(t *testing.T) {
+	cfg := parseHeadersConfig(t,
+		"    headers:\n      remove: [Upgrade, Te]",
+		"    headers:\n      rename:\n        Upgrade: X-Original-Upgrade")
+	if w := cfg.Warnings(); len(w) != 0 {
+		t.Errorf("unexpected warnings: %q", w)
+	}
+}
+
+func TestIsHopByHopHeader_KnownNamesAnyCase(t *testing.T) {
+	for _, name := range []string{
+		"Connection", "connection", "Keep-Alive", "Proxy-Connection", "TE", "te",
+		"Trailer", "Transfer-Encoding", "UPGRADE",
+	} {
+		if !IsHopByHopHeader(name) {
+			t.Errorf("IsHopByHopHeader(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{"", "Content-Type", "X-Connection", "Authorization"} {
+		if IsHopByHopHeader(name) {
+			t.Errorf("IsHopByHopHeader(%q) = true, want false", name)
+		}
+	}
+}
