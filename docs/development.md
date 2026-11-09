@@ -67,7 +67,7 @@ Multi-arch images (linux/amd64, linux/arm64) are built automatically by the rele
 
 ## SIGHUP reload — what applies, what doesn't
 
-`docker kill --signal=HUP hikyaku` re-reads `config.yaml` and atomically swaps in the new state. Good for iterating on routes and backends without disturbing in-flight requests. But several pieces are initialised once at startup and do **not** reload:
+`docker kill --signal=HUP hikyaku` re-reads `config.yaml` and atomically swaps in the new state. Good for iterating on routes and backends without disturbing in-flight requests. Several pieces are initialised once at startup; a config that changes one of them is **refused as a whole** (logged as `config reload rejected`, the old config keeps running):
 
 | Config change | Reloads via SIGHUP? |
 |---|---|
@@ -75,12 +75,14 @@ Multi-arch images (linux/amd64, linux/arm64) are built automatically by the rele
 | `backends.*` — URL, api_key, auth_type, timeout, max_concurrency, default flag | ✅ |
 | `server.log_level` / `LOG_LEVEL` | ✅ |
 | `server.passthrough_unrouted` | ✅ |
-| `server.allow_plaintext`, `server.tls.*` | ✅ *policy check only* — accepted or rejected; the listener itself is not rebuilt |
+| `server.allow_plaintext` | ✅ *policy check only* — accepted or rejected; the listener itself is not rebuilt |
 | `sig_message_capture.*` | ✅ (feature is rebuilt, arm state reset) |
-| `server.host` / `server.port` / `server.transport.*` | ❌ Restart |
-| `server.min_tls_version` | ❌ Restart — the outbound transport (live traffic and health probes) is built once at startup |
-| `telemetry.prometheus.*` (host, port, path, TLS, allow_plaintext) | ❌ Restart |
-| `journal.enabled` / `journal.otlp_endpoint` | ❌ Restart |
+| `server.host` / `server.port` / `server.tls.*` / `server.transport.*` | ❌ Refused — restart |
+| `server.min_tls_version` | ❌ Refused — restart: the outbound transport (live traffic and health probes) is built once at startup |
+| `telemetry.prometheus.*` (host, port, path, TLS, allow_plaintext) | ❌ Refused — restart |
+| `journal.enabled` / `journal.otlp_endpoint` | ❌ Refused — restart |
+
+The authoritative list is [Reloading the config](configuration.md#reloading-the-config).
 
 When in doubt, check `docker logs hikyaku 2>&1 | grep -A20 "SIGHUP received"` — the `[reload]` block prints the full route table the proxy now knows about. If your change doesn't appear there, the container didn't see it (most common cause: file-level bind mount + atomic-save editor; see the Quick start in the README).
 

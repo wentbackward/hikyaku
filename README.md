@@ -109,7 +109,7 @@ Both formats produce identical results. An explicit `id` / `virtual_model` insid
 
 **URL resolution (RFC 3986).** The proxy combines `base_url` with the request path using standard URL resolution ([RFC 3986 §5.2.2](https://www.rfc-editor.org/rfc/rfc3986#section-5.2.2)). Include a trailing slash on `base_url` when your backend uses a path prefix (e.g. `"http://host:port/v1/"`) so that relative resolution appends correctly. The incoming request path from the client is forwarded verbatim — the proxy does not manipulate it.
 
-Secrets use `${ENV_VAR}` syntax — resolved at startup, never stored in config. Hot-reload with `SIGHUP` — config, log level, and backend probes update without restart.
+Secrets use `${ENV_VAR}` syntax — resolved at startup, never stored in config. Hot-reload with `SIGHUP` — config, log level, and backend probes update without restart (a change to a [restart-only field](docs/configuration.md#reloading-the-config) such as the listen port is refused and the running config kept).
 
 See the [full configuration reference](docs/configuration.md) for details on auth types, TLS, auto-routing, and parameter profiles.
 

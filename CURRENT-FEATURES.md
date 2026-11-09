@@ -60,7 +60,7 @@
 - **Per-backend auth** — api_key, tls_client_cert, bearer_token
 
 ## Operations
-- **Hot reload** — SIGHUP updates config, log level, probes without restart
+- **Hot reload** — SIGHUP updates config, log level, probes without restart; a config that changes a restart-only field (listen address, TLS files, metrics listener, journal) is refused as a whole and the running config kept ([details](docs/configuration.md#reloading-the-config))
 - **Per-backend concurrency limits** — semaphore-based, config-driven
 - **Per-backend timeouts** — independent timeout per backend
 - **Config map syntax** — YAML map keys auto-become `id`/`virtual_model`

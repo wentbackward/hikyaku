@@ -865,7 +865,7 @@ telemetry:
     allow_plaintext: true      # if you're on a trusted network (Tailscale etc.)
 ```
 
-…or configure `tls.cert` + `tls.key` for HTTPS. Unlike most config, changes to `telemetry.prometheus.*` do **not** pick up on SIGHUP — the metrics server is built once at startup. Restart the container with `docker compose up -d --force-recreate` to apply.
+…or configure `tls.cert` + `tls.key` for HTTPS. Unlike most config, `telemetry.prometheus.*` is restart-only: the metrics server is built once at startup, and a SIGHUP with a changed value is refused (see [Reloading the config](#reloading-the-config)). Restart the container with `docker compose up -d --force-recreate` to apply.
 
 ## Journal
 
@@ -893,6 +893,40 @@ The proxy serves the following endpoints, all using the same reverse-proxy pipel
 Each endpoint forwards requests in the client's format — no protocol translation. A request to `/v1/chat/completions` must route to an `openai`-type backend; `/v1/messages` must route to an `anthropic`-type backend.
 
 `/v1/chat/completions`, `/v1/completions`, and `/v1/embeddings` share the same reverse-proxy pipeline — all get metrics, idle timeout, and logging. `/v1/completions` and `/v1/embeddings` force their respective backend paths.
+
+## Reloading the config
+
+`SIGHUP` re-reads the config file and applies it as a whole, or not at all. Requests already routed finish on the config they started with; a request reaching routing after the swap uses the new one.
+
+**Restart-only fields.** These are read once at startup, so a reload cannot apply them:
+
+| Field | Why |
+|---|---|
+| `server.host`, `server.port` | the gateway listener is bound once |
+| `server.tls.cert`, `server.tls.key` | the certificate is loaded once, when the listener starts |
+| `server.min_tls_version` | the inbound listener's floor and the outbound transport's floor are built once |
+| `server.transport.*` | the outbound connection pool is built once |
+| `telemetry.prometheus.*` (`enabled`, `host`, `port`, `path`, `allow_plaintext`, `tls.cert`, `tls.key`) | the metrics listener is started once |
+| `journal.enabled`, `journal.otlp_endpoint` | the journal exporter is constructed once |
+
+A config file that changes any of them is **refused as a whole**: the proxy logs `config reload rejected: config changes fields a reload cannot apply (restart to change them): <fields>` and keeps running the previous config, including its routes and backends. Values are compared after defaults, so spelling out a default (`port: 4000`) is not a change. Restart the process to apply such a change.
+
+Everything else is reloadable: `routes`, `backends`, `groups`, `load_balancing`, `defenders`, `sig_message_capture` (the capture handle is rebuilt and an armed window is cleared), `server.api_key`, `server.passthrough_unrouted`, `server.log_level`, `server.max_request_body_mb`, `server.drop_empty_content`, and `server.allow_plaintext` (a listen-policy input: re-checked on every reload, so a config that fails the policy is refused too). A config that fails to load is refused the same way. Each reload also re-probes the backends.
+
+### Embedding: checked reloads and generation admission
+
+An embedding program applies a config with `Server.ApplyConfig(cfg, opts...)`, which runs exactly the SIGHUP checks: a restart-only change is refused with a `*hikyaku.NonReloadableError` whose `Fields` lists the YAML paths above (`hikyaku.NonReloadableFields()` returns the whole list, `hikyaku.NonReloadableChanges(live, next)` the fields `next` would change, so an editor can say "restart required" before applying), and the listen policy is enforced with the embedder's options. A refused config changes nothing. `Server.Reload` applies without these checks and is deprecated.
+
+Each applied config is a new **generation**: the config passed to `New` is generation 1 and every successful `ApplyConfig` publishes the next, even for an unchanged config. `Server.Generation()` returns the live one; `Generation.ID()` is its sequence number and `Generation.Config()` the exact `*Config` pointer passed to `New` or `ApplyConfig`, so an embedder can tie a generation to what it derived from that config (a digest, say) with no race against a concurrent apply.
+
+`hikyaku.WithGenerationAdmission(f)` installs a per-request fence for an embedder that binds the running config into its identity (an attested certificate carrying a config digest, for example). For every request that reaches routing on an endpoint that contacts an upstream (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/messages`, `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/api/tags`), core:
+
+1. reads the whole request body,
+2. loads the generation the request will be served by, once,
+3. calls `f(ctx, gen)` with the inbound request context,
+4. and only if `f` returns nil goes on to balancer selection, journal export, capture and the backend connection, all with that same generation. The live state is never re-loaded for the request, even if a reload lands while `f` runs.
+
+A host that holds a client's upload, reloads, then releases the body therefore cannot get the request served by a config the hook did not see. A non-nil error ends the request with no upstream contact: `503` with `{"error":"request not admitted"}`, or the status of a `*hikyaku.AdmissionError` in the error chain (400–599). The error text is logged, never sent to the client. `/health` and `/v1/models` contact no upstream and do not call the hook; neither do requests that end before routing (wrong method, unreadable or invalid body). The hook runs on the request path and must be cheap.
 
 ## Environment variables
 

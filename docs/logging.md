@@ -25,11 +25,11 @@ Send `SIGHUP` to reload the entire config, log level, and re-probe all backends 
 docker kill --signal=HUP hikyaku
 ```
 
-If the new config fails to parse, the old config is kept and an error is logged. In-flight requests continue with the old config; new requests pick up the new config.
+If the new config fails to parse, or changes a field only a restart applies (listen address, TLS files, metrics listener, journal, ...), the old config is kept and an error is logged. In-flight requests continue with the old config; new requests pick up the new config. The restart-only fields are listed in [Reloading the config](configuration.md#reloading-the-config).
 
 A reload (SIGHUP or an embedder's apply) also rebuilds the capture handle, the stream-loop sample writer and the load balancer, and logs any deprecation notice for the new config (for example the removed `loop_detection` key) once.
 
-**Embedders.** `hikyaku.ParseConfig(raw)` runs the same parse/validate pipeline as `LoadConfig` on bytes (an empty document is `ErrEmptyDocument`). `Server.ApplyConfig(cfg, opts...)` applies it the way SIGHUP does: it enforces the listen policy with the embedder's options (e.g. `WithExternalGatewayTLS()`), then swaps the live config atomically; a rejected config leaves the running one untouched. Applies and reloads are serialized. `ApplyConfig` does not re-probe backends or change the log level — call `ApplyLogLevel` after a successful apply, as on SIGHUP.
+**Embedders.** `hikyaku.ParseConfig(raw)` runs the same parse/validate pipeline as `LoadConfig` on bytes (an empty document is `ErrEmptyDocument`). `Server.ApplyConfig(cfg, opts...)` applies it the way SIGHUP does: it refuses a restart-only change (`NonReloadableError`), enforces the listen policy with the embedder's options (e.g. `WithExternalGatewayTLS()`), then publishes the config as the next generation with one atomic swap; a rejected config leaves the running one untouched. Applies and reloads are serialized. `ApplyConfig` does not re-probe backends or change the log level — call `ApplyLogLevel` after a successful apply, as on SIGHUP. Generations and the per-request admission hook are described in [Embedding: checked reloads and generation admission](configuration.md#embedding-checked-reloads-and-generation-admission).
 
 ## Log levels
 
