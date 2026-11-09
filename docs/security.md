@@ -59,7 +59,11 @@ Why identity rather than letting the transport negotiate gzip: the choice holds 
 
 ### Upstream credentials
 
-A caller's credentials never reach a backend. Before forwarding, the proxy removes every credential header from the caller's request — `Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`, `Proxy-Authorization` and `Cookie` — and then sets only the backend's own `api_key`, in the header its lane uses (`auth_type`; see [configuration](configuration.md#authentication)). A backend without `api_key` receives no credential header at all. This also keeps the shared `server.api_key` a client never forwards: it authenticates the client at the proxy and stops there.
+A caller's credentials never reach a backend. Before forwarding, the proxy removes every credential header from the caller's request — `Authorization`, `X-Api-Key`, `Api-Key`, `X-Goog-Api-Key`, `Proxy-Authorization` and `Cookie` — and then sets only the backend's own `api_key`, in the header its lane uses (`auth_type`; see [configuration](configuration.md#authentication)). A backend without `api_key` receives no credential header at all. The client's copy of the shared `server.api_key` is consumed at the proxy and never forwarded.
+
+The list is a denylist of the common credential headers. Other headers that can carry a credential (`X-Auth-Token`, `X-Amz-Security-Token`, a provider's custom header) pass through unless a `headers` `remove` rule drops them.
+
+Headers the caller names in `Connection` are hop-by-hop and are dropped, with `Connection` itself, before anything else, so a caller cannot use `Connection` to remove the backend key or a header set by a rule.
 
 The request body is the one the proxy buffered and rewrote, sent with a `Content-Length`: no chunked transfer coding, and none of the caller's trailers (a trailer can carry a credential too).
 
@@ -70,6 +74,8 @@ The request body is the one the proxy buffered and rewrote, sent with a `Content
 - **`rename`** out of or into a credential header has no effect: out of one there is nothing left to move, and into one would send a caller-controlled value as an upstream credential. The config still loads; one `[config] WARNING:` line naming each backend and route with such a rule is logged on start and on every reload.
 
 The level-2 header log and capture files redact every credential header and `Set-Cookie`.
+
+**Upgrading:** backends without `api_key` no longer receive the caller's `Authorization` or API-key header. A deployment that relied on that passthrough sets the backend's `api_key`, or sends a static credential with `headers.add`.
 
 ### TLS with Tailscale
 
