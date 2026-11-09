@@ -67,11 +67,6 @@ type streamLoopRoute struct {
 	route string // metric/log label: the route's canonical virtual_model
 }
 
-// guarded reports whether the request's stream will be measured.
-func (sl *streamLoopRoute) guarded() bool {
-	return sl != nil && sl.cfg.Active()
-}
-
 // ── Compression ratio ────────────────────────────────────────────────────────
 
 // deflater is a pooled level-9 raw-deflate writer that only counts its output,
