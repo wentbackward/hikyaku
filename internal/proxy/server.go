@@ -43,16 +43,15 @@ func requestID() string {
 
 // Server handles all proxy traffic.
 type Server struct {
-	buildMode   string
-	version     string
-	state       atomic.Pointer[runtimeState] // config, router and balancer, published together
-	metrics     *telemetry.Metrics
-	journal     *journal.Journal                // nil if journal disabled
-	capture     atomic.Pointer[capture.Capture] // nil value = capture disabled; rebuilt on Reload
-	loopSampler atomic.Pointer[loopSampler]     // nil = no stream-loop samples (always nil in hardened); rebuilt on Reload
+	buildMode string
+	version   string
+	state     atomic.Pointer[runtimeState] // one generation of the reloadable state, published as a whole
+	metrics   *telemetry.Metrics
+	journal   *journal.Journal // nil if journal disabled
 
 	transport     http.RoundTripper        // shared outbound transport (default *http.Transport; override via WithTransportFactory)
 	usageObserver UsageObserver            // nil unless set via WithUsageObserver (pro accounting seam)
+	admission     GenerationAdmission      // nil unless set via WithGenerationAdmission (pro attestation seam)
 	captureGate   captureGate              // server-level capture filter (WithCaptureFilter); fieldless in hardened builds
 	mu            sync.RWMutex             // guards semaphores
 	reloadMu      sync.Mutex               // serializes Reload / ApplyConfig (balancer swap)
@@ -60,15 +59,105 @@ type Server struct {
 	bufferedBytes atomic.Int64             // bytes currently held in proxy buffers
 }
 
-// runtimeState is one immutable generation of the reloadable routing state.
-// reload builds a complete new generation and publishes it with a single
-// atomic swap; a request loads it once and uses that generation throughout,
-// so it never pairs one config with another config's router or balancer (a
-// group or backend id the other side does not know).
+// runtimeState is one immutable generation of the reloadable state: the
+// config and everything built from it per reload. reload builds a complete new
+// generation and publishes it with a single atomic swap; a proxied request
+// loads it once, after reading its body, passes it to the admission hook and
+// uses that generation throughout, so it never pairs one config with another
+// config's router, balancer (a group or backend id the other side does not
+// know), capture window or sample writer.
 type runtimeState struct {
+	id          uint64 // 1 for the config passed to New, +1 per applied config
+	cfg         *config.Config
+	rtr         *router.Router
+	bal         *balancer.Balancer // nil iff cfg has no groups
+	capture     *capture.Capture   // nil = capture disabled (always nil in hardened)
+	loopSampler *loopSampler       // nil = no stream-loop samples (always nil in hardened)
+}
+
+// generation is the embedder's view of st.
+func (st *runtimeState) generation() Generation {
+	return Generation{id: st.id, cfg: st.cfg}
+}
+
+// Generation identifies one published generation of the server's reloadable
+// state: the config passed to New is generation 1, and every config
+// ApplyConfig (or Reload) applies publishes the next one, even when it equals
+// the previous config. The value is stable: it names that generation for the
+// life of the server.
+type Generation struct {
+	id  uint64
 	cfg *config.Config
-	rtr *router.Router
-	bal *balancer.Balancer // nil iff cfg has no groups
+}
+
+// ID is the generation's sequence number, starting at 1 and increasing by
+// one per applied config. 0 only for the zero Generation.
+func (g Generation) ID() uint64 { return g.id }
+
+// Config is the config this generation runs: the very pointer passed to New
+// or to the ApplyConfig that published it, so an embedder can tie a
+// generation to state it derived from that config (a digest, say) without
+// racing a concurrent apply. Read-only.
+func (g Generation) Config() *config.Config { return g.cfg }
+
+// GenerationAdmission decides whether a proxied request may be served by gen.
+// Core calls it exactly once for every request that reaches routing: after
+// the request body has been read and the generation the request will route
+// with has been selected, and before anything contacts an upstream (no
+// balancer selection, journal export, capture or backend connection has
+// happened yet). The request is then served by exactly gen — core never
+// re-loads the live state for it, even if a reload lands meanwhile. ctx is
+// the inbound request context, so a hook can compare gen with what the
+// embedder recorded for the connection (the config digest its attested
+// certificate binds, say). A non-nil error ends the request with no upstream
+// contact: 503, or the status of an AdmissionError in the chain; the error
+// text is logged, never sent to the client. Requests that end before routing
+// (bad method, unreadable or invalid body) and endpoints that contact no
+// upstream (/health, /v1/models) do not call it. It runs on the request path
+// and must not block for long.
+type GenerationAdmission func(ctx context.Context, gen Generation) error
+
+// WithGenerationAdmission installs the admission hook. nil admits every
+// request (core's default).
+func WithGenerationAdmission(f GenerationAdmission) Option {
+	return func(s *Server) { s.admission = f }
+}
+
+// AdmissionError lets a GenerationAdmission hook choose the refused request's
+// status (e.g. 421 Misdirected Request). A Status outside 400-599 means 503.
+type AdmissionError struct {
+	Status int
+	Err    error
+}
+
+func (e *AdmissionError) Error() string {
+	if e.Err == nil {
+		return fmt.Sprintf("request not admitted (status %d)", e.Status)
+	}
+	return fmt.Sprintf("request not admitted (status %d): %v", e.Status, e.Err)
+}
+
+func (e *AdmissionError) Unwrap() error { return e.Err }
+
+// admit runs the admission hook, if any, for a request about to be served by
+// st. On refusal it writes the error response and returns false; the caller
+// must return without touching an upstream.
+func (s *Server) admit(w http.ResponseWriter, r *http.Request, rid string, st *runtimeState) bool {
+	if s.admission == nil {
+		return true
+	}
+	err := s.admission(r.Context(), st.generation())
+	if err == nil {
+		return true
+	}
+	status := http.StatusServiceUnavailable
+	var ae *AdmissionError
+	if errors.As(err, &ae) && ae.Status >= 400 && ae.Status <= 599 {
+		status = ae.Status
+	}
+	log.Printf("[proxy] [%s] %s %s not admitted (generation %d): %v", rid, r.Method, r.URL.Path, st.id, err)
+	jsonError(w, "request not admitted", status)
+	return false
 }
 
 // TransportFactory builds the outbound RoundTripper used for all backend
@@ -249,10 +338,8 @@ func New(version, buildMode string, cfg *config.Config, metrics *telemetry.Metri
 			TLSClientConfig:     sectls.ClientConfig(cfg.MinTLS()),
 		},
 	}
-	s.state.Store(&runtimeState{cfg: cfg, rtr: router.New(cfg)})
+	s.state.Store(newGeneration(cfg, 1))
 	s.buildSemaphores(cfg)
-	s.applyCaptureConfig(cfg)
-	s.applyLoopSamplerConfig(cfg)
 	logConfigNotices(cfg)
 	// Apply options before anything that depends on them: the balancer's probes
 	// go through the outbound transport an option may replace. cfg is already
@@ -276,10 +363,23 @@ func (s *Server) newBalancer(cfg *config.Config) *balancer.Balancer {
 	return balancer.New(cfg, balancer.WithTransport(s.transport))
 }
 
-// applyCaptureConfig builds (or rebuilds) the capture handle from cfg. An init
+// newGeneration builds generation id of the reloadable state for cfg, all
+// but the balancer (whose probes need the outbound transport options may
+// replace; the caller adds it).
+func newGeneration(cfg *config.Config, id uint64) *runtimeState {
+	return &runtimeState{
+		id:          id,
+		cfg:         cfg,
+		rtr:         router.New(cfg),
+		capture:     newCapture(cfg),
+		loopSampler: newConfiguredLoopSampler(cfg),
+	}
+}
+
+// newCapture builds the capture handle for cfg (nil when disabled). An init
 // failure disables capture rather than failing the whole server — this is a
 // debug-only feature and should never take the proxy down.
-func (s *Server) applyCaptureConfig(cfg *config.Config) {
+func newCapture(cfg *config.Config) *capture.Capture {
 	c, err := capture.New(capture.Config{
 		Enabled:      cfg.SigMessageCapture.Enabled,
 		OutputFolder: cfg.SigMessageCapture.OutputFolder,
@@ -287,26 +387,25 @@ func (s *Server) applyCaptureConfig(cfg *config.Config) {
 	})
 	if err != nil {
 		log.Printf("[capture] init failed: %v (disabling)", err)
-		c = nil
+		return nil
 	}
-	s.capture.Store(c)
 	if c != nil {
 		log.Printf("[capture] enabled: folder=%s max_messages=%d (send SIGUSR1 to arm)",
 			c.OutputFolder(), c.MaxMessages())
 	}
+	return c
 }
 
-// applyLoopSamplerConfig builds (or rebuilds) the stream-loop sample writer.
+// newConfiguredLoopSampler builds the stream-loop sample writer for cfg.
 // Like capture, a failure disables the debug feature instead of failing the
 // server.
-func (s *Server) applyLoopSamplerConfig(cfg *config.Config) {
+func newConfiguredLoopSampler(cfg *config.Config) *loopSampler {
 	sc := cfg.StreamLoopSamples()
 	ls, err := newLoopSampler(sc)
 	if err != nil {
 		log.Printf("[stream_loop] samples disabled: %v", err)
 		ls = nil
 	}
-	s.loopSampler.Store(ls)
 	switch {
 	case sc.Folder == "":
 	case !loopSamplesCompiledIn:
@@ -314,6 +413,7 @@ func (s *Server) applyLoopSamplerConfig(cfg *config.Config) {
 	case ls != nil:
 		log.Printf("[stream_loop] tripping-window samples: folder=%s max_samples=%d", sc.Folder, sc.MaxSamples)
 	}
+	return ls
 }
 
 // logConfigNotices logs each deprecation and warning notice the loader
@@ -327,10 +427,19 @@ func logConfigNotices(cfg *config.Config) {
 	}
 }
 
-// Capture returns the current capture handle (may be nil if disabled).
-// Used by the SIGUSR1 handler in main.
+// Capture returns the current generation's capture handle (nil if
+// disabled). Used by the SIGUSR1 handler in main. A reload replaces it, which
+// closes any window armed on the old one.
 func (s *Server) Capture() *capture.Capture {
-	return s.capture.Load()
+	return s.state.Load().capture
+}
+
+// Generation returns the live generation: the one a request reaching routing
+// now would be served by (see GenerationAdmission). After an ApplyConfig(cfg)
+// that returned nil, the live generation is the one it published as long as
+// Generation().Config() == cfg; a later apply has superseded it otherwise.
+func (s *Server) Generation() Generation {
+	return s.state.Load().generation()
 }
 
 // Balancer returns the current balancer (may be nil if no groups configured).
@@ -338,24 +447,37 @@ func (s *Server) Balancer() *balancer.Balancer {
 	return s.state.Load().bal
 }
 
-// ApplyConfig is the programmatic counterpart of a SIGHUP reload for
-// embedders: it runs the same gate cmd/hikyaku runs before Reload — the
-// listen policy, with the embedder's options (an embedder serving a runtime
-// certificate passes config.WithExternalGatewayTLS, as it does at startup) —
-// and, only if that passes, swaps cfg in atomically with Reload. A rejected
-// cfg (nil, or failing the policy) returns the reason and leaves the live
-// config, router, balancer and semaphores exactly as they were. cfg must come
-// from config.Load or config.Parse, which validate its structure; the log
-// level is the embedder's to apply afterwards (logger.Apply), as on SIGHUP.
-// Concurrent calls, and calls concurrent with Reload, are serialized: the
-// gate and the swap run under one lock, so two ApplyConfig calls can never
-// interleave between their verdicts and their swaps.
+// ApplyConfig is the checked reload, for cmd/hikyaku's SIGHUP and for
+// embedders. It refuses cfg, returning the reason, when:
+//
+//   - cfg is nil;
+//   - cfg changes a field the server reads only at startup (listen address,
+//     TLS files and floor, outbound pool, metrics listener, journal — see
+//     config.NonReloadableFields): a *config.NonReloadableError listing them,
+//     since applying the rest would leave the process running a config other
+//     than cfg;
+//   - cfg fails the listen policy with the embedder's options (an embedder
+//     serving a runtime certificate passes config.WithExternalGatewayTLS, as
+//     it does at startup).
+//
+// A refused cfg changes nothing: the live generation (config, router,
+// balancer, capture, semaphores) stays exactly as it was. Otherwise cfg is
+// published as the next generation with one atomic swap; requests already
+// routed finish on theirs. cfg must come from config.Load or config.Parse,
+// which validate its structure; the log level is the caller's to apply
+// afterwards (logger.Apply), as on SIGHUP. Concurrent calls, and calls
+// concurrent with Reload, are serialized: the checks and the swap run under
+// one lock, so two ApplyConfig calls can never interleave between their
+// verdicts and their swaps.
 func (s *Server) ApplyConfig(cfg *config.Config, opts ...config.ListenPolicyOption) error {
 	if cfg == nil {
 		return errors.New("apply config: nil config")
 	}
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
+	if fields := config.NonReloadableChanges(s.state.Load().cfg, cfg); len(fields) > 0 {
+		return &config.NonReloadableError{Fields: fields}
+	}
 	if err := cfg.ValidateListenPolicy(opts...); err != nil {
 		return err
 	}
@@ -363,10 +485,13 @@ func (s *Server) ApplyConfig(cfg *config.Config, opts ...config.ListenPolicyOpti
 	return nil
 }
 
-// Reload atomically swaps in a new config and router.
-// In-flight requests continue with the old config. Reloads are serialized
-// (the balancer swap is not atomic on its own), so a SIGHUP racing an
-// ApplyConfig cannot interleave.
+// Reload publishes cfg as the next generation without ApplyConfig's checks:
+// no listen policy, and changes to startup-only fields are silently not
+// applied. In-flight requests continue with their generation. Reloads are
+// serialized with ApplyConfig.
+//
+// Deprecated: use ApplyConfig, which refuses a config the server cannot run
+// as a whole instead of applying part of it.
 func (s *Server) Reload(cfg *config.Config) {
 	s.reloadMu.Lock()
 	defer s.reloadMu.Unlock()
@@ -381,16 +506,14 @@ func (s *Server) reload(cfg *config.Config) {
 	// replaced). Requests already running keep their generation and finish on
 	// the balancer they started on; stopping the old balancer only ends its
 	// probes, its in-memory counters stay usable for them.
-	next := &runtimeState{cfg: cfg, rtr: router.New(cfg)}
+	next := newGeneration(cfg, s.state.Load().id+1)
 	if len(cfg.Groups) > 0 {
 		next.bal = s.newBalancer(cfg)
 	}
 	s.buildSemaphores(cfg)
-	if old := s.state.Swap(next); old != nil && old.bal != nil {
+	if old := s.state.Swap(next); old.bal != nil {
 		old.bal.Stop()
 	}
-	s.applyCaptureConfig(cfg)
-	s.applyLoopSamplerConfig(cfg)
 	logConfigNotices(cfg)
 
 	log.Printf("[reload] %d backends, %d routes", len(cfg.Backends), len(cfg.Routes))
@@ -642,8 +765,14 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	var realModel string
 	var loopRoute *streamLoopRoute // stream loop detection for this request; nil when not streaming
 
-	// One generation for the whole request (route … Select … CompleteAndDecr).
+	// One generation for the whole request (admission, route … Select …
+	// CompleteAndDecr, capture, samples), loaded once here — after the body
+	// has been read — and never again. The admission hook sees exactly this
+	// generation before anything below can contact an upstream.
 	st := s.state.Load()
+	if !s.admit(w, r, rid, st) {
+		return
+	}
 	cfg, rtr, bal := st.cfg, st.rtr, st.bal
 
 	// Ollama nests sampling params under body["options"]. Flatten them into
@@ -904,7 +1033,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	// ── Capture: reserve a slot if the SIGUSR1 window is open ─────────────
 	// Reserved here (after successful validation) so that 400/404/500
 	// early-returns do not consume slots from the bounded window.
-	capCtx := s.startCapture(r, rid, t0, modelName, realModel, backend.ID, protocol, isStreaming, rawBody, newBody)
+	capCtx := s.startCapture(st.capture, r, rid, t0, modelName, realModel, backend.ID, protocol, isStreaming, rawBody, newBody)
 
 	// ── Per-backend concurrency guard ─────────────────────────────────────
 	release, ok := s.acquireSemaphore(r.Context(), backendID)
@@ -963,14 +1092,14 @@ type captureCtx struct {
 	payload capture.Payload
 }
 
-// startCapture reserves a capture slot if the window is open and assembles
-// the request-side payload. Returns nil if capture is disabled or the window
-// is closed — callers should treat that nil as "do nothing".
-func (s *Server) startCapture(r *http.Request, rid string, t0 time.Time,
+// startCapture reserves a slot in c, the request generation's capture handle,
+// if its window is open, and assembles the request-side payload. Returns nil
+// if capture is disabled or the window is closed — callers should treat that
+// nil as "do nothing".
+func (s *Server) startCapture(c *capture.Capture, r *http.Request, rid string, t0 time.Time,
 	virtualModel, realModel, backendID, protocol string, streaming bool,
 	rawBody, resolvedBody []byte,
 ) *captureCtx {
-	c := s.capture.Load()
 	if c == nil || c.Remaining() <= 0 {
 		// No window armed (or the window is spent): nothing to reserve, so
 		// the request snapshot is not built and the server filter never runs.
@@ -1407,7 +1536,7 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 			//
 			// The stream loop guard (nil when detection is off for the route)
 			// rides on the parser, which already decodes every event.
-			guard := newStreamLoopGuard(loopRoute, rid, backendID, s.metrics, metricsCtx, s.loopSampler.Load())
+			guard := newStreamLoopGuard(loopRoute, rid, backendID, s.metrics, metricsCtx, st.loopSampler)
 			var parser streamParser
 			var ssep *sseParser
 			if backendType == "ollama" {

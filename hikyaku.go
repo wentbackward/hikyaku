@@ -13,7 +13,12 @@
 //     message-capture seam: a server-level filter that gates every capture
 //     window, and programmatic arming of a bounded, filtered window on
 //     Server.Capture (inspect builds; compiled out in hardened, where the
-//     symbols remain as no-ops so an embedder builds in both).
+//     symbols remain as no-ops so an embedder builds in both);
+//   - Generation / GenerationAdmission / WithGenerationAdmission — a per-request
+//     fence on the config generation a request is served by, for an embedder
+//     that binds the applied config into its attested identity; with
+//     Server.ApplyConfig refusing (NonReloadableError) any config it could
+//     only apply in part.
 //
 // Everything here is a thin alias or pass-through to internal packages; the
 // behavior is identical to running cmd/hikyaku.
@@ -73,6 +78,21 @@ type (
 	// CaptureFilter decides whether a request is recorded; it runs on the
 	// request path and must be cheap. A rejected request consumes no slot.
 	CaptureFilter = capture.Filter
+	// Generation identifies one published generation of the server's
+	// reloadable state: ID() (1 for the config passed to New, +1 per applied
+	// config) and Config() (the exact *Config that generation runs).
+	// Server.Generation returns the live one.
+	Generation = proxy.Generation
+	// GenerationAdmission is called once per proxied request with the
+	// generation it will be served by, before any upstream I/O; a non-nil
+	// error refuses the request (see WithGenerationAdmission).
+	GenerationAdmission = proxy.GenerationAdmission
+	// AdmissionError lets a GenerationAdmission hook choose the refused
+	// request's status (default 503).
+	AdmissionError = proxy.AdmissionError
+	// NonReloadableError is Server.ApplyConfig's refusal of a config that
+	// changes fields only a restart applies; Fields lists their YAML paths.
+	NonReloadableError = config.NonReloadableError
 )
 
 // UsageEvent.EndReason values. A streamed response's Status is 200 however it
@@ -138,6 +158,39 @@ func WithCaptureFilter(f CaptureFilter) Option {
 	return proxy.WithCaptureFilter(f)
 }
 
+// WithGenerationAdmission installs the generation-admission hook: the
+// per-request fence for an embedder that binds the applied config into its
+// identity (pro's attested certificate binds a config digest). Core loads the
+// generation a proxied request will be served by once, after reading the
+// request body, and calls f with it before any upstream I/O (balancer
+// selection, journal export, capture, backend connection); the request is then
+// served by exactly that generation, never re-loaded, so a reload that lands
+// while a client's upload is held cannot slip another config past the hook. A
+// non-nil error ends the request with no upstream contact: 503, or the status
+// of an AdmissionError; the error is logged, not sent to the client. Tie a
+// generation to the embedder's own state through Generation.Config() — the
+// pointer passed to New or ApplyConfig — which needs no ordering with the
+// apply. nil admits every request.
+func WithGenerationAdmission(f GenerationAdmission) Option {
+	return proxy.WithGenerationAdmission(f)
+}
+
+// NonReloadableFields lists the YAML paths of the config fields a reload
+// cannot apply (listen address, TLS files and floor, outbound pool, metrics
+// listener, journal). Server.ApplyConfig refuses a config that changes any of
+// them.
+func NonReloadableFields() []string {
+	return config.NonReloadableFields()
+}
+
+// NonReloadableChanges returns the non-reloadable fields whose effective value
+// differs between live and next — the fields Server.ApplyConfig(next) would
+// refuse, so an embedder can tell an operator "restart required" before
+// applying.
+func NonReloadableChanges(live, next *Config) []string {
+	return config.NonReloadableChanges(live, next)
+}
+
 // LoadConfig reads and validates a config.yaml.
 func LoadConfig(path string) (*Config, error) {
 	return config.Load(path)
@@ -154,11 +207,12 @@ func LoadConfig(path string) (*Config, error) {
 // itself.
 //
 // The write half is Server.ApplyConfig (a method of the aliased Server type):
-// it runs the SIGHUP gate — Config.ValidateListenPolicy with the
-// ListenPolicyOptions the embedder uses at startup — and then the atomic swap
-// Server.Reload performs, the two serialized under one lock; a rejected config
-// leaves the live one untouched. Call ApplyLogLevel afterwards, as after a
-// SIGHUP.
+// it runs the SIGHUP gate — a NonReloadableError for a config that changes a
+// field only a restart applies, then Config.ValidateListenPolicy with the
+// ListenPolicyOptions the embedder uses at startup — and then publishes the
+// config as the next Generation with one atomic swap, the checks and the swap
+// serialized under one lock; a rejected config leaves the live one untouched.
+// Call ApplyLogLevel afterwards, as after a SIGHUP.
 func ParseConfig(raw []byte) (*Config, error) {
 	return config.Parse(raw)
 }

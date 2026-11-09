@@ -1,9 +1,13 @@
 package hikyaku_test
 
 import (
+	"context"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	hikyaku "github.com/wentbackward/hikyaku"
@@ -113,5 +117,61 @@ func TestFacade_ParseConfigAndApplyConfig(t *testing.T) {
 	}
 	if srv.Config() != next {
 		t.Fatal("accepted apply did not swap the live config")
+	}
+}
+
+// The generation-admission seam is reachable through the facade: an embedder
+// installs the hook with WithGenerationAdmission, names the generation it was
+// given, refuses with an AdmissionError, and recognizes a NonReloadableError
+// from ApplyConfig.
+func TestFacade_GenerationAdmissionAndNonReloadableRefusal(t *testing.T) {
+	const base = "backends:\n  - id: b\n    type: openai\n    base_url: \"https://localhost:9/v1\"\nroutes:\n  - virtual_model: m\n    backend: b\n    real_model: r\n"
+	cfg, err := hikyaku.ParseConfig([]byte(base))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	metrics, _, err := hikyaku.InitTelemetry()
+	if err != nil {
+		t.Fatalf("InitTelemetry: %v", err)
+	}
+	var seen hikyaku.Generation
+	hook := hikyaku.GenerationAdmission(func(_ context.Context, gen hikyaku.Generation) error {
+		seen = gen
+		return &hikyaku.AdmissionError{Status: http.StatusMisdirectedRequest, Err: errors.New("not verified")}
+	})
+	srv := hikyaku.New("test", "pro", cfg, metrics, nil, hikyaku.WithGenerationAdmission(hook))
+	if g := srv.Generation(); g.ID() != 1 || g.Config() != cfg {
+		t.Fatalf("initial generation %d (cfg %p)", g.ID(), g.Config())
+	}
+
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("status = %d, want 421", rec.Code)
+	}
+	if seen.Config() != cfg {
+		t.Fatal("hook did not see the live generation")
+	}
+
+	next, err := hikyaku.ParseConfig([]byte("journal:\n  enabled: true\n" + base))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	err = srv.ApplyConfig(next, hikyaku.WithExternalGatewayTLS())
+	var nre *hikyaku.NonReloadableError
+	if !errors.As(err, &nre) || len(nre.Fields) != 1 || nre.Fields[0] != "journal.enabled" {
+		t.Fatalf("ApplyConfig = %v, want a NonReloadableError for journal.enabled", err)
+	}
+	if got := hikyaku.NonReloadableChanges(cfg, next); len(got) != 1 || got[0] != "journal.enabled" {
+		t.Fatalf("NonReloadableChanges = %v", got)
+	}
+	if len(hikyaku.NonReloadableFields()) == 0 {
+		t.Fatal("NonReloadableFields is empty")
+	}
+	if srv.Config() != cfg || srv.Generation().ID() != 1 {
+		t.Fatal("a refused apply changed the live generation")
 	}
 }

@@ -52,7 +52,7 @@ func sampleFiles(t *testing.T, dir string) []string {
 // waitSamples waits for the sampler's in-flight writes.
 func waitSamples(t *testing.T, srv *Server) {
 	t.Helper()
-	if ls := srv.loopSampler.Load(); ls != nil {
+	if ls := srv.state.Load().loopSampler; ls != nil {
 		ls.pending.Wait()
 	}
 }

@@ -147,14 +147,14 @@ func main() {
 				log.Printf("[hikyaku] config reload failed: %v (keeping old config)", err)
 				logger.Apply(srv.Config().Server.LogLevel)
 			default:
-				// Enforce TLS policy on reload too — an operator adding a
-				// network-facing metrics bind shouldn't silently swap to
-				// plaintext just because they used SIGHUP instead of restart.
-				if perr := newCfg.ValidateListenPolicy(); perr != nil {
+				// ApplyConfig enforces the TLS policy on reload too, and
+				// refuses a change to a field only a restart applies (listen
+				// address, TLS files, metrics listener, journal, ...) rather
+				// than run a config other than the file's.
+				if perr := srv.ApplyConfig(newCfg); perr != nil {
 					log.Printf("[hikyaku] config reload rejected: %v (keeping old config)", perr)
 					logger.Apply(srv.Config().Server.LogLevel)
 				} else {
-					srv.Reload(newCfg)
 					logger.Apply(newCfg.Server.LogLevel)
 				}
 			}
