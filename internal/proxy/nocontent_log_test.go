@@ -25,7 +25,9 @@ import (
 // log could contain it by accident.
 const logMarker = "ZQX-confidential-7f3c1e9a-marker"
 
-// markerLane is one protocol lane with requests whose every content-bearing
+// markerLane is one proxied endpoint (chat, completions and embeddings on
+// the OpenAI lane, messages on the Anthropic lane, chat and generate on the
+// Ollama lane) with requests whose every content-bearing
 // field carries the marker: message text, system prompt, tool definitions,
 // tool-call arguments, tool results, stop sequences (a sampling parameter the
 // router merges, so it reaches the level-2 params summary) and metadata.
@@ -117,6 +119,58 @@ var markerLanes = []markerLane{
 		partial: func(w http.ResponseWriter) {
 			w.Header().Set("Content-Type", "application/x-ndjson")
 			fmt.Fprintf(w, `{"model":"real-m","message":{"role":"assistant","content":"%s cut"},"done":false}`+"\n", logMarker)
+		},
+	},
+	{
+		name: "openai-completions", backendType: "openai", path: "/v1/completions",
+		request: func(stream bool) string {
+			return fmt.Sprintf(`{"model":"m","stream":%t,"stop":"%[2]s stop","prompt":"%[2]s prompt","suffix":"%[2]s suffix"}`, stream, logMarker)
+		},
+		ok: func(w http.ResponseWriter, stream bool) {
+			if !stream {
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprintf(w, `{"id":"cmpl-1","object":"text_completion","choices":[{"index":0,"text":"%s completion","finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}`, logMarker)
+				return
+			}
+			writeSSE(w,
+				fmt.Sprintf(`data: {"id":"cmpl-1","object":"text_completion","choices":[{"index":0,"text":"%s delta","finish_reason":null}]}`, logMarker),
+				`data: [DONE]`)
+		},
+		partial: func(w http.ResponseWriter) {
+			writeSSE(w, fmt.Sprintf(`data: {"id":"cmpl-1","object":"text_completion","choices":[{"index":0,"text":"%s cut"}]}`, logMarker))
+		},
+	},
+	{
+		name: "openai-embeddings", backendType: "openai", path: "/v1/embeddings",
+		request: func(stream bool) string {
+			return fmt.Sprintf(`{"model":"m","stream":%t,"input":["%[2]s input"]}`, stream, logMarker)
+		},
+		ok: func(w http.ResponseWriter, _ bool) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1]}],"model":"%s completion","usage":{"prompt_tokens":3,"total_tokens":3}}`, logMarker)
+		},
+		partial: func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1]}],"model":"%s cut`, logMarker)
+		},
+	},
+	{
+		name: "ollama-generate", backendType: "ollama", path: "/api/generate",
+		request: func(stream bool) string {
+			return fmt.Sprintf(`{"model":"m","stream":%t,"system":"%[2]s system","prompt":"%[2]s prompt","options":{"stop":["%[2]s stop"]}}`, stream, logMarker)
+		},
+		ok: func(w http.ResponseWriter, stream bool) {
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			if !stream {
+				fmt.Fprintf(w, `{"model":"real-m","response":"%s completion","done":true,"prompt_eval_count":3,"eval_count":2}`, logMarker)
+				return
+			}
+			fmt.Fprintf(w, `{"model":"real-m","response":"%s delta","done":false}`+"\n", logMarker)
+			fmt.Fprintln(w, `{"model":"real-m","response":"","done":true,"prompt_eval_count":3,"eval_count":2}`)
+		},
+		partial: func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			fmt.Fprintf(w, `{"model":"real-m","response":"%s cut","done":false}`+"\n", logMarker)
 		},
 	},
 }
