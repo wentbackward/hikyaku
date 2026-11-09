@@ -435,7 +435,7 @@ routes:
 
 **`Accept-Encoding` is not configurable**
 
-The proxy reads every response body (usage metering, stream loop detection, capture), so it owns the upstream encoding negotiation: every proxied request asks the upstream for `Accept-Encoding: identity`, set after the header rules. The caller's `Accept-Encoding` is not forwarded, and a rule that adds or renames into `Accept-Encoding` has no effect. Clients receive uncompressed responses. See [security](security.md#response-encoding) for how an upstream that compresses anyway is handled.
+The proxy reads every response body (usage metering, stream loop detection, capture), so it owns the upstream encoding negotiation: every proxied request asks the upstream for `Accept-Encoding: identity`, set after the header rules. The caller's `Accept-Encoding` is not forwarded, and a rule that adds or renames into `Accept-Encoding` has no effect: the config still loads, and one `[config] WARNING:` line naming each backend and route with such a rule is logged on start and on every reload. Clients receive uncompressed responses. See [security](security.md#response-encoding) for how an upstream that compresses anyway is handled.
 
 **Quirk: `X-Forwarded-For` removal**
 
