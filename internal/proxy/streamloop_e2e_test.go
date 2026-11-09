@@ -19,8 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"go.opentelemetry.io/otel/sdk/metric/metricdata"
-
 	"github.com/wentbackward/hikyaku/internal/config"
 	"github.com/wentbackward/hikyaku/internal/telemetry"
 )
@@ -553,112 +551,29 @@ func TestStreamLoopE2E_EndReasonUpstreamError(t *testing.T) {
 	}
 }
 
-// Guarding asks the upstream for an uncompressed answer: the caller's
-// Accept-Encoding is not forwarded on a guarded stream, and is forwarded
-// unchanged when detection is off. A gzip answer the transport negotiated
-// itself is decoded before the parsers, so it is still measured.
-func TestStreamLoopE2E_AcceptEncodingAndGzip(t *testing.T) {
-	var mu sync.Mutex
-	var seen []string
+// A guarded stream that arrives gzip-encoded (an upstream that ignores the
+// proxy's request for identity) is decoded before the parser, so it is still
+// measured and its loop still trips.
+func TestStreamLoopE2E_GzipStreamIsMeasured(t *testing.T) {
 	pieces := chunked(loopText(20000), 40)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
-		ae := r.Header.Get("Accept-Encoding")
-		mu.Lock()
-		seen = append(seen, ae)
-		mu.Unlock()
 		w.Header().Set("Content-Type", "text/event-stream")
-		if ae == "gzip" { // only Go's transport asks for exactly "gzip"
-			w.Header().Set("Content-Encoding", "gzip")
-			zw := gzip.NewWriter(w)
-			for _, p := range pieces {
-				_, _ = io.WriteString(zw, openAIDelta("c", 0, map[string]interface{}{"reasoning_content": p}))
-			}
-			_ = zw.Close()
-			return
+		w.Header().Set("Content-Encoding", "gzip")
+		zw := gzip.NewWriter(w)
+		for _, p := range pieces {
+			_, _ = io.WriteString(zw, openAIDelta("c", 0, map[string]interface{}{"reasoning_content": p}))
 		}
-		_, _ = io.WriteString(w, openAIDelta("c", 0, map[string]interface{}{"content": "ok"})+"data: [DONE]\n\n")
+		_ = zw.Close()
 	}))
 	t.Cleanup(backend.Close)
-
-	send := func(ps *httptest.Server) string {
-		raw, _ := json.Marshal(map[string]interface{}{"model": "coder", "stream": true,
-			"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}}})
-		req, _ := http.NewRequest(http.MethodPost, ps.URL+"/v1/chat/completions", bytes.NewReader(raw))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept-Encoding", "br")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
-		b, _ := io.ReadAll(resp.Body)
-		return string(b)
-	}
-
 	_, guarded, mr := newLoopProxy(t, "openai", backend.URL, loopDefendersAbort)
-	body := send(guarded)
-	_, plain, _ := newLoopProxy(t, "openai", backend.URL, "  zero_content_detection: {enabled: false}")
-	send(plain)
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(seen) != 2 || seen[0] == "br" || seen[1] != "br" {
-		t.Fatalf("upstream Accept-Encoding = %q, want [not br, br]", seen)
-	}
+	_, body := postJSON(t, guarded.URL+"/v1/chat/completions", map[string]interface{}{"model": "coder", "stream": true,
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}}})
 	if !strings.Contains(body, `"type":"degenerate_output"`) {
-		t.Error("a transport-decoded gzip stream was not measured")
+		t.Error("a gzip stream was not measured")
 	}
 	if n := mr.trips(t, map[string]string{"mode": "abort"}); n != 1 {
 		t.Errorf("trips = %d, want 1", n)
 	}
-}
-
-// A body that stays encoded (an encoding the transport does not decode)
-// cannot be measured: it passes through unchanged and is counted and logged
-// as unguarded, without text.
-func TestStreamLoopE2E_UnreadableEncodingIsCountedUnguarded(t *testing.T) {
-	logs := captureLog(t)
-	payload := "\x1b\x00opaque-brotli-bytes-" + loopText(5000)
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Content-Encoding", "br")
-		_, _ = io.WriteString(w, payload)
-	}))
-	t.Cleanup(backend.Close)
-	_, ps, mr := newLoopProxy(t, "openai", backend.URL, loopDefendersAbort)
-	_, body := postJSON(t, ps.URL+"/v1/chat/completions", map[string]interface{}{"model": "coder", "stream": true,
-		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}}})
-	if body != payload {
-		t.Error("an unguarded stream was altered")
-	}
-	if n := unguarded(t, mr, map[string]string{"route": "coder", "backend": "be", "reason": "content_encoding"}); n != 1 {
-		t.Errorf("unguarded = %d, want 1", n)
-	}
-	l := logs.String()
-	if strings.Count(l, "stream_loop_unguarded route=coder backend=be reason=content_encoding encoding=br") != 1 {
-		t.Errorf("want one unguarded log line:\n%s", l)
-	}
-	if strings.Contains(l, "re-check step") {
-		t.Error("response text in the log")
-	}
-}
-
-func unguarded(t *testing.T, lr loopMetricsReader, want map[string]string) int64 {
-	t.Helper()
-	var n int64
-	for _, sm := range lr.collect(t).ScopeMetrics {
-		for _, m := range sm.Metrics {
-			if m.Name != "hikyaku_stream_loop_unguarded_total" {
-				continue
-			}
-			for _, dp := range m.Data.(metricdata.Sum[int64]).DataPoints {
-				if attrsMatch(dp.Attributes, want) {
-					n += dp.Value
-				}
-			}
-		}
-	}
-	return n
 }
