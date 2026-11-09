@@ -192,6 +192,9 @@ func TestOllamaTags_DoesNotFollowRedirects(t *testing.T) {
 	if rec.Code != http.StatusFound {
 		t.Errorf("status = %d, want the backend's 302", rec.Code)
 	}
+	if loc := rec.Header().Get("Location"); loc != "https://elsewhere.example.invalid/api/tags" {
+		t.Errorf("Location = %q, want the backend's redirect target", loc)
+	}
 }
 
 // A backend that gzips the list although identity was asked for is decoded,
