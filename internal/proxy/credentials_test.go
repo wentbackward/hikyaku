@@ -429,3 +429,18 @@ func TestHeaderLog_RedactsCredentials(t *testing.T) {
 		}
 	}
 }
+
+// Keys written into the header map in a non-canonical case (an embedder's
+// middleware can do that) are stripped too.
+func TestStripCredentials_NonCanonicalKeys(t *testing.T) {
+	h := http.Header{
+		"authorization":  {"Bearer a"},
+		"x-goog-api-key": {"g"},
+		"COOKIE":         {"c"},
+		"X-Keep":         {"k"},
+	}
+	stripCredentials(h)
+	if len(h) != 1 || h.Get("X-Keep") != "k" {
+		t.Errorf("after strip: %v, want only X-Keep", h)
+	}
+}

@@ -1075,10 +1075,13 @@ func safeHeaders(h http.Header) map[string]string {
 }
 
 // stripCredentials deletes every credential header (config.CredentialHeaders)
-// from h.
+// from h, matching keys in any case: an embedder's middleware may have
+// written a non-canonical key straight into the map.
 func stripCredentials(h http.Header) {
-	for _, name := range config.CredentialHeaders() {
-		h.Del(name)
+	for k := range h {
+		if config.IsCredentialHeader(k) {
+			delete(h, k)
+		}
 	}
 }
 
