@@ -7,6 +7,9 @@ import (
 
 // ── Analyze ─────────────────────────────────────────────────────────────────────
 
+// The prompt text fields (SystemText, LastUserText) differ by build: see
+// analyze_debug_test.go and analyze_hardened_test.go.
+
 func TestAnalyze_SimpleTextMessages(t *testing.T) {
 	body := map[string]interface{}{
 		"model":  "test-model",
@@ -43,12 +46,6 @@ func TestAnalyze_SimpleTextMessages(t *testing.T) {
 	if e.IsMultimodal {
 		t.Error("should not be multimodal")
 	}
-	if e.SystemText != "You are helpful." {
-		t.Errorf("system text: got %q, want %q", e.SystemText, "You are helpful.")
-	}
-	if e.LastUserText != "Hello world" {
-		t.Errorf("last user text: got %q, want %q", e.LastUserText, "Hello world")
-	}
 }
 
 func TestAnalyze_AnthropicTopLevelSystem(t *testing.T) {
@@ -65,12 +62,6 @@ func TestAnalyze_AnthropicTopLevelSystem(t *testing.T) {
 	}
 	if e.TotalChars != len("Be concise.")+len("Hi") {
 		t.Errorf("total chars: got %d", e.TotalChars)
-	}
-	if e.SystemText != "Be concise." {
-		t.Errorf("system text: got %q, want %q", e.SystemText, "Be concise.")
-	}
-	if e.LastUserText != "Hi" {
-		t.Errorf("last user text: got %q, want %q", e.LastUserText, "Hi")
 	}
 }
 
@@ -164,9 +155,6 @@ func TestAnalyze_MultipleUserMessages(t *testing.T) {
 	if e.LastUserChars != len("second message") {
 		t.Errorf("last user chars: got %d, want %d", e.LastUserChars, len("second message"))
 	}
-	if e.LastUserText != "second message" {
-		t.Errorf("last user text: got %q, want %q", e.LastUserText, "second message")
-	}
 }
 
 func TestAnalyze_EmptyBody(t *testing.T) {
@@ -178,31 +166,6 @@ func TestAnalyze_EmptyBody(t *testing.T) {
 	}
 	if e.TotalChars != 0 {
 		t.Errorf("total chars: got %d, want 0", e.TotalChars)
-	}
-}
-
-func TestAnalyze_TextTruncation(t *testing.T) {
-	longSystem := strings.Repeat("s", maxSystemText+100)
-	longUser := strings.Repeat("u", maxLastUserText+100)
-	body := map[string]interface{}{
-		"messages": []interface{}{
-			map[string]interface{}{"role": "system", "content": longSystem},
-			map[string]interface{}{"role": "user", "content": longUser},
-		},
-	}
-	e := Analyze(body, "openai")
-
-	if len(e.SystemText) != maxSystemText+len("[truncated]") {
-		t.Errorf("system text length: got %d, want %d", len(e.SystemText), maxSystemText+len("[truncated]"))
-	}
-	if !strings.HasSuffix(e.SystemText, "[truncated]") {
-		t.Error("system text should end with [truncated]")
-	}
-	if len(e.LastUserText) != maxLastUserText+len("[truncated]") {
-		t.Errorf("last user text length: got %d, want %d", len(e.LastUserText), maxLastUserText+len("[truncated]"))
-	}
-	if !strings.HasSuffix(e.LastUserText, "[truncated]") {
-		t.Error("last user text should end with [truncated]")
 	}
 }
 
@@ -372,5 +335,81 @@ func TestCountJSONBlocks(t *testing.T) {
 				t.Errorf("got %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+// ── Prompt text fixtures ────────────────────────────────────────────────────────
+
+// promptTextCase is a request whose prompt text the default build copies into
+// the entry and the hardened build omits.
+type promptTextCase struct {
+	name       string
+	protocol   string
+	body       map[string]interface{}
+	wantSystem string // SystemText in the default build
+	wantUser   string // LastUserText in the default build
+}
+
+func promptTextCases() []promptTextCase {
+	return []promptTextCase{
+		{
+			name:     "openai system and user",
+			protocol: "openai",
+			body: map[string]interface{}{
+				"messages": []interface{}{
+					map[string]interface{}{"role": "system", "content": "You are helpful."},
+					map[string]interface{}{"role": "user", "content": "Hello world"},
+				},
+			},
+			wantSystem: "You are helpful.",
+			wantUser:   "Hello world",
+		},
+		{
+			name:     "anthropic top-level system",
+			protocol: "anthropic",
+			body: map[string]interface{}{
+				"system": "Be concise.",
+				"messages": []interface{}{
+					map[string]interface{}{"role": "user", "content": "Hi"},
+				},
+			},
+			wantSystem: "Be concise.",
+			wantUser:   "Hi",
+		},
+		{
+			name:     "last of several user messages",
+			protocol: "openai",
+			body: map[string]interface{}{
+				"messages": []interface{}{
+					map[string]interface{}{"role": "user", "content": "first"},
+					map[string]interface{}{"role": "assistant", "content": "reply"},
+					map[string]interface{}{"role": "user", "content": "second message"},
+				},
+			},
+			wantUser: "second message",
+		},
+		{
+			name:     "multipart text content",
+			protocol: "openai",
+			body: map[string]interface{}{
+				"messages": []interface{}{
+					map[string]interface{}{"role": "user", "content": []interface{}{
+						map[string]interface{}{"type": "text", "text": "describe this"},
+						map[string]interface{}{"type": "image_url", "image_url": map[string]interface{}{"url": "data:,"}},
+					}},
+				},
+			},
+			wantUser: "describe this",
+		},
+	}
+}
+
+// longPromptBody is a request whose system and user text exceed the caps.
+func longPromptBody() map[string]interface{} {
+	return map[string]interface{}{
+		"messages": []interface{}{
+			map[string]interface{}{"role": "system", "content": strings.Repeat("s", maxSystemText+100)},
+			map[string]interface{}{"role": "user", "content": strings.Repeat("u", maxLastUserText+100)},
+		},
 	}
 }
