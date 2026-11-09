@@ -1249,3 +1249,159 @@ func TestParse_RejectsWhatLoadRejects(t *testing.T) {
 		})
 	}
 }
+
+// ── ParseWithLookup (Parse with a caller-supplied ${NAME} resolver instead of
+// the process environment) ──────────────────────────────────────────────────
+
+// richLookupConfig exercises every stage of the pipeline: ${NAME} expansion in
+// several fields, map-format backends and routes, port expansion, aliases,
+// groups, defaults and indexing.
+const richLookupConfig = `
+server:
+  api_key: "${HIKYAKU_TEST_LOOKUP_KEY}"
+  allow_plaintext: true
+  log_level: 2
+backends:
+  local:
+    type: openai
+    base_url: "http://${HIKYAKU_TEST_LOOKUP_HOST}:8000/v1"
+    api_key: "${HIKYAKU_TEST_LOOKUP_BACKEND_KEY}"
+  pool-{port}:
+    type: openai
+    base_url: "http://localhost:{port}/v1"
+    ports: [9001, 9002]
+  claude:
+    type: anthropic
+    base_url: "https://api.anthropic.example"
+    api_key: "${HIKYAKU_TEST_LOOKUP_UNSET}"
+routes:
+  m:
+    backend: local
+    real_model: "${HIKYAKU_TEST_LOOKUP_MODEL}"
+    alias: [m-alias]
+  c:
+    backend: claude
+    real_model: claude-real
+`
+
+func TestParseWithLookup_OsGetenvMatchesParse(t *testing.T) {
+	t.Setenv("HIKYAKU_TEST_LOOKUP_KEY", "k-env")
+	t.Setenv("HIKYAKU_TEST_LOOKUP_HOST", "host-env")
+	t.Setenv("HIKYAKU_TEST_LOOKUP_BACKEND_KEY", "bk-env")
+	t.Setenv("HIKYAKU_TEST_LOOKUP_MODEL", "model-env")
+	viaParse, err := Parse([]byte(richLookupConfig))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	viaLookup, err := ParseWithLookup([]byte(richLookupConfig), os.Getenv)
+	if err != nil {
+		t.Fatalf("ParseWithLookup: %v", err)
+	}
+	if viaLookup.Server.APIKey != "k-env" {
+		t.Fatalf("api_key = %q, want the env value", viaLookup.Server.APIKey)
+	}
+	if !reflect.DeepEqual(viaParse, viaLookup) {
+		t.Fatalf("ParseWithLookup(os.Getenv) and Parse disagree:\n parse=%+v\nlookup=%+v", viaParse, viaLookup)
+	}
+}
+
+func TestParseWithLookup_ExpandsFromMap(t *testing.T) {
+	vars := map[string]string{
+		"HIKYAKU_TEST_LOOKUP_KEY":         "k-map",
+		"HIKYAKU_TEST_LOOKUP_HOST":        "host-map",
+		"HIKYAKU_TEST_LOOKUP_BACKEND_KEY": "bk-map",
+		"HIKYAKU_TEST_LOOKUP_MODEL":       "model-map",
+	}
+	var asked []string
+	lookup := func(name string) string {
+		asked = append(asked, name)
+		return vars[name]
+	}
+	cfg, err := ParseWithLookup([]byte(richLookupConfig), lookup)
+	if err != nil {
+		t.Fatalf("ParseWithLookup: %v", err)
+	}
+	if cfg.Server.APIKey != "k-map" {
+		t.Fatalf("server.api_key = %q", cfg.Server.APIKey)
+	}
+	local, ok := cfg.Backend("local")
+	if !ok || local.BaseURL != "http://host-map:8000/v1" || local.APIKey != "bk-map" {
+		t.Fatalf("backend local = %+v (found %v)", local, ok)
+	}
+	if r, ok := cfg.Route("m-alias"); !ok || r.RealModel != "model-map" {
+		t.Fatalf("route via alias = %+v (found %v)", r, ok)
+	}
+	if _, ok := cfg.Backend("pool-9002"); !ok {
+		t.Fatal("port expansion must still run")
+	}
+	if c, _ := cfg.Backend("claude"); c.APIKey != "" {
+		t.Fatalf("a name the lookup does not know must expand to \"\", got %q", c.APIKey)
+	}
+	if len(asked) != 5 {
+		t.Fatalf("lookup called %d times (%v), want once per ${NAME} occurrence", len(asked), asked)
+	}
+}
+
+func TestParseWithLookup_NeverConsultsTheProcessEnvironment(t *testing.T) {
+	t.Setenv("HIKYAKU_TEST_LOOKUP_KEY", "k-env")
+	t.Setenv("HIKYAKU_TEST_LOOKUP_HOST", "host-env")
+	t.Setenv("HIKYAKU_TEST_LOOKUP_BACKEND_KEY", "bk-env")
+	t.Setenv("HIKYAKU_TEST_LOOKUP_MODEL", "model-env")
+	t.Setenv("HIKYAKU_TEST_LOOKUP_UNSET", "unset-env")
+	vars := map[string]string{
+		"HIKYAKU_TEST_LOOKUP_KEY":  "k-map",
+		"HIKYAKU_TEST_LOOKUP_HOST": "host-map",
+	}
+	cfg, err := ParseWithLookup([]byte(richLookupConfig), func(name string) string { return vars[name] })
+	if err != nil {
+		t.Fatalf("ParseWithLookup: %v", err)
+	}
+	if cfg.Server.APIKey != "k-map" {
+		t.Fatalf("map value must win over the environment: api_key = %q", cfg.Server.APIKey)
+	}
+	local, _ := cfg.Backend("local")
+	if local.BaseURL != "http://host-map:8000/v1" {
+		t.Fatalf("base_url = %q", local.BaseURL)
+	}
+	if local.APIKey != "" {
+		t.Fatalf("a name absent from the map must expand to \"\" even when the environment has it: %q", local.APIKey)
+	}
+	if c, _ := cfg.Backend("claude"); c.APIKey != "" {
+		t.Fatalf("claude api_key = %q, want \"\"", c.APIKey)
+	}
+	if r, _ := cfg.Route("m"); r.RealModel != "" {
+		t.Fatalf("real_model = %q, want \"\"", r.RealModel)
+	}
+}
+
+func TestParseWithLookup_ExpandsInOnePass(t *testing.T) {
+	// A looked-up value that itself looks like ${NAME} is not expanded again.
+	vars := map[string]string{"HIKYAKU_TEST_LOOKUP_KEY": "${HIKYAKU_TEST_LOOKUP_INNER}", "HIKYAKU_TEST_LOOKUP_INNER": "inner"}
+	cfg, err := ParseWithLookup([]byte("server:\n  api_key: \"${HIKYAKU_TEST_LOOKUP_KEY}\"\n"), func(n string) string { return vars[n] })
+	if err != nil {
+		t.Fatalf("ParseWithLookup: %v", err)
+	}
+	if cfg.Server.APIKey != "${HIKYAKU_TEST_LOOKUP_INNER}" {
+		t.Fatalf("api_key = %q, want the literal looked-up value", cfg.Server.APIKey)
+	}
+}
+
+func TestParseWithLookup_RunsTheSameValidation(t *testing.T) {
+	if _, err := ParseWithLookup([]byte("# nothing\n"), os.Getenv); !errors.Is(err, ErrEmptyDocument) {
+		t.Fatalf("empty document: err = %v, want ErrEmptyDocument", err)
+	}
+	raw := "backends:\n  - id: b\n    type: openai\n    base_url: \"http://localhost\"\nroutes:\n  - virtual_model: m\n    backend: \"${HIKYAKU_TEST_LOOKUP_BACKEND}\"\n"
+	if _, err := ParseWithLookup([]byte(raw), func(string) string { return "nope" }); err == nil || !strings.Contains(err.Error(), "nope") {
+		t.Fatalf("route to an unknown backend: err = %v", err)
+	}
+}
+
+func TestParseWithLookup_NilLookupIsRefused(t *testing.T) {
+	cfg, err := ParseWithLookup([]byte("server:\n  allow_plaintext: true\n"), nil)
+	if err == nil {
+		t.Fatalf("nil lookup accepted: %+v", cfg)
+	}
+	if !errors.Is(err, ErrNilLookup) {
+		t.Fatalf("err = %v, want ErrNilLookup", err)
+	}
+}

@@ -226,6 +226,19 @@ func ParseConfig(raw []byte) (*Config, error) {
 	return config.Parse(raw)
 }
 
+// ParseConfigWithLookup is ParseConfig with ${NAME} resolved by lookup instead
+// of the process environment, which it never reads. Each ${NAME} is replaced
+// in a single pass by lookup(NAME) (a replacement is not expanded again), and
+// a name lookup does not know expands to "", as an unset variable does for
+// ParseConfig; parsing, defaults and validation are ParseConfig's, so
+// ParseConfigWithLookup(raw, os.Getenv) is ParseConfig(raw). An embedder uses
+// it to validate YAML against the variables the router that will load it sees,
+// when those are not the embedder's own environment. A nil lookup is an error.
+// ParseConfig and LoadConfig keep reading the process environment.
+func ParseConfigWithLookup(raw []byte, lookup func(name string) string) (*Config, error) {
+	return config.ParseWithLookup(raw, lookup)
+}
+
 // InitTelemetry initializes metrics and returns the handle plus the metrics
 // HTTP handler to mount on a metrics endpoint.
 func InitTelemetry() (*Metrics, http.Handler, error) {

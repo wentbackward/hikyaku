@@ -23,6 +23,9 @@ var envVarRe = regexp.MustCompile(`\$\{([^}]+)\}`)
 // file — so it is reported explicitly rather than loaded as "no backends".
 var ErrEmptyDocument = errors.New("empty document (no YAML content)")
 
+// ErrNilLookup is returned by ParseWithLookup when it is given no resolver.
+var ErrNilLookup = errors.New("config: nil ${NAME} lookup function")
+
 // ── Schema ────────────────────────────────────────────────────────────────────
 
 type TLSConfig struct {
@@ -253,7 +256,7 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	return parse(raw, path)
+	return parse(raw, path, os.Getenv)
 }
 
 // Parse runs Load's whole pipeline on YAML bytes that did not come from a
@@ -263,14 +266,29 @@ func Load(path string) (*Config, error) {
 // validate it exactly as a SIGHUP reload of the same bytes would. An empty
 // document is ErrEmptyDocument, as with Load.
 func Parse(raw []byte) (*Config, error) {
-	return parse(raw, "config")
+	return parse(raw, "config", os.Getenv)
 }
 
-// parse is Load and Parse: source names the input in parse errors (the file
-// path for Load, "config" for bytes).
-func parse(raw []byte, source string) (*Config, error) {
-	// Expand ${ENV_VAR} before parsing
-	expanded := expandEnvVars(string(raw))
+// ParseWithLookup is Parse with ${NAME} resolved by lookup instead of the
+// process environment, which it never reads: each ${NAME} in raw is replaced,
+// in a single pass, by lookup(NAME) — "" for a name lookup does not know, as
+// Parse does for an unset variable — and the rest of the pipeline is Parse's.
+// It lets an embedder validate YAML against the variables its process will
+// actually see (a staged environment, say) rather than its own. A nil lookup
+// is ErrNilLookup.
+func ParseWithLookup(raw []byte, lookup func(name string) string) (*Config, error) {
+	if lookup == nil {
+		return nil, ErrNilLookup
+	}
+	return parse(raw, "config", lookup)
+}
+
+// parse is Load, Parse and ParseWithLookup: source names the input in parse
+// errors (the file path for Load, "config" for bytes); lookup resolves
+// ${NAME} (os.Getenv for Load and Parse).
+func parse(raw []byte, source string, lookup func(string) string) (*Config, error) {
+	// Expand ${NAME} before parsing
+	expanded := expandVars(string(raw), lookup)
 
 	// Normalize map-formatted backends/routes to list format.
 	// Allows: backends: {foo: {type: openai, ...}}  →  backends: [{id: foo, type: openai, ...}]
@@ -410,9 +428,11 @@ func normalizeMapToList(yamlText, blockName, keyField string) (string, error) {
 	return strings.TrimSpace(string(result)), nil
 }
 
-func expandEnvVars(s string) string {
+// expandVars replaces each ${NAME} in s with lookup(NAME), in one pass: a
+// replacement is never expanded again.
+func expandVars(s string, lookup func(string) string) string {
 	return envVarRe.ReplaceAllStringFunc(s, func(m string) string {
-		return os.Getenv(m[2 : len(m)-1])
+		return lookup(m[2 : len(m)-1])
 	})
 }
 

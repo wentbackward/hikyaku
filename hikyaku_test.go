@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -173,5 +174,47 @@ func TestFacade_GenerationAdmissionAndNonReloadableRefusal(t *testing.T) {
 	}
 	if srv.Config() != cfg || srv.Generation().ID() != 1 {
 		t.Fatal("a refused apply changed the live generation")
+	}
+}
+
+// ParseConfigWithLookup is ParseConfig with the embedder's ${NAME} resolver:
+// given os.Getenv it is ParseConfig exactly (checked on the shipped example
+// config, which uses most features), given a map it never reads the process
+// environment, and a nil resolver is refused.
+func TestFacade_ParseConfigWithLookup(t *testing.T) {
+	raw, err := os.ReadFile("config.example.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PROXY_API_KEY", "proxy-env")
+	t.Setenv("VLLM_API_KEY", "vllm-env")
+	viaParse, err := hikyaku.ParseConfig(raw)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	viaGetenv, err := hikyaku.ParseConfigWithLookup(raw, os.Getenv)
+	if err != nil {
+		t.Fatalf("ParseConfigWithLookup(os.Getenv): %v", err)
+	}
+	if !reflect.DeepEqual(viaParse, viaGetenv) {
+		t.Fatalf("ParseConfigWithLookup(os.Getenv) differs from ParseConfig:\n parse=%+v\nlookup=%+v", viaParse, viaGetenv)
+	}
+
+	vars := map[string]string{"PROXY_API_KEY": "proxy-map"}
+	viaMap, err := hikyaku.ParseConfigWithLookup(raw, func(name string) string { return vars[name] })
+	if err != nil {
+		t.Fatalf("ParseConfigWithLookup(map): %v", err)
+	}
+	if viaMap.Server.APIKey != "proxy-map" {
+		t.Fatalf("api_key = %q, want the map value over the environment", viaMap.Server.APIKey)
+	}
+	for _, b := range viaMap.Backends {
+		if b.APIKey == "vllm-env" {
+			t.Fatalf("backend %s took its key from the environment", b.ID)
+		}
+	}
+
+	if _, err := hikyaku.ParseConfigWithLookup(raw, nil); err == nil {
+		t.Fatal("a nil lookup must be refused")
 	}
 }
