@@ -405,7 +405,8 @@ func TestSafeHeaders_RedactsEveryCredentialHeader(t *testing.T) {
 	}
 }
 
-// The level-2 header log redacts credential values like capture does.
+// The level-2 header log never prints a credential value: like every
+// header off the protocol allowlist, it is logged as its length.
 func TestHeaderLog_RedactsCredentials(t *testing.T) {
 	// Registered first, so it runs after t.Setenv restores LOG_LEVEL.
 	t.Cleanup(logger.Reload)
@@ -423,7 +424,7 @@ func TestHeaderLog_RedactsCredentials(t *testing.T) {
 			t.Errorf("header log contains caller credential %q", v)
 		}
 	}
-	for _, want := range []string{"[redacted]", "X-Request-Tag: visible"} {
+	for _, want := range []string{"Authorization: <len=", "X-Request-Tag: <len=7>", "Content-Type: application/json"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("header log missing %q:\n%s", want, out)
 		}

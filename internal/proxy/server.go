@@ -841,7 +841,7 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	// ── L2: log incoming headers, L3: log body preview ────────────────────
 	rlog.Headers("[%s] %s %s", rid, r.Method, r.URL.Path)
 	if rlog.level() >= logger.LevelHeaders {
-		logged := safeHeaders(r.Header)
+		logged := logHeaders(r.Header)
 		names := make([]string, 0, len(logged))
 		for k := range logged {
 			names = append(names, k)
@@ -894,8 +894,8 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 	if err != nil {
 		if !cfg.Server.PassthroughUnrouted {
 			available := cfg.VirtualModels()
-			log.Printf("[proxy] rejected unknown model %q (from=%s ua=%s)",
-				modelName, r.RemoteAddr, r.UserAgent())
+			log.Printf("[proxy] rejected unknown model %s (from=%s ua=%s)",
+				logUnknownModel(modelName), r.RemoteAddr, logUserAgent(r.UserAgent()))
 			jsonError(w, fmt.Sprintf("unknown model %q — available models: %v", modelName, available), http.StatusNotFound)
 			return
 		}
@@ -910,8 +910,8 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 		if isStreaming {
 			loopRoute = &streamLoopRoute{cfg: cfg.GetStreamLoopDetection(nil), route: unroutedLoopRoute}
 		}
-		log.Printf("[proxy] no route for %q, passing through to %s (from=%s ua=%s)",
-			modelName, b.ID, r.RemoteAddr, r.UserAgent())
+		log.Printf("[proxy] no route for %s, passing through to %s (from=%s ua=%s)",
+			logUnknownModel(modelName), b.ID, r.RemoteAddr, logUserAgent(r.UserAgent()))
 	} else {
 		realModel = res.RealModel
 		if isStreaming {
@@ -1021,12 +1021,14 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 			}
 		}
 	}
+	// A model name is logged only when it names a configured route.
+	logVirtual, logReal := logModels(cfg, modelName, realModel)
 	if res != nil && len(res.Params) > 0 && rlog.level() >= logger.LevelHeaders {
 		rlog.Headers("[%s] → backend=%s target=%s model=%s→%s auth=%s params=%v",
-			rid, backend.ID, backend.BaseURL, modelName, realModel, authType, logParams(res.Params))
+			rid, backend.ID, backend.BaseURL, logVirtual, logReal, authType, logParams(res.Params))
 	} else {
 		rlog.Headers("[%s] → backend=%s target=%s model=%s→%s auth=%s",
-			rid, backend.ID, backend.BaseURL, modelName, realModel, authType)
+			rid, backend.ID, backend.BaseURL, logVirtual, logReal, authType)
 	}
 
 	// ── L4: log full message content ───────────────────────────────────────
@@ -1171,11 +1173,10 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 				}
 			}
 			// r.URL has been rewritten by the director to the final upstream
-			// scheme/host/path, so r.URL.String() is the actual outbound URL.
-			upstreamURL := r.URL.String()
+			// scheme/host/path; logURL drops the caller's query string.
 			rlog.Request("[%s] %s %s model=%s backend=%s url=%s status=502 dur=%.3fs ERROR: %v",
-				rid, r.Method, r.URL.Path, modelName, backendID, upstreamURL, elapsed, err)
-			log.Printf("[proxy] upstream error backend=%s: %v", backendID, err)
+				rid, r.Method, r.URL.Path, logVirtual, backendID, logURL(r.URL), elapsed, logErr(err))
+			log.Printf("[proxy] upstream error backend=%s: %v", backendID, logErr(err))
 			capCtx.finishError(t0, "upstream error: "+err.Error())
 			jsonError(w, "upstream error: "+err.Error(), http.StatusBadGateway)
 		},
@@ -1272,11 +1273,13 @@ func (c *captureCtx) finishError(t0 time.Time, msg string) {
 // upstreamURL returns the full URL that was sent to the backend, as rewritten
 // by the director (scheme + host + resolved path + query). Used in request
 // logs so misconfigured base_url / endpoint composition is visible at L1.
+// upstreamURL is the URL a response came from, for the log: without the
+// caller's query string (logURL).
 func upstreamURL(resp *http.Response) string {
-	if resp == nil || resp.Request == nil || resp.Request.URL == nil {
+	if resp == nil || resp.Request == nil {
 		return ""
 	}
-	return resp.Request.URL.String()
+	return logURL(resp.Request.URL)
 }
 
 func timing(t0 time.Time) capture.TimingSnapshot {
@@ -1614,6 +1617,7 @@ func logMessageContent(rid string, body map[string]interface{}) {
 func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, backendType string, timeoutSec int, streaming bool, t0 time.Time, metricsCtx, reqCtx context.Context, capCtx *captureCtx, lbGroup, lbAffKey string, st *runtimeState, bytesHeld int64, loopRoute *streamLoopRoute) func(*http.Response) error {
 	bal := st.bal // the request's generation: the balancer it was counted in on
 	rlog := st.log
+	logVirtual, logReal := logModels(st.cfg, virtualModel, realModel) // caller text only if a configured route
 	return func(resp *http.Response) error {
 		statusStr := fmt.Sprintf("%d", resp.StatusCode)
 		// Moonshot reports the cache-write split by lifetime only in the
@@ -1732,7 +1736,7 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 						}
 					}
 					rlog.Request("[%s] POST %s model=%s→%s backend=%s url=%s status=%s dur=%.3fs stream=true",
-						rid, path, virtualModel, realModel, backendID, upstreamURL(resp), statusStr, elapsed)
+						rid, path, logVirtual, logReal, backendID, upstreamURL(resp), statusStr, elapsed)
 					if ssep != nil && ssep.captureContent {
 						rlog.Content("[resp %s] | %s", rid, ssep.ResponseText())
 					}
@@ -1776,7 +1780,7 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 				}
 			}
 			rlog.Request("[%s] POST %s model=%s→%s backend=%s url=%s status=%s dur=%.3fs",
-				rid, path, virtualModel, realModel, backendID, upstreamURL(resp), statusStr, elapsed)
+				rid, path, logVirtual, logReal, backendID, upstreamURL(resp), statusStr, elapsed)
 
 			// An upstream error body is content: providers echo the offending
 			// input in it. Levels 1-2 log only its status and length; the

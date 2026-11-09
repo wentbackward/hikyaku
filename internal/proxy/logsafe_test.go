@@ -1,12 +1,17 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"net/url"
+
+	"github.com/wentbackward/hikyaku/internal/config"
 	"github.com/wentbackward/hikyaku/internal/logger"
 )
 
@@ -85,5 +90,148 @@ func TestLog_UpstreamErrorStatusAndLengthAtRequestLevel(t *testing.T) {
 	}
 	if strings.Contains(out, "private prompt") {
 		t.Errorf("level 1 logged the upstream error text:\n%s", out)
+	}
+}
+
+// Allowlisted protocol headers keep their values; every other header,
+// credentials included, is its length; an allowlisted value that is too
+// long or not printable ASCII is its length too.
+func TestLogHeaders_AllowlistOrLength(t *testing.T) {
+	h := http.Header{
+		"Content-Type":      {"application/json"},
+		"Content-Length":    {"42"},
+		"Accept":            {"text/event-stream"},
+		"Accept-Encoding":   {"gzip"},
+		"anthropic-version": {"2023-06-01"},
+		"Anthropic-Beta":    {"tools-2024-04-04", "prompt-caching-2024-07-31"},
+		"Openai-Beta":       {"assistants=v2"},
+		"X-Title":           {"my secret project"},
+		"X-Auth-Token":      {"tok"},
+		"Authorization":     {"Bearer sk-x"},
+		"Cookie":            {"a=b"},
+		"Anthropic-Beta2":   {"x"},
+	}
+	got := logHeaders(h)
+	want := map[string]string{
+		"Content-Type":      "application/json",
+		"Content-Length":    "42",
+		"Accept":            "text/event-stream",
+		"Accept-Encoding":   "gzip",
+		"Anthropic-Version": "2023-06-01",
+		"Anthropic-Beta":    "tools-2024-04-04, prompt-caching-2024-07-31",
+		"Openai-Beta":       "assistants=v2",
+		"X-Title":           "<len=17>",
+		"X-Auth-Token":      "<len=3>",
+		"Authorization":     "<len=11>",
+		"Cookie":            "<len=3>",
+		"Anthropic-Beta2":   "<len=1>",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s: got %q, want %q", k, got[k], v)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("got %d headers, want %d: %v", len(got), len(want), got)
+	}
+
+	long := http.Header{"Content-Type": {strings.Repeat("a", maxLogHeaderValue+1)}}
+	long.Set("Accept", "text/plain\xc3\xa9")
+	got = logHeaders(long)
+	if got["Content-Type"] != fmt.Sprintf("<len=%d>", maxLogHeaderValue+1) {
+		t.Errorf("over-long allowlisted value: got %q", got["Content-Type"])
+	}
+	if got["Accept"] != "<len=12>" {
+		t.Errorf("non-ASCII allowlisted value: got %q", got["Accept"])
+	}
+}
+
+// The User-Agent keeps only its first product token, within a fixed length
+// and the token character set; the rest is its length.
+func TestLogUserAgent(t *testing.T) {
+	cases := map[string]string{
+		"Go-http-client/1.1":                   "Go-http-client/1.1",
+		"curl/8.5.0":                           "curl/8.5.0",
+		"Anthropic/Python 0.40.0":              "Anthropic/Python <len=7>",
+		"OpenAI/JS 4.0 (secret comment)":       "OpenAI/JS <len=21>",
+		"":                                     "<len=0>",
+		" leading-space":                       "<len=14>",
+		strings.Repeat("a", maxLogUserAgent+1): fmt.Sprintf("<len=%d>", maxLogUserAgent+1),
+		"name(with)parens/1":                   "<len=18>",
+		"tool/1.0;secret":                      "<len=15>",
+		strings.Repeat("b", maxLogUserAgent) + " x": strings.Repeat("b", maxLogUserAgent) + " <len=2>",
+	}
+	for in, want := range cases {
+		if got := logUserAgent(in); got != want {
+			t.Errorf("logUserAgent(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A model name is printed only when it names a configured route or alias;
+// anything else, and a passthrough real model, is its length.
+func TestLogModels(t *testing.T) {
+	cfg, err := config.Parse([]byte(`
+server:
+  allow_plaintext: true
+backends:
+  - id: be
+    type: openai
+    base_url: "http://127.0.0.1:1"
+routes:
+  - virtual_model: fast
+    alias: [quick]
+    backend: be
+    real_model: vendor/fast-1
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct{ virtual, real, wantV, wantR string }{
+		{"fast", "vendor/fast-1", "fast", "vendor/fast-1"},
+		{"quick", "vendor/fast-1", "quick", "vendor/fast-1"},
+		{"secret prompt", "secret prompt", "<unknown model len=13>", "<unknown model len=13>"},
+		{"Fast", "Fast", "<unknown model len=4>", "<unknown model len=4>"},
+		{"", "", "<unknown model len=0>", "<unknown model len=0>"},
+		{"secret", "other", "<unknown model len=6>", "<unknown model len=5>"},
+	}
+	for _, c := range cases {
+		v, r := logModels(cfg, c.virtual, c.real)
+		if v != c.wantV || r != c.wantR {
+			t.Errorf("logModels(%q, %q) = %q, %q; want %q, %q", c.virtual, c.real, v, r, c.wantV, c.wantR)
+		}
+	}
+	if v, _ := logModels(nil, "fast", "fast"); v != "<unknown model len=4>" {
+		t.Errorf("logModels(nil cfg) = %q, want the length", v)
+	}
+}
+
+// The upstream URL is logged without the caller's query string, fragment
+// or user info.
+func TestLogURL(t *testing.T) {
+	u, _ := url.Parse("https://user:pw@api.example:8443/v1/chat/completions?q=secret#frag")
+	if got, want := logURL(u), "https://api.example:8443/v1/chat/completions"; got != want {
+		t.Errorf("logURL = %q, want %q", got, want)
+	}
+	if logURL(nil) != "" {
+		t.Error("logURL(nil) should be empty")
+	}
+	if upstreamURL(nil) != "" || upstreamURL(&http.Response{}) != "" {
+		t.Error("upstreamURL without a request should be empty")
+	}
+}
+
+// An outbound *url.Error quotes the request URL; logErr drops its query.
+func TestLogErr(t *testing.T) {
+	ue := &url.Error{Op: "Post", URL: "http://h/v1/chat/completions?q=secret", Err: io.EOF}
+	if got, want := logErr(fmt.Errorf("wrapped: %w", ue)), `Post "http://h/v1/chat/completions": EOF`; got != want {
+		t.Errorf("logErr = %q, want %q", got, want)
+	}
+	bad := &url.Error{Op: "Get", URL: "http://h/%zz?q=secret", Err: io.EOF}
+	if got := logErr(bad); strings.Contains(got, "secret") || !strings.Contains(got, "unparsable url") {
+		t.Errorf("logErr(unparsable) = %q", got)
+	}
+	if got := logErr(errors.New("dial tcp: connection refused")); got != "dial tcp: connection refused" {
+		t.Errorf("logErr(plain) = %q", got)
 	}
 }

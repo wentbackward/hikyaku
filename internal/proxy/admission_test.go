@@ -637,7 +637,7 @@ func TestAdmission_RequestLoggingIsCappedByItsGeneration(t *testing.T) {
 	if err := apply(srv, loud); err != nil {
 		t.Fatal(err)
 	}
-	if out := send(srv); !strings.Contains(out, "X-Probe-Header: seen") {
+	if out := send(srv); !strings.Contains(out, "X-Probe-Header: <len=4>") {
 		t.Fatalf("a level-2 generation did not log headers:\n%s", out)
 	}
 	// Generation level 2, process level 0: nothing.

@@ -1,8 +1,14 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"reflect"
+	"strings"
+
+	"github.com/wentbackward/hikyaku/internal/config"
 )
 
 // Helpers that keep content out of the request and header logs (levels 1-2,
@@ -75,4 +81,122 @@ func logRole(role interface{}) string {
 		}
 	}
 	return "<non-standard>"
+}
+
+// logHeaderValues are the protocol headers whose values the level-2 header
+// dump prints (canonical names). Every other header is caller text of
+// unknown meaning, a custom title or a credential the redaction list does
+// not name, and is printed as its length only. User-Agent is handled by
+// logUserAgent.
+var logHeaderValues = map[string]bool{
+	"Content-Type":      true,
+	"Content-Length":    true,
+	"Accept":            true,
+	"Accept-Encoding":   true,
+	"Anthropic-Version": true,
+	"Anthropic-Beta":    true,
+	"Openai-Beta":       true,
+}
+
+// maxLogHeaderValue caps an allowlisted header value; a longer one, or one
+// with characters outside printable ASCII, is printed as its length.
+const maxLogHeaderValue = 128
+
+// maxLogUserAgent caps the User-Agent product token that is printed.
+const maxLogUserAgent = 32
+
+// logHeaders renders the request headers for the level-2 dump: allowlisted
+// protocol headers with their values, the User-Agent's first product token,
+// and every other header, credentials included, as <len=N>.
+func logHeaders(h http.Header) map[string]string {
+	out := make(map[string]string, len(h))
+	for k, vs := range h {
+		name := http.CanonicalHeaderKey(k)
+		v := strings.Join(vs, ", ")
+		switch {
+		case name == "User-Agent":
+			out[name] = logUserAgent(v)
+		case logHeaderValues[name] && len(v) <= maxLogHeaderValue && printableASCII(v):
+			out[name] = v
+		default:
+			out[name] = lenOnly(v)
+		}
+	}
+	return out
+}
+
+// logUserAgent returns the User-Agent's first product token (name/version)
+// when it is at most maxLogUserAgent bytes of token characters, and the
+// header's length otherwise. Comments and further tokens are dropped.
+func logUserAgent(ua string) string {
+	tok, _, _ := strings.Cut(ua, " ")
+	if tok == "" || len(tok) > maxLogUserAgent {
+		return lenOnly(ua)
+	}
+	for _, r := range tok {
+		if !uaTokenRune(r) {
+			return lenOnly(ua)
+		}
+	}
+	if len(tok) < len(ua) {
+		return tok + " " + lenOnly(ua[len(tok):])
+	}
+	return tok
+}
+
+func uaTokenRune(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._-/+", r)
+}
+
+func lenOnly(s string) string { return fmt.Sprintf("<len=%d>", len(s)) }
+
+func printableASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+// logModels renders a request's model pair for levels 0-2. A model name is
+// caller text unless it names a configured route or alias: then the
+// virtual name and the real model it resolved to (both from config) are
+// printed. Any other name, and the passthrough real model that copies it,
+// is printed as <unknown model len=N>.
+func logModels(cfg *config.Config, virtual, resolved string) (logVirtual, logResolved string) {
+	if cfg != nil {
+		if _, ok := cfg.Route(virtual); ok {
+			return virtual, resolved
+		}
+	}
+	// Nothing in config vouches for either name: print their lengths.
+	return logUnknownModel(virtual), logUnknownModel(resolved)
+}
+
+func logUnknownModel(name string) string { return fmt.Sprintf("<unknown model len=%d>", len(name)) }
+
+// logURL renders an upstream URL without its query string, fragment or
+// user info: the proxy forwards the caller's query string, which is caller
+// text. Scheme, host and path come from config and the fixed API paths.
+func logURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	c := url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}
+	return c.String()
+}
+
+// logErr renders an outbound error for the log. A *url.Error quotes the
+// request URL, query string included; it is printed with logURL instead.
+func logErr(err error) string {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		u, perr := url.Parse(ue.URL)
+		if perr != nil {
+			return fmt.Sprintf("%s <unparsable url len=%d>: %v", ue.Op, len(ue.URL), ue.Err)
+		}
+		return fmt.Sprintf("%s %q: %v", ue.Op, logURL(u), ue.Err)
+	}
+	return err.Error()
 }

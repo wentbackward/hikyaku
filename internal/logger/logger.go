@@ -9,9 +9,16 @@
 //	4 = content  — level 3 + full message text (request and response)
 //
 // Levels 0-2 (Request, Headers, log.Printf) must never carry request or
-// response content: message text, tool arguments, completions, upstream
-// error text or other caller-supplied strings. Content goes only through
-// Body and Content, which the hardened build compiles out.
+// response content or other caller-supplied text. They contain exactly: ids
+// and durations; the method and API path (no query string); model names
+// only when they are configured routes or aliases (others as
+// <unknown model len=N>); backend ids and URLs from config (upstream URLs
+// without their query string); statuses and byte lengths; sampling params
+// with strings as lengths; standard message roles; allowlisted protocol
+// header values and the User-Agent product token (other headers as
+// lengths); the caller's network address; transport and config errors.
+// Content goes only through Body and Content, which the hardened build
+// compiles out. docs/logging.md is the reference.
 //
 // Set via server.log_level in config.yaml, or LOG_LEVEL=<n> in the
 // environment (env wins when both are set). Send SIGHUP to reload:
