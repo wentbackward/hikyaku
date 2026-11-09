@@ -5,8 +5,13 @@
 //	0 = errors only (default)
 //	1 = requests — method, path, model, status, duration
 //	2 = headers  — level 1 + incoming headers + transformation summary
-//	3 = body     — level 2 + first 80 chars of request body
+//	3 = body     — level 2 + first 80 chars of request body, upstream error body
 //	4 = content  — level 3 + full message text (request and response)
+//
+// Levels 0-2 (Request, Headers, log.Printf) must never carry request or
+// response content: message text, tool arguments, completions, upstream
+// error text or other caller-supplied strings. Content goes only through
+// Body and Content, which the hardened build compiles out.
 //
 // Set via server.log_level in config.yaml, or LOG_LEVEL=<n> in the
 // environment (env wins when both are set). Send SIGHUP to reload:

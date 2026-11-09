@@ -8,7 +8,8 @@ import "log"
 // In the default (debug) build, all four levels are available.
 const MaxAllowedLevel = LevelContent
 
-// Body logs at level 3 (shows first 80 chars of request bodies).
+// Body logs at level 3: content previews (the first 80 chars of a request
+// body, an upstream error body).
 func Body(format string, args ...interface{}) {
 	if Get() >= LevelBody {
 		log.Printf("[body] "+format, args...)

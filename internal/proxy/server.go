@@ -1021,9 +1021,9 @@ func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, opts proxy
 			}
 		}
 	}
-	if res != nil && len(res.Params) > 0 {
+	if res != nil && len(res.Params) > 0 && rlog.level() >= logger.LevelHeaders {
 		rlog.Headers("[%s] → backend=%s target=%s model=%s→%s auth=%s params=%v",
-			rid, backend.ID, backend.BaseURL, modelName, realModel, authType, res.Params)
+			rid, backend.ID, backend.BaseURL, modelName, realModel, authType, logParams(res.Params))
 	} else {
 		rlog.Headers("[%s] → backend=%s target=%s model=%s→%s auth=%s",
 			rid, backend.ID, backend.BaseURL, modelName, realModel, authType)
@@ -1778,9 +1778,14 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 			rlog.Request("[%s] POST %s model=%s→%s backend=%s url=%s status=%s dur=%.3fs",
 				rid, path, virtualModel, realModel, backendID, upstreamURL(resp), statusStr, elapsed)
 
-			// Log upstream error body at level >= 1
-			if resp.StatusCode != http.StatusOK && rlog.level() >= logger.LevelRequest {
-				rlog.Request("[%s] upstream error body: %s", rid, string(data)[:min(len(data), 1024)])
+			// An upstream error body is content: providers echo the offending
+			// input in it. Levels 1-2 log only its status and length; the
+			// text goes to the body path (level 3, compiled out in hardened).
+			if resp.StatusCode != http.StatusOK {
+				rlog.Request("[%s] upstream error status=%d body_bytes=%d", rid, resp.StatusCode, len(data))
+				if rlog.level() >= logger.LevelBody {
+					rlog.Body("[%s] upstream error body: %s", rid, data[:min(len(data), maxErrorBodyLog)])
+				}
 			}
 
 			var counts usageCounts
@@ -2015,7 +2020,7 @@ func checkEmptyMessages(cfg *config.Config, route *config.Route, backend *config
 			continue
 		}
 		if isEmptyContent(m["content"]) {
-			return fmt.Errorf("%w: message[%d] (role=%v) has empty content", ErrEmptyContent, i, m["role"])
+			return fmt.Errorf("%w: message[%d] (role=%s) has empty content", ErrEmptyContent, i, logRole(m["role"]))
 		}
 	}
 	return nil
