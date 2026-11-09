@@ -142,24 +142,26 @@ func TestHeaders_Rename(t *testing.T) {
 	s, backend := newHeadersServer(t, &captured, "", `
     headers:
       rename:
-        Authorization: X-Original-Auth`)
+        X-Client-Trace: X-Upstream-Trace`)
 	defer backend.Close()
 
 	sendBasicChat(t, s, map[string]string{
-		"Authorization": "Bearer client-supplied-token",
+		"X-Client-Trace": "trace-1",
 	})
 
-	if got := captured.Get("X-Original-Auth"); got != "Bearer client-supplied-token" {
-		t.Errorf("renamed header: got %q, want %q", got, "Bearer client-supplied-token")
+	if got := captured.Get("X-Upstream-Trace"); got != "trace-1" {
+		t.Errorf("renamed header: got %q, want %q", got, "trace-1")
 	}
-	if got := captured.Get("Authorization"); got != "" {
-		t.Errorf("original Authorization should be removed after rename, got %q", got)
+	if got := captured.Get("X-Client-Trace"); got != "" {
+		t.Errorf("original header should be removed after rename, got %q", got)
 	}
 }
 
-func TestHeaders_RenameThenAddPreservesAuditAndAddsNew(t *testing.T) {
-	// Practical pattern: rename Authorization → X-Original-Auth (audit),
-	// then add a new Authorization for the upstream.
+func TestHeaders_RenameThenAddReplacesCredential(t *testing.T) {
+	// The former audit pattern (rename Authorization → X-Original-Auth, then
+	// add a new Authorization) no longer carries the caller's credential:
+	// caller credentials are stripped before the rules, and a rename out of
+	// a credential header has no effect. The operator's add still applies.
 	var captured http.Header
 	s, backend := newHeadersServer(t, &captured, "", `
     headers:
@@ -173,8 +175,8 @@ func TestHeaders_RenameThenAddPreservesAuditAndAddsNew(t *testing.T) {
 		"Authorization": "Bearer client-token",
 	})
 
-	if got := captured.Get("X-Original-Auth"); got != "Bearer client-token" {
-		t.Errorf("renamed header should have client value: got %q", got)
+	if got := captured.Get("X-Original-Auth"); got != "" {
+		t.Errorf("the caller credential must not reach the backend renamed: got %q", got)
 	}
 	if got := captured.Get("Authorization"); got != "Bearer new-internal-token" {
 		t.Errorf("new Authorization: got %q", got)

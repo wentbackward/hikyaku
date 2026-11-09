@@ -56,3 +56,33 @@ func warnIgnoredAcceptEncoding(cfg *Config) {
 func (c *Config) Warnings() []string {
 	return c.warnings
 }
+
+// credentialHeaders are the request headers that carry a credential. The
+// proxy strips every one of them from the caller's request before it
+// forwards it, sets only the backend's own configured credential, and
+// redacts them wherever request headers are logged or captured.
+var credentialHeaders = []string{
+	"Authorization",
+	"X-Api-Key",
+	"Api-Key",
+	"X-Goog-Api-Key",
+	"Proxy-Authorization",
+	"Cookie",
+}
+
+// CredentialHeaders returns the canonical names of the request headers that
+// carry a credential (a fresh copy on every call).
+func CredentialHeaders() []string {
+	return append([]string(nil), credentialHeaders...)
+}
+
+// IsCredentialHeader reports whether name (any case) is a credential header.
+func IsCredentialHeader(name string) bool {
+	canonical := http.CanonicalHeaderKey(name)
+	for _, c := range credentialHeaders {
+		if canonical == c {
+			return true
+		}
+	}
+	return false
+}
