@@ -2130,8 +2130,9 @@ type cacheWriteSplit struct {
 // total it splits. A split with no total (cacheWrite 0) is dropped on
 // purpose: CacheWriteTokens is the billed total and the tiers only divide
 // it, so tiers that divide nothing are inconsistent upstream data, and
-// reporting them would bill cache writes the total says did not happen. Every operand is in [0, 2^63) (jsonCount, headerCount),
-// so the comparison cannot overflow where adding the two could.
+// reporting them would bill cache writes the total says did not happen.
+// Every operand is in [0, 2^63) (jsonCount, headerCount), so the
+// comparison cannot overflow where adding the two could.
 func (c usageCounts) withCacheWriteSplit(s cacheWriteSplit) usageCounts {
 	if s.m5 > c.cacheWrite || s.h1 > c.cacheWrite-s.m5 {
 		s = cacheWriteSplit{}

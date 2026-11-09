@@ -1,12 +1,16 @@
 package proxy
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wentbackward/hikyaku/internal/config"
 	"github.com/wentbackward/hikyaku/internal/telemetry"
@@ -287,10 +291,11 @@ func TestAnthropicStream_ZeroInputMessageDeltaKeepsMessageStart(t *testing.T) {
 }
 
 // The cache-write split belongs to the cache_creation_input_tokens total it
-// was reported with. A larger total takes the delta's split, or none when
-// the delta has no cache_creation object; the same total keeps the earlier
-// split unless the delta carries a positive one; an absent or smaller total
-// keeps the earlier total and split.
+// was reported with. A delta reporting the (same or larger) total with a
+// positive split replaces the split; otherwise the earlier split is kept,
+// as the SDK keeps an omitted cache_creation: it still fits the total, and
+// the remainder is cache write of unreported lifetime. An absent or smaller
+// total keeps the earlier total and split.
 func TestAnthropicStream_CacheWriteSplitFollowsItsTotal(t *testing.T) {
 	start := `{"input_tokens":100,"cache_creation_input_tokens":248,"output_tokens":1,"cache_creation":{"ephemeral_5m_input_tokens":148,"ephemeral_1h_input_tokens":100}}`
 	cases := []struct {
@@ -328,9 +333,14 @@ func TestAnthropicStream_CacheWriteSplitFollowsItsTotal(t *testing.T) {
 			want:  usageCounts{prompt: 100, completion: 9, cacheWrite: 248, cacheWrite5m: 148, cacheWrite1h: 100},
 		},
 		{
-			name:  "ChangedTotalWithoutSplitDropsSplit",
+			name:  "LargerTotalWithoutSplitKeepsEarlierSplit",
 			delta: `{"input_tokens":200,"cache_creation_input_tokens":400,"output_tokens":9}`,
-			want:  usageCounts{prompt: 200, completion: 9, cacheWrite: 400},
+			want:  usageCounts{prompt: 200, completion: 9, cacheWrite: 400, cacheWrite5m: 148, cacheWrite1h: 100},
+		},
+		{
+			name:  "LargerTotalWithZeroSplitKeepsEarlierSplit",
+			delta: `{"cache_creation_input_tokens":400,"output_tokens":9,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}`,
+			want:  usageCounts{prompt: 100, completion: 9, cacheWrite: 400, cacheWrite5m: 148, cacheWrite1h: 100},
 		},
 	}
 	for _, tc := range cases {
@@ -486,5 +496,186 @@ func TestUsageEvent_WebSearchRequestsZeroOnOpenAILane(t *testing.T) {
 	ev, _ := proxyRecorded(t, "openai", "/v1/chat/completions", "openai_chat.json", false, nil)
 	if ev.WebSearchRequests != 0 {
 		t.Errorf("WebSearchRequests = %d, want 0", ev.WebSearchRequests)
+	}
+}
+
+// ── Streams cut before their end ────────────────────────────────────────────
+
+// cutMode says how cutStreamServer's upstream ends the stream after writing
+// its lines.
+type cutMode int
+
+const (
+	cutCleanEOF         cutMode = iota // the upstream ends the body normally, without the protocol's end event
+	cutUpstreamError                   // the upstream drops the connection mid-body (truncated chunked body)
+	cutClientDisconnect                // the upstream holds the stream open; the client leaves
+)
+
+// cutStream proxies a stream of backendType whose upstream writes raw and
+// then ends as mode says, and returns the single UsageEvent and the proxy's
+// metrics reader. The client reads all of raw before it leaves, so the
+// parser has seen every byte of it.
+func cutStream(t *testing.T, backendType, path, raw string, mode cutMode) (UsageEvent, loopMetricsReader) {
+	t.Helper()
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if mode == cutUpstreamError {
+			conn, buf, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			fmt.Fprintf(buf, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n", len(raw), raw)
+			_ = buf.Flush()
+			_ = conn.Close() // no terminating chunk
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, raw)
+		w.(http.Flusher).Flush()
+		if mode == cutClientDisconnect {
+			<-r.Context().Done()
+		}
+	}))
+	t.Cleanup(backend.Close)
+	yaml := fmt.Sprintf(`
+server:
+  allow_plaintext: true
+backends:
+  - id: be
+    type: %s
+    base_url: "%s"
+    timeout_seconds: 30
+routes:
+  - virtual_model: m
+    backend: be
+    real_model: real-m
+`, backendType, backend.URL)
+	cfg, err := config.Load(writeTestConfig(t, yaml))
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	events := make(chan UsageEvent, 4)
+	m, lr := newLoopMetrics(t)
+	s := New("test", "inspect", cfg, m, nil, WithUsageObserver(func(ev UsageEvent) { events <- ev }))
+	mux := http.NewServeMux()
+	s.RegisterRoutes(mux)
+	ps := httptest.NewServer(mux)
+	t.Cleanup(ps.Close)
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"model": "m", "max_tokens": 16, "stream": true,
+		"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, ps.URL+path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode == cutClientDisconnect {
+		if _, err := io.ReadFull(resp.Body, make([]byte, len(raw))); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+	} else {
+		_, _ = io.ReadAll(resp.Body)
+	}
+	resp.Body.Close()
+	return nextUsage(t, events), lr
+}
+
+const (
+	cutStartOnly = "event: message_start\n" +
+		`data: {"type":"message_start","message":{"id":"m1","usage":{"input_tokens":2679,"cache_read_input_tokens":500,"cache_creation_input_tokens":248,"output_tokens":3,"cache_creation":{"ephemeral_5m_input_tokens":148,"ephemeral_1h_input_tokens":100}}}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}` + "\n\n"
+	cutStartAndDelta = cutStartOnly +
+		"event: message_delta\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10682,"output_tokens":510,"server_tool_use":{"web_search_requests":1}}}` + "\n\n"
+)
+
+// An Anthropic stream cut before message_stop still reports the usage it
+// carried: message_start's input classes (and a message_delta's, when one
+// arrived) are billed input whether or not the stream finished. EndReason
+// says how it ended, so the embedder knows the counts may be partial.
+func TestAnthropicStream_CutBeforeMessageStopReportsObservedUsage(t *testing.T) {
+	startOnly := usageCounts{prompt: 2679, cacheRead: 500, cacheWrite: 248, cacheWrite5m: 148, cacheWrite1h: 100}
+	startAndDelta := usageCounts{prompt: 10682, completion: 510, cacheRead: 500, cacheWrite: 248, cacheWrite5m: 148, cacheWrite1h: 100, webSearch: 1}
+	cases := []struct {
+		name string
+		raw  string
+		mode cutMode
+		want usageCounts
+		end  EndReason
+	}{
+		{"StartOnlyThenUpstreamEnds", cutStartOnly, cutCleanEOF, startOnly, EndComplete},
+		{"StartAndDeltaThenUpstreamEnds", cutStartAndDelta, cutCleanEOF, startAndDelta, EndComplete},
+		{"StartOnlyThenClientDisconnects", cutStartOnly, cutClientDisconnect, startOnly, EndClientDisconnect},
+		{"StartAndDeltaThenClientDisconnects", cutStartAndDelta, cutClientDisconnect, startAndDelta, EndClientDisconnect},
+		{"StartOnlyThenUpstreamError", cutStartOnly, cutUpstreamError, startOnly, EndUpstreamError},
+		{"StartAndDeltaThenUpstreamError", cutStartAndDelta, cutUpstreamError, startAndDelta, EndUpstreamError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev, lr := cutStream(t, "anthropic", "/v1/messages", tc.raw, tc.mode)
+			if ev.EndReason != tc.end {
+				t.Errorf("EndReason = %q, want %q", ev.EndReason, tc.end)
+			}
+			if got := eventCounts(ev); got != tc.want {
+				t.Errorf("event counts = %+v, want %+v", got, tc.want)
+			}
+			if got := lr.promptTokensTotal(t); got != tc.want.prompt {
+				t.Errorf("llm_prompt_tokens_total = %d, want %d (observed input, counted once)", got, tc.want.prompt)
+			}
+		})
+	}
+}
+
+// The parser flush in recordFinal is idempotent: a stream that did reach
+// message_stop and [DONE] is counted once.
+func TestAnthropicStream_RecordFinalAfterMessageStopDoesNotDoubleCount(t *testing.T) {
+	m, lr := newLoopMetrics(t)
+	p := newSSEParser("be", "real-m", "anthropic", time.Now(), m, t.Context())
+	feedLines(p,
+		`data: {"type":"message_start","message":{"id":"m1","usage":{"input_tokens":100}}}`,
+		`data: {"type":"message_delta","usage":{"output_tokens":7}}`,
+		`data: {"type":"message_stop"}`,
+		`data: [DONE]`,
+	)
+	p.recordFinal()
+	if got := lr.promptTokensTotal(t); got != 100 {
+		t.Errorf("llm_prompt_tokens_total = %d, want 100", got)
+	}
+	if got, want := p.usage(), (usageCounts{prompt: 100, completion: 7}); got != want {
+		t.Errorf("usage() = %+v, want %+v", got, want)
+	}
+}
+
+// On the OpenAI lane a usage object seen before the cut is reported too
+// (it is stored as it arrives, with no end-of-stream flush to miss).
+func TestOpenAIStream_CutAfterUsageChunkReportsIt(t *testing.T) {
+	raw := `data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}` + "\n\n" +
+		`data: {"id":"c1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":1500,"completion_tokens":40,"prompt_tokens_details":{"cached_tokens":1024,"cache_write_tokens":256}}}` + "\n\n"
+	want := usageCounts{prompt: 220, completion: 40, cacheRead: 1024, cacheWrite: 256}
+	for _, tc := range []struct {
+		name string
+		mode cutMode
+		end  EndReason
+	}{
+		{"ClientDisconnect", cutClientDisconnect, EndClientDisconnect},
+		{"UpstreamError", cutUpstreamError, EndUpstreamError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ev, _ := cutStream(t, "openai", "/v1/chat/completions", raw, tc.mode)
+			if ev.EndReason != tc.end {
+				t.Errorf("EndReason = %q, want %q", ev.EndReason, tc.end)
+			}
+			if got := eventCounts(ev); got != want {
+				t.Errorf("event counts = %+v, want %+v", got, want)
+			}
+		})
 	}
 }

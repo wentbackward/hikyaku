@@ -72,12 +72,18 @@ takes the larger of its earlier and its new value (cumulative counts never
 fall, so on a compliant stream that is the last value, and a zero
 placeholder never erases a count). `output_tokens` comes from the
 `message_delta` events the same way, and `server_tool_use` is read as one
-object. The cache-write split stays with the total it was reported with: a
-larger total takes that event's `cache_creation` split, or none (0) when
-the event has no split; the same total keeps the earlier split unless the
-event carries a positive one; an absent or smaller total keeps the earlier
-total and split. `llm_prompt_tokens_total` gets the same final
-`input_tokens`.
+object. The cache-write split stays with the total it was reported with:
+an event that reports the (same or larger) total with a positive
+`cache_creation` split replaces the split; otherwise the earlier split is
+kept, as the SDK keeps an omitted `cache_creation` (it still fits the
+total, and the remainder is cache write of unreported lifetime). An absent
+or smaller total keeps the earlier total and split.
+`llm_prompt_tokens_total` gets the same final `input_tokens`. A stream cut
+before `message_stop` (client disconnect, upstream error, loop abort, or an
+upstream that just stops) reports the usage it carried so far, so
+`message_start`'s input is never lost; its `EndReason` says the counts may
+be partial. The OpenAI lane likewise reports a usage chunk that arrived
+before the cut.
 
 Streamed OpenAI-lane responses carry these in the final usage chunk
 (`"choices": []`), which core requests with `stream_options.include_usage`.

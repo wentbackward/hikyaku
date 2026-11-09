@@ -403,36 +403,29 @@ func (p *sseParser) handleAnthropicEvent(evt map[string]interface{}) {
 // (or an omitted key, which jsonCount reads as zero) never erases a count.
 // server_tool_use is read as one object, the way the SDK replaces it.
 //
-// The cache-write split stays tied to the total it was reported with:
-//   - a larger total takes this object's cache_creation split, or none (0)
-//     when the object has no split for it;
-//   - the same total takes this object's split only when it carries a
-//     positive tier, else keeps the earlier one;
-//   - an absent, null or smaller total keeps the earlier total and split,
-//     whatever cache_creation this object carries.
+// The cache-write total merges like the other classes. Its split is taken
+// from this object only when the object reports the resulting total itself
+// and a split with a positive tier for it (anthropicUsage has already
+// dropped a split that does not fit this object's own total, or that has
+// no total). Otherwise the earlier split is kept, as the SDK keeps an
+// omitted cache_creation: it was reported for a total no larger than the
+// current one, so it still fits, and any remainder is cache write whose
+// lifetime the provider has not reported.
 func (p *sseParser) mergeAnthropicUsage(usage map[string]interface{}) {
 	u := anthropicUsage(usage)
 	in := &p.anthropicIn
 	in.prompt = max(in.prompt, u.prompt)
 	in.cacheRead = max(in.cacheRead, u.cacheRead)
 	in.webSearch = max(in.webSearch, u.webSearch)
-	_, hasSplit := usage["cache_creation"].(map[string]interface{})
-	split := cacheWriteSplit{m5: u.cacheWrite5m, h1: u.cacheWrite1h}
-	switch {
-	case u.cacheWrite > in.cacheWrite:
-		in.cacheWrite = u.cacheWrite
-		if !hasSplit {
-			split = cacheWriteSplit{}
-		}
-		*in = in.withCacheWriteSplit(split)
-	case u.cacheWrite == in.cacheWrite && (split.m5 > 0 || split.h1 > 0):
-		*in = in.withCacheWriteSplit(split)
+	in.cacheWrite = max(in.cacheWrite, u.cacheWrite)
+	if u.cacheWrite == in.cacheWrite && (u.cacheWrite5m > 0 || u.cacheWrite1h > 0) {
+		*in = in.withCacheWriteSplit(cacheWriteSplit{m5: u.cacheWrite5m, h1: u.cacheWrite1h})
 	}
 }
 
 // recordAnthropicTokens flushes the counts accumulated across Anthropic events
 // into the per-stream totals and the Prometheus counters. It runs on
-// message_stop and again on [DONE]; the accumulators are zeroed after each
+// message_stop, on [DONE] and in recordFinal; the accumulators are zeroed after each
 // flush so a second flush is a no-op rather than a double count, while the
 // totals it exposes via usage() persist.
 func (p *sseParser) recordAnthropicTokens() {
@@ -476,6 +469,15 @@ func (p *sseParser) usage() usageCounts {
 func (p *sseParser) recordFinal() {
 	p.loop.close()
 	attrs := telemetry.BackendAttrs(p.backendID, p.model)
+
+	// A stream that ended before message_stop (client disconnect, upstream
+	// error, loop abort, or an upstream that just stopped) still reports
+	// the usage it carried so far: message_start's input classes are billed
+	// input whether or not the stream finished. EndReason tells the
+	// embedder the counts may be partial. A no-op after message_stop.
+	if p.backendType == "anthropic" {
+		p.recordAnthropicTokens()
+	}
 
 	// Flush any buffered token counts to totals counters (OpenAI path)
 	if p.backendType != "anthropic" {
