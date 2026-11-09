@@ -40,7 +40,7 @@ Set in `config.yaml` under `server.log_level`, or via the `LOG_LEVEL` environmen
 | `0` | Errors only (default) |
 | `1` | One line per request — method, API path, virtual model → real model (configured routes only, see below), backend, upstream URL without its query string, status, duration. For an upstream error, one more line with the status, the request ID and the error body's length in bytes (`upstream error status=400 body_bytes=312`) |
 | `2` | Level 1 + incoming request headers (allowlisted protocol headers with their values, every other header as its length) + transformation summary (backend, target URL, model rewrite, auth type, merged params with every string value shown as its length) |
-| `3` | Level 2 + first 80 characters of the request body + the upstream error body (up to 1 KB) |
+| `3` | Level 2 + first 80 characters of the request body + the upstream error body (up to 1 KB) + the full text of errors that levels 0-2 render by allowlist |
 | `4` | Level 3 + full message text content (request and response) |
 
 ### What each level may contain
@@ -50,14 +50,23 @@ Levels 0, 1 and 2 never contain request or response **content** or other caller-
 - **Ids and timing:** the interaction ID, durations, the generation number of a refused request.
 - **The request line:** the method and the API path (one of the fixed endpoint paths; the query string is never logged).
 - **Model names from config:** a model name appears only when it is a configured route or alias, together with the real model it resolves to. Any other name, and the real model a `passthrough_unrouted` request copies from it, appears as `<unknown model len=N>`.
-- **Routing from config:** backend id, backend base URL and upstream URL (scheme, host and path only; never a query string, fragment or user info), auth type, stream-loop route label, and the upstream response id on a stream-loop trip line (up to 64 token characters, otherwise its length).
-- **Load balancing (inspect builds only, level 0):** `[lb]` lines name an affinity key, a caller header value or a fingerprint of the first user message, only as the first 8 hex digits of its SHA-256 (`affinity=1a2b3c4d`). The hardened build compiles these lines out.
+- **Routing from config:** backend id, backend base URL and upstream URL (scheme, host and path only; never a query string, fragment or user info), auth type, stream-loop route label, and the upstream response id on a stream-loop trip line (up to 64 token characters, otherwise its length). The startup probe lists the model ids a backend reports the same way (up to 128 token characters each, otherwise the length).
+- **Load balancing (inspect builds only, level 0):** `[lb]` lines name an affinity key, a caller header value or a fingerprint of the first user message, only as the first 8 hex digits of its HMAC-SHA256 under a per-process random key (`affinity=1a2b3c4d`), so a low-entropy key cannot be recovered by hashing guesses. The hardened build compiles these lines out.
 - **Status and sizes:** HTTP status, `upstream error status=N body_bytes=N`, byte counts.
 - **Parameters:** merged sampling parameters, numbers and booleans as they are, every string as `<string len=N>`.
 - **Message roles:** a standard role (`system`, `developer`, `user`, `assistant`, `tool`, `function`); any other value is `<non-standard>`.
 - **Headers (level 2):** values only for `Content-Type`, `Content-Length`, `Accept`, `Accept-Encoding`, `anthropic-version`, `anthropic-beta` and `OpenAI-Beta` (up to 128 printable ASCII characters), and the first product token of `User-Agent` (up to 32 token characters, the rest as its length). Every other header, credentials included, is `Name: <len=N>`.
 - **Caller network address:** the remote address on level-0 unknown-model lines.
-- **Errors:** transport, admission, probe and config errors, with every quoted span reduced to `<quoted len=N>` and any URL shown as scheme, host and path. That covers the bytes Go's HTTP client quotes from a peer that is not an HTTP server (`malformed HTTP response <quoted len=24>`), and the value a YAML type error quotes, which could be a secret typed into the wrong field (`line 7: cannot unmarshal !!str <quoted len=17> into int`). The line, column and type information remain. Never a response body.
+- **Errors**, rendered by allowlist from their structure, never from their text. Only these parts are printed:
+  - URL errors: the operation and the URL as scheme, host and path.
+  - Network errors: the operation, network and addresses.
+  - DNS errors: the name and whether it was not found or timed out.
+  - TLS and x509 errors: a fixed description of their kind.
+  - File errors: the operation and path.
+  - The standard fixed-text errors: `EOF`, `context canceled`, system call errors such as `connection refused`.
+  - Core's own errors: a config error with every value shown as `<len=N>`, a YAML error as its line, column and YAML tag (`yaml: unmarshal errors: line 7: cannot unmarshal a !!str value into this field`), the admission refusal status, and the upstream idle timeout.
+
+  Any other error, including those the standard library builds by pasting in a peer's bytes (a non-HTTP backend's reply, a malformed header line), prints as its types and length, for example `<error type=*fmt.wrapError,textproto.ProtocolError len=117 reason=malformed_MIME_header_line>`. The `timeout` flag and a `reason=` phrase are added only when the error reports a timeout or its text contains one of a fixed list of standard-library phrases. The phrase is the constant from that list, never the surrounding text. In the default build the full error text follows on the body path at level 3 (`[body] ... detail: ...`), which the hardened build compiles out. Embedders get the same rendering from `hikyaku.SafeErr`.
 
 Content reaches the log only at level 3 (the request-body preview and the upstream error body, `[body]` lines) and level 4 (full message and response text). The hardened build compiles both out and clamps a requested level 3 or 4 to 2, so a hardened binary never logs content at any level. `internal/proxy/nocontent_log_*_test.go` enforce this in both builds by sending a unique marker through every lane, in requests, 2xx and error responses, streams and cut-off streams, and failing if the marker reaches the log.
 
