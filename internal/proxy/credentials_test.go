@@ -444,3 +444,63 @@ func TestStripCredentials_NonCanonicalKeys(t *testing.T) {
 		t.Errorf("after strip: %v, want only X-Keep", h)
 	}
 }
+
+// A caller cannot use Connection to make the reverse proxy drop headers the
+// proxy itself sets: the backend key, an operator add and Accept-Encoding all
+// survive a Connection header naming them, on every lane.
+func TestCredentials_ConnectionCannotStripProxySetHeaders(t *testing.T) {
+	keyHeader := map[string]string{
+		"openai":    "Authorization",
+		"anthropic": "X-Api-Key",
+		"ollama":    "Authorization",
+	}
+	wantKey := map[string]string{
+		"openai":    "Bearer be-key",
+		"anthropic": "be-key",
+		"ollama":    "Bearer be-key",
+	}
+	for _, lane := range credLanes {
+		t.Run(lane.name, func(t *testing.T) {
+			up := newRecordingUpstream(t)
+			s := newCredServer(t, up.URL, lane.backendType, "", `
+    api_key: be-key
+    headers:
+      add:
+        X-Tenant-Id: tenant-a`, "")
+			sendWithCallerCredentials(t, s, lane, map[string]string{
+				"Connection":   "Authorization, x-api-key,X-Tenant-Id , Accept-Encoding",
+				"X-Hop-Marker": "x",
+			})
+			got := up.last(t).header
+			assertOnlyCredential(t, got, map[string]string{keyHeader[lane.name]: wantKey[lane.name]})
+			if v := got.Get("X-Tenant-Id"); v != "tenant-a" {
+				t.Errorf("X-Tenant-Id = %q, want tenant-a", v)
+			}
+			if v := got.Get("Accept-Encoding"); v != "identity" {
+				t.Errorf("Accept-Encoding = %q, want identity", v)
+			}
+			if v := got.Get("Connection"); v != "" {
+				t.Errorf("Connection reached the backend: %q", v)
+			}
+		})
+	}
+}
+
+// Headers the caller names in Connection are hop-by-hop and are not
+// forwarded (RFC 9110 7.6.1), whatever their case.
+func TestCredentials_ConnectionListedCallerHeadersAreDropped(t *testing.T) {
+	up := newRecordingUpstream(t)
+	s := newCredServer(t, up.URL, "openai", "", "", "")
+	sendWithCallerCredentials(t, s, credLanes[0], map[string]string{
+		"Connection":   "x-hop-marker",
+		"X-Hop-Marker": "x",
+		"X-Keep":       "k",
+	})
+	got := up.last(t).header
+	if v := got.Get("X-Hop-Marker"); v != "" {
+		t.Errorf("X-Hop-Marker = %q, want dropped", v)
+	}
+	if v := got.Get("X-Keep"); v != "k" {
+		t.Errorf("X-Keep = %q, want k", v)
+	}
+}
