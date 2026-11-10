@@ -22,6 +22,7 @@ server:
     idle_conn_timeout: 120       # seconds before idle connections are closed (default: 120)
 ```
 
+- **`port`** — TCP port of the gateway. Default: 4000, used when the key is absent or has no value (`port:`, `port: ~`, or an unquoted `${VAR}` that is unset or empty; a quoted `"${VAR}"` that is unset is an empty string, which is a parse error). An explicit `0` binds a free port the kernel picks; the proxy logs the bound address (`listening on 0.0.0.0:41234 ...`). Meant for tests and supervisors that read the log; a deployment behind a Service or a firewall keeps a fixed port.
 - **`passthrough_unrouted`** — when `false` (default), requests for unknown model names are rejected with a 404 that lists available virtual models. When `true`, unknown models are forwarded to the default backend as-is (see `default:` on backends below).
 - **`min_tls_version`** — minimum TLS version for both inbound (client→proxy) and outbound (proxy→backend) connections. `"1.3"` (default) or `"1.2"`. In the inspect build this tightens Go's defaults when set; in the [hardened build](security.md#hardened-build) it is the enforced floor. Lower to `"1.2"` only for clients/backends that can't yet negotiate 1.3 — never below. `http://` backends are unaffected (no TLS handshake).
 - **`max_response_body_mb`** — the most one upstream response may carry, in MiB of decoded bytes (after a `gzip` or `deflate` body is decoded). Over it, a non-streamed response (or one whose `Content-Length` is over it) is a `502`, and a stream is cut off at the cap. Default 256; `0` means the default; otherwise 1 to 4096.
@@ -852,10 +853,10 @@ telemetry:
 
 - **`enabled`** — serve Prometheus metrics. Disable to skip the metrics server entirely.
 - **`host`** — bind address. Defaults to `127.0.0.1` (localhost only) because `/metrics` has no authentication. To scrape from another host, set to `0.0.0.0` (or a specific interface) *and* either configure TLS or set `allow_plaintext: true`.
-- **`port`** — TCP port. Default: 9091.
+- **`port`** — TCP port. Default: 9091, used when the key is absent or has no value. An explicit `0` binds a free port the kernel picks; the proxy logs it (`metrics on 127.0.0.1:41235/metrics`). The listen policy does not depend on the port, so an ephemeral metrics listener needs the same TLS or loopback bind as a fixed one.
 - **`path`** — URL path. Default: `/metrics`.
 - **`allow_plaintext`** — explicit acknowledgement that binding a non-loopback host without TLS is intended. Required on trusted networks (Tailscale, corporate LAN) where link-layer encryption is your boundary. Startup refuses to bind plaintext on a non-loopback host without this.
-- **`tls.cert`** / **`tls.key`** — paths to a PEM cert and key for HTTPS metrics. Independent of `server.tls` — the metrics endpoint can use a different cert/CA if you want. When set, the metrics server runs `ListenAndServeTLS`.
+- **`tls.cert`** / **`tls.key`** — paths to a PEM cert and key for HTTPS metrics. Independent of `server.tls` — the metrics endpoint can use a different cert/CA if you want. When set, the metrics server serves HTTPS.
 
 See [Metrics](metrics.md) for the full metrics reference.
 
@@ -914,7 +915,7 @@ Each endpoint forwards requests in the client's format — no protocol translati
 | `telemetry.prometheus.*` (`enabled`, `host`, `port`, `path`, `allow_plaintext`, `tls.cert`, `tls.key`) | the metrics listener is started once |
 | `journal.enabled`, `journal.otlp_endpoint` | the journal exporter is constructed once |
 
-A config file that changes any of them is **refused as a whole**: the proxy logs `config reload rejected: config changes fields a reload cannot apply (restart to change them): <fields>` and keeps running the previous config, including its routes and backends. Values are compared after defaults, so spelling out a default (`port: 4000`) is not a change. Restart the process to apply such a change. The comparison is always against the config the process started with, so no sequence of reloads can move a startup-only field.
+A config file that changes any of them is **refused as a whole**: the proxy logs `config reload rejected: config changes fields a reload cannot apply (restart to change them): <fields>` and keeps running the previous config, including its routes and backends. Values are compared after defaults, so spelling out a default (`port: 4000`) is not a change, while `port: 0` (an ephemeral port) differs from the default and from any fixed port. Restart the process to apply such a change. The comparison is always against the config the process started with, so no sequence of reloads can move a startup-only field.
 
 Everything else is reloadable: `routes`, `backends`, `groups`, `load_balancing`, `defenders`, `sig_message_capture` (the capture handle is rebuilt and an armed window is cleared), `server.api_key`, `server.passthrough_unrouted`, `server.log_level`, `server.max_request_body_mb`, `server.max_response_body_mb` and `server.max_response_line_mb` (read per request from the request's generation, so a request in flight keeps the caps it started with), `server.drop_empty_content`, and `server.allow_plaintext` (a listen-policy input: re-checked on every reload, so a config that fails the policy is refused too). A config that fails to load is refused the same way. Each reload also re-probes the backends.
 
