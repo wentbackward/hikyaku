@@ -44,6 +44,8 @@ type ServerConfig struct {
 	PassthroughUnrouted bool            `yaml:"passthrough_unrouted"` // false = reject unknown models; true = forward to first backend
 	LogLevel            *int            `yaml:"log_level"`            // 0-4 (see internal/logger); LOG_LEVEL env wins when set
 	MaxRequestBodyMB    int             `yaml:"max_request_body_mb"`  // hard cap per request body; default 50, 0 means use default
+	MaxResponseBodyMB   int             `yaml:"max_response_body_mb"` // cap on one upstream response, in decoded bytes; default 256, 0 means use default
+	MaxResponseLineMB   int             `yaml:"max_response_line_mb"` // cap on one line of a streamed response; default 16 (at most the body cap), 0 means use default
 	AllowPlaintext      bool            `yaml:"allow_plaintext"`      // required to start without TLS; appropriate only on Tailscale/private networks
 	TLS                 TLSConfig       `yaml:"tls"`
 	MinTLSVersion       string          `yaml:"min_tls_version"` // "1.2" | "1.3" (default "1.3"); floor for inbound + outbound TLS
@@ -481,6 +483,12 @@ func applyDefaults(cfg *Config) {
 	if cfg.Server.MaxRequestBodyMB == 0 {
 		cfg.Server.MaxRequestBodyMB = 50
 	}
+	if cfg.Server.MaxResponseBodyMB == 0 {
+		cfg.Server.MaxResponseBodyMB = DefaultMaxResponseBodyMB
+	}
+	if cfg.Server.MaxResponseLineMB == 0 {
+		cfg.Server.MaxResponseLineMB = defaultResponseLineMB(cfg.Server.MaxResponseBodyMB)
+	}
 	if cfg.Telemetry.Prometheus.Port == 0 {
 		cfg.Telemetry.Prometheus.Port = 9091
 	}
@@ -544,6 +552,9 @@ func validate(cfg *Config) error {
 		// ok; "" means default (1.3) at use site
 	default:
 		return errorf("server.min_tls_version must be \"1.2\" or \"1.3\", got %q", cfg.Server.MinTLSVersion)
+	}
+	if err := validateResponseLimits(&cfg.Server); err != nil {
+		return err
 	}
 	ids, err := validateBackends(cfg.Backends)
 	if err != nil {

@@ -160,6 +160,8 @@ var reloadableYAMLPaths = map[string]bool{
 	"server.passthrough_unrouted": true, // read per request
 	"server.log_level":            true, // re-applied after every reload (ApplyLogLevel)
 	"server.max_request_body_mb":  true, // read per request
+	"server.max_response_body_mb": true, // read per request from its generation
+	"server.max_response_line_mb": true, // read per request from its generation
 	"server.allow_plaintext":      true, // a listen-policy input, re-checked on every apply
 	"server.drop_empty_content":   true, // read per request
 	// Whole sections rebuilt on every reload.
