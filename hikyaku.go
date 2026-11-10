@@ -104,6 +104,7 @@ const (
 	EndClientDisconnect = proxy.EndClientDisconnect // the client went away mid-stream
 	EndUpstreamError    = proxy.EndUpstreamError    // reading the upstream stream failed
 	EndStreamLoopAbort  = proxy.EndStreamLoopAbort  // stream loop detection ended it; see UsageEvent.LoopChannel
+	EndResponseTooLarge = proxy.EndResponseTooLarge // over a decoded response cap: refused (502) or cut off
 )
 
 // MaxCaptureMessages is the largest capture window ArmWith opens (counts

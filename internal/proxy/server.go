@@ -337,14 +337,24 @@ const (
 	// EndStreamLoopAbort: stream loop detection ended the stream and closed
 	// the upstream request; LoopChannel names the channel that tripped.
 	EndStreamLoopAbort EndReason = "stream_loop_abort"
+	// EndResponseTooLarge: the upstream response went over a decoded
+	// response cap (server.max_response_body_mb, or
+	// server.max_response_line_mb for one stream line). A non-streamed
+	// response, or one whose declared length is over the cap, was refused
+	// with a 502 and has no token counts; a stream was cut off at the cap
+	// and has the counts it carried so far.
+	EndResponseTooLarge EndReason = "response_too_large"
 )
 
 // streamEndReason classifies a streamed response at close. readErr is the
 // first error the upstream body returned (io.EOF on a clean end).
 func streamEndReason(trip *loopTrip, readErr error, reqCtx context.Context) EndReason {
+	var tooLarge *responseTooLargeError
 	switch {
 	case trip != nil:
 		return EndStreamLoopAbort
+	case errors.As(readErr, &tooLarge):
+		return EndResponseTooLarge
 	case errors.Is(readErr, io.EOF):
 		return EndComplete
 	case reqCtx.Err() != nil:
@@ -1661,6 +1671,31 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 			return err
 		}
 
+		// The decoded response caps. A declared length over the body cap is
+		// refused before anything is read or sent (a 502 on both lanes);
+		// otherwise the body is cut at the cap as it is read.
+		maxBody := st.cfg.MaxResponseBytes()
+		tooLarge := func(err *responseTooLargeError, streamed bool) {
+			s.metrics.ResponseTooLarge.Add(metricsCtx, 1, telemetry.ResponseLimitAttrs(backendID, realModel, err.limit))
+			if streamed {
+				rlog.Request("[%s] upstream response cut off: %s", rid, logger.SafeErr(err))
+				return // the stream's close emits its UsageEvent
+			}
+			rlog.Request("[%s] upstream response refused: %s", rid, logger.SafeErr(err))
+			s.emitUsage(UsageEvent{
+				Ctx: reqCtx, RequestID: rid, VirtualModel: virtualModel, RealModel: realModel,
+				Backend: backendID, BackendType: backendType,
+				Streamed: false, Status: resp.StatusCode, Duration: time.Since(t0),
+				EndReason: EndResponseTooLarge,
+			})
+		}
+		if resp.ContentLength > maxBody {
+			err := &responseTooLargeError{limit: limitBody, max: maxBody}
+			tooLarge(err, false)
+			return err
+		}
+		resp.Body = newCappedBody(resp.Body, maxBody)
+
 		if streaming && resp.StatusCode == http.StatusOK {
 			// Pick the parser that matches the upstream protocol. SSE parsing
 			// for OpenAI/Anthropic (both use text/event-stream); minimal
@@ -1673,10 +1708,12 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 			var ssep *sseParser
 			if backendType == "ollama" {
 				op := newOllamaParser(backendID, realModel, t0, s.metrics, metricsCtx)
+				op.lines.max = st.cfg.MaxResponseLineBytes()
 				op.loop = guard
 				parser = op
 			} else {
 				ssep = newSSEParser(backendID, realModel, backendType, t0, s.metrics, metricsCtx)
+				ssep.lines.max = st.cfg.MaxResponseLineBytes()
 				if rlog.level() >= logger.LevelContent {
 					ssep.captureContent = true
 				}
@@ -1702,6 +1739,10 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 				parser:     parser,
 				tee:        teeWriter,
 				onClose: func(readErr error) {
+					var capErr *responseTooLargeError
+					if errors.As(readErr, &capErr) {
+						tooLarge(capErr, true)
+					}
 					s.bufferedBytes.Add(-bytesHeld)
 					s.metrics.RequestBodyBytesBuffered.Record(metricsCtx, float64(s.bufferedBytes.Load()))
 					parser.recordFinal()
@@ -1741,9 +1782,14 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 						if reqCtx.Err() != nil {
 							isTimeout = true
 						}
-						bal.CompleteAndDecr(backendID, resp.StatusCode == http.StatusOK, isTimeout, 0)
+						// A response over a cap is the backend's failure, as on
+						// the 502 path (the ErrorHandler): it counts against
+						// the backend's health and moves the pin.
+						bal.CompleteAndDecr(backendID, resp.StatusCode == http.StatusOK && capErr == nil, isTimeout, 0)
 						// Invalidate pin based on group failover config (5xx always + configured codes)
-						if !isTimeout && lbGroup != "" {
+						if !isTimeout && capErr != nil {
+							bal.InvalidatePin(lbGroup, lbAffKey)
+						} else if !isTimeout && lbGroup != "" {
 							if grp, ok := st.cfg.Groups[lbGroup]; ok && grp.ShouldFailoverOnCode(resp.StatusCode) {
 								bal.InvalidatePin(lbGroup, lbAffKey)
 							}
@@ -1773,6 +1819,10 @@ func (s *Server) modifyResponse(rid, backendID, virtualModel, realModel, path, b
 			data, err := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
 			if err != nil {
+				var capErr *responseTooLargeError
+				if errors.As(err, &capErr) {
+					tooLarge(capErr, false)
+				}
 				if capCtx != nil {
 					capCtx.finishError(t0, fmt.Sprintf("read upstream body: %v", err))
 				}

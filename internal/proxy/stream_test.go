@@ -316,28 +316,6 @@ func TestOllama_CRLFAndUnterminatedFinalLine(t *testing.T) {
 	}
 }
 
-// A partial line is buffered only up to maxOllamaLineBytes; beyond that the
-// line is discarded to its newline and parsing resumes on the next line.
-func TestOllama_OversizedLineIsDroppedNotBuffered(t *testing.T) {
-	p := makeOllamaParser(t)
-	huge := `{"done":true,"prompt_eval_count":999,"eval_count":999,"pad":"` + strings.Repeat("x", maxOllamaLineBytes)
-	for i := 0; i < len(huge); i += 4096 {
-		end := min(i+4096, len(huge))
-		p.feed([]byte(huge[i:end]))
-		if len(p.lineBuf) > maxOllamaLineBytes {
-			t.Fatalf("line buffer grew to %d bytes, cap is %d", len(p.lineBuf), maxOllamaLineBytes)
-		}
-	}
-	if len(p.lineBuf) != 0 {
-		t.Fatalf("oversized partial line should have been dropped, %d bytes still buffered", len(p.lineBuf))
-	}
-	// Tail of the oversized line, then its newline, then a well-formed line.
-	p.feed([]byte(`"}` + "\n" + ollamaFinalChunk + "\n"))
-	if got, want := p.usage(), (usageCounts{prompt: 11, completion: 3}); got != want {
-		t.Errorf("usage() = %+v, want %+v (oversized line must be skipped, next line parsed)", got, want)
-	}
-}
-
 func TestOllama_MalformedLinesIgnored(t *testing.T) {
 	p := makeOllamaParser(t)
 	p.feed([]byte("not json\n[1,2,3]\n" + `{"done":true,"prompt_eval_count":"11"}` + "\n" + ollamaFinalChunk + "\n"))

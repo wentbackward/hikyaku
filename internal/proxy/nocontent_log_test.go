@@ -334,6 +334,42 @@ func runMarkerTraffic(t *testing.T, level string) markerRun {
 		b.Close()
 	}
 
+	// Responses over the decoded response caps: a body over
+	// max_response_body_mb (a 502 when not streamed, a cut-off stream when
+	// streamed) and a stream line over max_response_line_mb. The padding is
+	// the marker itself, so the bytes the proxy read and refused carry it.
+	markerPad := strings.Repeat(logMarker, (64<<10)/len(logMarker))
+	for _, over := range []struct {
+		serverExtra string
+		pad         func(w io.Writer)
+	}{
+		{"\n  max_response_body_mb: 1", func(w io.Writer) {
+			for range 20 {
+				fmt.Fprintf(w, ":%s\n", markerPad)
+			}
+		}},
+		{"\n  max_response_body_mb: 4\n  max_response_line_mb: 1", func(w io.Writer) {
+			fmt.Fprint(w, ":")
+			for range 20 {
+				fmt.Fprint(w, markerPad)
+			}
+			fmt.Fprint(w, "\n")
+		}},
+	} {
+		for _, lane := range markerLanes {
+			for _, stream := range []bool{false, true} {
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					_, _ = io.Copy(io.Discard, r.Body)
+					lane.ok(w, stream)
+					over.pad(w)
+				}))
+				s := newCredServer(t, upstream.URL, lane.backendType, over.serverExtra, "", "")
+				client.WriteString(sendMarkerRequest(t, s, lane.path, lane.request(stream)))
+				upstream.Close()
+			}
+		}
+	}
+
 	return markerRun{log: buf.String(), upstream: up.saw(), client: client.String()}
 }
 
@@ -494,7 +530,8 @@ func assertMarkerTransited(t *testing.T, run markerRun) {
 			t.Errorf("no client received %q; the run is vacuous", want)
 		}
 	}
-	for _, want := range []string{"[req] ", "upstream error status=400", "upstream error status=500", "status=502"} {
+	for _, want := range []string{"[req] ", "upstream error status=400", "upstream error status=500", "status=502",
+		"max_response_body_mb", "max_response_line_mb"} {
 		if !strings.Contains(run.log, want) {
 			t.Errorf("log missing %q; the run did not exercise the request log:\n%s", want, run.log)
 		}

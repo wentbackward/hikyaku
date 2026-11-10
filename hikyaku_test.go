@@ -71,6 +71,7 @@ func TestFacade_EndReasonValues(t *testing.T) {
 		hikyaku.EndClientDisconnect: "client_disconnect",
 		hikyaku.EndUpstreamError:    "upstream_error",
 		hikyaku.EndStreamLoopAbort:  "stream_loop_abort",
+		hikyaku.EndResponseTooLarge: "response_too_large",
 	}
 	for got, s := range want {
 		if string(got) != s {

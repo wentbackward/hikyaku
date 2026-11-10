@@ -27,6 +27,7 @@ type Metrics struct {
 	RequestBodyBytesBuffered metric.Float64Gauge
 	StreamRatio              metric.Float64Histogram // stream loop detection: deflate ratio per evaluated window
 	StreamLoopTrips          metric.Int64Counter     // stream loop detection: trips by mode
+	ResponseTooLarge         metric.Int64Counter     // responses refused or cut off at a decoded response cap
 }
 
 // StreamRatioBuckets are the hikyaku_stream_ratio bucket boundaries: 0.10 to
@@ -158,6 +159,13 @@ func New(provider metric.MeterProvider) (*Metrics, error) {
 		return nil, err
 	}
 
+	tooLarge, err := meter.Int64Counter("hikyaku_response_too_large_total",
+		metric.WithDescription("Upstream responses refused or cut off at a decoded response cap, by backend, model and limit (body or line)"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Metrics{
 		RequestDuration:          reqDur,
 		TTFT:                     ttft,
@@ -173,6 +181,7 @@ func New(provider metric.MeterProvider) (*Metrics, error) {
 		RequestBodyBytesBuffered: bufferedBytes,
 		StreamRatio:              streamRatio,
 		StreamLoopTrips:          loopTrips,
+		ResponseTooLarge:         tooLarge,
 	}, nil
 }
 
@@ -209,5 +218,16 @@ func StreamLoopTripAttrs(route, backend, channel, mode string) metric.Measuremen
 		attribute.String("backend", backend),
 		attribute.String("channel", channel),
 		attribute.String("mode", mode),
+	)
+}
+
+// ResponseLimitAttrs returns the label set for hikyaku_response_too_large_total;
+// limit is "body" (server.max_response_body_mb) or "line"
+// (server.max_response_line_mb).
+func ResponseLimitAttrs(backend, model, limit string) metric.MeasurementOption {
+	return metric.WithAttributes(
+		attribute.String("backend", backend),
+		attribute.String("model", model),
+		attribute.String("limit", limit),
 	)
 }

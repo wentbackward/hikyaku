@@ -31,6 +31,11 @@ type streamParser interface {
 	recordFinal()
 	// abortTrip returns the stream loop trip that ended the stream, or nil.
 	abortTrip() *loopTrip
+	// limitErr returns the *responseTooLargeError of a line over the line
+	// cap, or nil. The feed that sets it forwards only the complete lines
+	// before the oversized one; later feeds forward nothing, and
+	// interceptedBody ends the stream with it as an upstream read error.
+	limitErr() error
 	usageSource
 }
 
@@ -59,8 +64,8 @@ type sseParser struct {
 	ctx         context.Context
 
 	ttftDone   bool
-	t0FirstTok time.Time // when first content token arrived (for gen speed)
-	lineBuf    []byte    // holds a partial line between Read calls
+	t0FirstTok time.Time  // when first content token arrived (for gen speed)
+	lines      lineBuffer // splits the stream into lines, carrying a partial line between reads
 
 	// Token accumulation. promptToks is the provider's own prompt count:
 	// uncached on Anthropic (input_tokens), including both cache classes on
@@ -142,38 +147,24 @@ func (p *sseParser) feed(in []byte) (forward int, abortTail []byte) {
 	if p.aborted {
 		return 0, nil
 	}
-	// Prepend any leftover from the previous call. carried bytes were already
-	// forwarded, so cut offsets are reported relative to in.
-	data := in
-	carried := len(p.lineBuf)
-	if carried > 0 {
-		p.lineBuf = append(p.lineBuf, in...)
-		data, p.lineBuf = p.lineBuf, nil
+	n, stopped, err := p.lines.split(in, func(line []byte) bool {
+		p.handleLine(bytes.TrimRight(line, "\r"))
+		return p.loopTrip == nil
+	})
+	switch {
+	case err != nil:
+		return n, nil // the lines before the oversized one; limitErr reports it
+	case stopped:
+		// Forward through the end of the tripping line, drop the rest.
+		p.aborted = true
+		p.lines.release()
+		return n, p.abortTail()
 	}
-
-	pos := 0
-	for {
-		idx := bytes.IndexByte(data[pos:], '\n')
-		if idx == -1 {
-			// Incomplete line — save for next call
-			if pos < len(data) {
-				p.lineBuf = append([]byte(nil), data[pos:]...)
-			}
-			return len(in), nil
-		}
-		line := bytes.TrimRight(data[pos:pos+idx], "\r")
-		pos += idx + 1
-
-		p.handleLine(line)
-		if p.loopTrip != nil {
-			// Forward through the end of the tripping line (its '\n' is in
-			// in, since carried bytes never contain one), drop the rest.
-			p.aborted = true
-			p.lineBuf = nil
-			return pos - carried, p.abortTail()
-		}
-	}
+	return len(in), nil
 }
+
+// limitErr returns the line-cap error, or nil.
+func (p *sseParser) limitErr() error { return p.lines.err }
 
 // handleLine processes one complete SSE line.
 func (p *sseParser) handleLine(line []byte) {
@@ -548,13 +539,6 @@ func (p *sseParser) ResponseText() string {
 
 // ── Ollama parser ────────────────────────────────────────────────────────────
 
-// maxOllamaLineBytes bounds the partial-line buffer the Ollama parser keeps
-// between Read calls. A line longer than this is discarded up to its newline
-// rather than buffered: the parser must never block or grow without bound on
-// a stream it only observes. Ollama's chunks are a few hundred bytes; the
-// final chunk with the counts is well under 1 KiB.
-const maxOllamaLineBytes = 64 * 1024
-
 // ollamaParser extracts telemetry from an Ollama-native streaming response
 // (NDJSON, one JSON object per line) without buffering the body: time to
 // first byte on the first chunk, and the token counts Ollama places on its
@@ -568,9 +552,8 @@ type ollamaParser struct {
 	ctx       context.Context
 
 	ttftDone   bool
-	t0FirstTok time.Time // when the first chunk arrived (for gen speed)
-	lineBuf    []byte    // partial line between Read calls, ≤ maxOllamaLineBytes
-	discarding bool      // skipping an oversized line up to its newline
+	t0FirstTok time.Time  // when the first chunk arrived (for gen speed)
+	lines      lineBuffer // splits the stream into lines, carrying a partial line between reads
 
 	promptToks     int64
 	completionToks int64
@@ -586,14 +569,10 @@ func newOllamaParser(backendID, model string, t0 time.Time, m *telemetry.Metrics
 
 // feed records TTFT on the first non-empty chunk and scans complete NDJSON
 // lines for token counts. Read boundaries need not align with lines: a partial
-// line is carried to the next call (bounded by maxOllamaLineBytes), and a
-// chunk may hold several lines. See streamParser for the return values.
+// line is carried to the next call (up to the line cap), and a chunk may hold
+// several lines. See streamParser for the return values.
 func (p *ollamaParser) feed(in []byte) (forward int, abortTail []byte) {
-	if p.aborted {
-		return 0, nil
-	}
-	data := in
-	if len(data) == 0 {
+	if p.aborted || len(in) == 0 {
 		return 0, nil
 	}
 	if !p.ttftDone {
@@ -602,47 +581,24 @@ func (p *ollamaParser) feed(in []byte) (forward int, abortTail []byte) {
 		p.ttftDone = true
 		p.t0FirstTok = time.Now()
 	}
-
-	for len(data) > 0 {
-		idx := bytes.IndexByte(data, '\n')
-		if idx == -1 {
-			// No newline in what is left: buffer it, unless that would exceed
-			// the cap — then drop the line and skip to its terminator.
-			if p.discarding {
-				return len(in), nil
-			}
-			if len(p.lineBuf)+len(data) > maxOllamaLineBytes {
-				p.lineBuf = nil
-				p.discarding = true
-				return len(in), nil
-			}
-			p.lineBuf = append(p.lineBuf, data...)
-			return len(in), nil
-		}
-		line := data[:idx]
-		data = data[idx+1:]
-		if p.discarding {
-			p.discarding = false // the oversized line ended here; resume on the next one
-			continue
-		}
-		if len(p.lineBuf)+len(line) > maxOllamaLineBytes {
-			p.lineBuf = nil
-			continue
-		}
-		if len(p.lineBuf) > 0 {
-			line = append(p.lineBuf, line...)
-			p.lineBuf = nil
-		}
+	n, stopped, err := p.lines.split(in, func(line []byte) bool {
 		p.handleLine(line)
-		if p.loopTrip != nil {
-			// Forward through the end of the tripping line, drop the rest.
-			p.aborted = true
-			p.lineBuf = nil
-			return len(in) - len(data), ollamaAbortTail(p.loopTrip)
-		}
+		return p.loopTrip == nil
+	})
+	switch {
+	case err != nil:
+		return n, nil // the lines before the oversized one; limitErr reports it
+	case stopped:
+		// Forward through the end of the tripping line, drop the rest.
+		p.aborted = true
+		p.lines.release()
+		return n, ollamaAbortTail(p.loopTrip)
 	}
 	return len(in), nil
 }
+
+// limitErr returns the line-cap error, or nil.
+func (p *ollamaParser) limitErr() error { return p.lines.err }
 
 // handleLine decodes one NDJSON object and captures the token counts if it
 // carries them. Ollama puts the counts only on the final object (done:true)
@@ -701,10 +657,10 @@ func (p *ollamaParser) abortTrip() *loopTrip {
 // then records the per-request token metrics and generation speed. Request
 // duration is recorded by the caller, as on the SSE path.
 func (p *ollamaParser) recordFinal() {
-	if len(p.lineBuf) > 0 && !p.discarding && !p.aborted {
-		p.handleLine(p.lineBuf)
+	if rest := p.lines.pending(); len(rest) > 0 && !p.aborted {
+		p.handleLine(rest)
 	}
-	p.lineBuf = nil
+	p.lines.release()
 	p.loop.close()
 
 	p.usage().recordTokenMetrics(p.ctx, p.metrics, p.backendID, p.model)
@@ -880,12 +836,28 @@ func (b *interceptedBody) Read(p []byte) (n int, err error) {
 	if b.aborted {
 		return b.readTail(p)
 	}
+	if lerr := b.parser.limitErr(); lerr != nil {
+		// Latched, as cappedBody latches its error: a later Read must not
+		// replace the cap hit with whatever the upstream reports next.
+		return 0, lerr
+	}
 	n, err = b.ReadCloser.Read(p)
 	if err != nil {
 		b.readErr = err
 	}
 	if n > 0 {
 		fwd, tail := b.parser.feed(p[:n])
+		if lerr := b.parser.limitErr(); lerr != nil {
+			// A line over the line cap: the complete lines before it are
+			// passed on, then the stream ends as an upstream error and the
+			// backend is released at once.
+			b.readErr = lerr
+			_ = b.closeUpstream()
+			if b.tee != nil && fwd > 0 {
+				_, _ = b.tee.Write(p[:fwd])
+			}
+			return fwd, lerr
+		}
 		if tail != nil {
 			b.aborted = true
 			b.tail = tail
