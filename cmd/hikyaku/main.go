@@ -199,6 +199,11 @@ type vmodel struct {
 	real    string
 }
 
+// maxProbeModelsBytes caps the /models answer the startup probe reads, in
+// decoded bytes. The largest public model lists (aggregators listing hundreds
+// of models with metadata) are about 1 MiB; 8 MiB is far above them.
+const maxProbeModelsBytes = 8 << 20
+
 // probeBackends checks each configured backend at startup, logs its status
 // and the virtual models that map to it. Probes go through rt, the server's
 // outbound transport, and carry only the backend's own credential.
@@ -262,8 +267,15 @@ func probeBackends(cfg *config.Config, rt http.RoundTripper) {
 			continue
 		}
 
-		body, _ := io.ReadAll(resp.Body)
+		// Decoded bytes (the transport decodes a gzip answer it asked for),
+		// capped so a compressed bomb stops at maxProbeModelsBytes.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxProbeModelsBytes+1))
 		_ = resp.Body.Close()
+		if len(body) > maxProbeModelsBytes {
+			log.Printf("[probe] backend %-12s OK  (model list over %d bytes, not read)", b.ID, maxProbeModelsBytes)
+			logVirtualModels(byBackend[b.ID])
+			continue
+		}
 		var result struct {
 			Data []struct {
 				ID string `json:"id"`

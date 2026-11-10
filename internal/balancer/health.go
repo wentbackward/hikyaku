@@ -88,12 +88,36 @@ func (c *hcClient) scrapeMetrics(targetURL string, timeout time.Duration) ([]byt
 		return nil, &ScrapeError{StatusCode: resp.StatusCode}
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// The body is decoded (the transport decodes a gzip answer it asked
+	// for), so the cap counts decoded bytes and a compressed bomb stops at it.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxScrapeBytes+1))
 	if err != nil {
 		return nil, err
 	}
+	if len(body) > maxScrapeBytes {
+		return nil, errScrapeTooLarge
+	}
 	return body, nil
 }
+
+// maxScrapeBytes caps a /metrics scrape, in decoded bytes. A vLLM or
+// llama.cpp exposition is tens to hundreds of KiB; 16 MiB is far above any
+// real one and bounds what a misbehaving or compromised backend can make the
+// balancer allocate on every scrape.
+const maxScrapeBytes = 16 << 20
+
+// errScrapeTooLarge is the error of a scrape over maxScrapeBytes. The scrape
+// fails as an unreachable endpoint does; nothing of the body is kept.
+var errScrapeTooLarge = scrapeTooLargeError{}
+
+type scrapeTooLargeError struct{}
+
+func (scrapeTooLargeError) Error() string {
+	return "metrics scrape exceeds " + strconv.Itoa(maxScrapeBytes) + " bytes"
+}
+
+// SafeError is Error: a fixed text.
+func (e scrapeTooLargeError) SafeError() string { return e.Error() }
 
 // ScrapeError indicates a non-successful scrape attempt.
 type ScrapeError struct {
