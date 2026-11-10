@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -75,9 +75,7 @@ func main() {
 	// exactly as live traffic does.
 	probeBackends(cfg, srv.OutboundTransport())
 
-	proxyAddr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	proxyServer := &http.Server{
-		Addr:         proxyAddr,
 		Handler:      proxyMux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 0, // disabled — streaming responses can take minutes
@@ -91,7 +89,6 @@ func main() {
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle(cfg.Telemetry.Prometheus.Path, metricsHandler)
 		metricsServer = &http.Server{
-			Addr:        fmt.Sprintf("%s:%d", cfg.Telemetry.Prometheus.Host, cfg.Telemetry.Prometheus.Port),
 			Handler:     metricsMux,
 			ReadTimeout: 5 * time.Second,
 			TLSConfig:   serverTLSConfig(cfg),
@@ -99,17 +96,24 @@ func main() {
 	}
 
 	// ── Start ──────────────────────────────────────────────────────────────
+	// Both listeners are bound before either serves, so a port 0 is resolved
+	// and the logged address is the one clients reach.
+	proxyLn, metricsLn, err := bindListeners(cfg, net.Listen)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
 	go func() {
 		tls := cfg.Server.TLS
+		addr := boundAddr(cfg.Server.Host, proxyLn)
 		if tls.Cert != "" && tls.Key != "" {
-			log.Printf("[hikyaku] listening on %s (TLS)", proxyAddr)
-			if err := proxyServer.ListenAndServeTLS(tls.Cert, tls.Key); err != http.ErrServerClosed {
+			log.Printf("[hikyaku] listening on %s (TLS)", addr)
+			if err := proxyServer.ServeTLS(proxyLn, tls.Cert, tls.Key); err != http.ErrServerClosed {
 				log.Fatalf("proxy server: %v", err)
 			}
 		} else {
 			// Validated earlier: allow_plaintext must be true to reach here.
-			log.Printf("[hikyaku] listening on %s (PLAINTEXT — allow_plaintext: true)", proxyAddr)
-			if err := proxyServer.ListenAndServe(); err != http.ErrServerClosed {
+			log.Printf("[hikyaku] listening on %s (PLAINTEXT — allow_plaintext: true)", addr)
+			if err := proxyServer.Serve(proxyLn); err != http.ErrServerClosed {
 				log.Fatalf("proxy server: %v", err)
 			}
 		}
@@ -118,16 +122,15 @@ func main() {
 	if metricsServer != nil {
 		go func() {
 			mt := cfg.Telemetry.Prometheus.TLS
+			addr := boundAddr(cfg.Telemetry.Prometheus.Host, metricsLn)
 			if mt.Cert != "" && mt.Key != "" {
-				log.Printf("[hikyaku] metrics on %s:%d%s (TLS)",
-					cfg.Telemetry.Prometheus.Host, cfg.Telemetry.Prometheus.Port, cfg.Telemetry.Prometheus.Path)
-				if err := metricsServer.ListenAndServeTLS(mt.Cert, mt.Key); err != http.ErrServerClosed {
+				log.Printf("[hikyaku] metrics on %s%s (TLS)", addr, cfg.Telemetry.Prometheus.Path)
+				if err := metricsServer.ServeTLS(metricsLn, mt.Cert, mt.Key); err != http.ErrServerClosed {
 					log.Fatalf("metrics server: %v", err)
 				}
 			} else {
-				log.Printf("[hikyaku] metrics on %s:%d%s",
-					cfg.Telemetry.Prometheus.Host, cfg.Telemetry.Prometheus.Port, cfg.Telemetry.Prometheus.Path)
-				if err := metricsServer.ListenAndServe(); err != http.ErrServerClosed {
+				log.Printf("[hikyaku] metrics on %s%s", addr, cfg.Telemetry.Prometheus.Path)
+				if err := metricsServer.Serve(metricsLn); err != http.ErrServerClosed {
 					log.Fatalf("metrics server: %v", err)
 				}
 			}
