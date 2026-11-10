@@ -6,6 +6,8 @@ server:
   # log_level: 1                 # 0=errors, 1=requests, 2=+headers, 3=+body preview, 4=+full message text
                                   # LOG_LEVEL env var overrides this when set
   max_request_body_mb: 50         # hard cap per request body (OOM protection); 0 = use default
+  # max_response_body_mb: 256     # cap on one upstream response in decoded bytes; over it: 502, or a cut-off stream
+  # max_response_line_mb: 16      # cap on one line of a streamed response (at most max_response_body_mb)
   # Secure by default: the proxy refuses to start without TLS unless allow_plaintext is true.
   # Set allow_plaintext: true only on a trusted private network (Tailscale/VPN/LAN).
   allow_plaintext: false

@@ -52,6 +52,7 @@
 - **Constant-time auth** — bearer token comparison
 - **No credential passthrough** — caller `Authorization`, API-key headers, `Proxy-Authorization`, `Cookie` and trailers are stripped before forwarding; only the backend's own `api_key` is sent ([security](docs/security.md#upstream-credentials))
 - **Secret resolution** — `${ENV_VAR}` syntax, never stored in config
+- **Decoded response caps** — `server.max_response_body_mb` (256 MiB) per response and `server.max_response_line_mb` (16 MiB) per stream line, counted after gzip/deflate decoding: a decompression bomb is a 502, or a cut-off stream once headers are out ([security](docs/security.md#response-size-caps))
 - **Keyed affinity fingerprints** — HMAC-SHA256 with a per-process random key (hardened); affinity logs gated
 - **Request-buffer zeroing** — resolved outbound body wiped after forward (all builds); raw inbound body wiped early (hardened)
 - **Non-root container** — `FROM scratch`, USER 65532, no shell, no libc (~7MB)

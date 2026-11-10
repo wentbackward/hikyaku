@@ -162,6 +162,29 @@ This is a deliberate diagnostic feature — typical use is "something is broken,
 
 Incoming request bodies are capped at `server.max_request_body_mb` (default 50 MB). Requests above the cap receive HTTP 413. This is a resource-exhaustion guard rather than a privacy control.
 
+### Response size caps
+
+Upstream responses are capped in **decoded** bytes, counted after a `gzip` or `deflate` body is decoded (see [response encoding](#response-encoding)), so a small compressed answer cannot make the proxy decode, hold or forward more than the cap. Decoding stops at the cap. Two keys, both in MiB and both reloadable ([configuration](configuration.md#server)):
+
+- **`server.max_response_body_mb`** (default 256) caps one response on every lane (OpenAI, Anthropic, Ollama).
+  - A non-streamed response is buffered whole (for usage metering), so one over the cap is answered with `502 Bad Gateway`, `{"error":{"message":"upstream error: upstream response exceeds server.max_response_body_mb (N bytes)","type":"proxy_error"}}`. A streamed request the upstream answers with an error status is read the same way.
+  - A response whose `Content-Length` is over the cap is refused with the same `502` before its body is read, streamed or not.
+  - A stream without a declared length has sent its headers, so it is passed on up to the cap and then cut off like any other upstream read error: the connection is aborted, so an HTTP/1.1 client sees the chunked body break off and an HTTP/2 client a reset stream, never a clean end. An HTTP/1.0 client, which reads until the connection closes, cannot tell an abort from the end of the body; it sees a stream that stops without its final event.
+- **`server.max_response_line_mb`** (default 16, and never more than the body cap) caps one line of a streamed response: an SSE line or an Ollama NDJSON object. The stream parsers carry a line that spans reads in a buffer that grows amortized (linear in the line's length), up to this cap. A longer line ends the stream the same way; the complete lines before it are passed on. This also applies when a `stream: true` request is answered with one non-streamed JSON body (a backend that ignores the flag): the proxy reads it as a stream, so such a body over the line cap is cut off at 16 MiB by default. A long line is not skipped: the parsers meter and watch the stream, and passing on a line they did not read would forward unmetered bytes.
+
+How the defaults were chosen: the largest legitimate non-streamed responses are embedding batches at provider limits (2048 inputs × 3072 dimensions as JSON floats, about 126 MB) and the largest streams are long completions with per-token logprobs (128k tokens with 20 alternatives each, about 180 MB); 256 MiB is above both. Stream events are a few hundred bytes; the longest legitimate lines are a tool call whose arguments arrive in one event and Ollama's final `/api/generate` object, which carries the whole context's token ids (a few MB at 128k tokens); 16 MiB is above them. Heavier logprob use (a vLLM server started with `--max-logprobs` above 20, or very long outputs with logprobs) and larger embedding batches can exceed the body default: raise `max_response_body_mb` for them.
+
+Each cap limits one response, so the memory the non-streamed lane may hold is the body cap times the number of concurrent non-streamed requests, and a stream holds at most one line cap.
+
+For the load balancer, a cap hit on a proxied request is the backend's failure on both paths (the 502 and the cut-off stream): one strike against its health, and its affinity pin moves ([health signals](configuration.md#health-signals)).
+
+Two reads the proxy makes on its own behalf are capped in decoded bytes too, with fixed caps:
+
+- The load balancer's `/metrics` scrape (16 MiB). A larger answer fails the scrape, which counts like an unreachable `/metrics` endpoint: after `health_check.unhealthy_after` failed scrapes in a row the backend is marked unhealthy, unless it has requests in flight or a real request succeeded within the last 60 seconds. At startup a failed first scrape puts the backend in health-only mode when health checks are on (`health_check.enabled` is not `false`): health probes, with the scrape retried every `retry_interval_seconds` (default 120). With health checks off, a failed first scrape is not retried ([metrics retry](configuration.md#metrics-retry)).
+- The startup `/models` probe (8 MiB). A larger list is logged as `model list over N bytes, not read`.
+
+A cap hit is counted in `hikyaku_response_too_large_total` ([metrics](metrics.md)), reported to an embedder as `UsageEvent.EndReason` `response_too_large` ([usage events](metrics.md#per-request-usage-events)), and logged at level 1 as `[<rid>] upstream response refused: <key and cap>` (or `cut off` for a stream): no response bytes, in any build.
+
 ## Hardened build
 
 For deployments where any of the above features are a concern, use the hardened variant. It is published as a container image alongside the regular one on every release — pull the `-hardened`-suffixed tag:

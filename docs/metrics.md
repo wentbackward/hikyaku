@@ -18,6 +18,7 @@ All metrics are exported via OpenTelemetry with a Prometheus exporter. Default e
 | `hikyaku_request_body_bytes_buffered` | Gauge | — | Bytes held in proxy buffers awaiting responses |
 | `hikyaku_stream_ratio` | Histogram | `route`, `backend`, `channel` | Stream loop detection: deflate ratio of each measured output window |
 | `hikyaku_stream_loop_trips_total` | Counter | `route`, `backend`, `channel`, `mode` | Stream loop detection trips |
+| `hikyaku_response_too_large_total` | Counter | `backend`, `model`, `limit` | Upstream responses refused or cut off at a [decoded response cap](security.md#response-size-caps); `limit` is `body` (`server.max_response_body_mb`) or `line` (`server.max_response_line_mb`) |
 
 ## Token counters
 
@@ -108,10 +109,11 @@ estimates them):
 
 | `EndReason` | Meaning |
 |---|---|
-| `complete` | The upstream response was read to its end (every non-streamed response) |
+| `complete` | The upstream response was read to its end (every non-streamed response that was forwarded) |
 | `client_disconnect` | The client went away before the stream ended |
 | `upstream_error` | Reading the upstream stream failed (reset, truncated body, idle timeout) |
 | `stream_loop_abort` | Stream loop detection ended the stream; `LoopChannel` is `reasoning` or `content` |
+| `response_too_large` | The response went over a [decoded response cap](security.md#response-size-caps). Refused with a `502` (not streamed, or a declared length over the cap): no token counts. Cut off mid-stream: the counts it carried so far |
 
 ## Stream loop detection
 

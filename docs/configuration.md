@@ -10,6 +10,8 @@ server:
   port: 4000
   api_key: "${PROXY_API_KEY}"   # clients must send: Authorization: Bearer <key>
   passthrough_unrouted: false    # reject unknown models with 404 (default)
+  # max_response_body_mb: 256    # cap on one upstream response, decoded bytes (MiB)
+  # max_response_line_mb: 16     # cap on one line of a streamed response (MiB)
   tls:
     cert: ""                     # path to TLS certificate
     key:  ""                     # path to TLS private key
@@ -22,6 +24,8 @@ server:
 
 - **`passthrough_unrouted`** — when `false` (default), requests for unknown model names are rejected with a 404 that lists available virtual models. When `true`, unknown models are forwarded to the default backend as-is (see `default:` on backends below).
 - **`min_tls_version`** — minimum TLS version for both inbound (client→proxy) and outbound (proxy→backend) connections. `"1.3"` (default) or `"1.2"`. In the inspect build this tightens Go's defaults when set; in the [hardened build](security.md#hardened-build) it is the enforced floor. Lower to `"1.2"` only for clients/backends that can't yet negotiate 1.3 — never below. `http://` backends are unaffected (no TLS handshake).
+- **`max_response_body_mb`** — the most one upstream response may carry, in MiB of decoded bytes (after a `gzip` or `deflate` body is decoded). Over it, a non-streamed response (or one whose `Content-Length` is over it) is a `502`, and a stream is cut off at the cap. Default 256; `0` means the default; otherwise 1 to 4096.
+- **`max_response_line_mb`** — the longest line of a streamed response (an SSE line or an Ollama NDJSON object), in MiB. A longer line cuts the stream off. Default 16, or the body cap when that is smaller; `0` means the default; otherwise 1 to `max_response_body_mb`. How both defaults were chosen, and what the client sees: [response size caps](security.md#response-size-caps).
 - **`allow_plaintext`** (not shown) — permits starting without `server.tls` on a trusted network. Ignored by the hardened build, which always requires TLS.
 - **`transport.max_idle_conns`** — total number of idle (keep-alive) connections across all backends. Default: 100.
 - **`transport.max_idle_conns_per_host`** — idle connections retained per backend host. Increase this if you have few backends with high concurrency. Default: 20.
@@ -552,16 +556,17 @@ The proxy uses multiple independent signals to determine backend health. Operato
 #### Health signals
 
 **Ground-truth: real request outcomes.** Every proxied request feeds the health state directly:
-- **Success (2xx)** → resets the failure counter, recovers an unhealthy backend immediately
+- **Success (200)** → resets the failure counter, recovers an unhealthy backend immediately. Any other status counts as a failure for the counter; only 5xx (and a group's `failover_on_status_codes`) also moves the affinity pin
 - **Failure (5xx)** → increments the consecutive failure counter; after 3 strikes the backend is marked unhealthy and evicted from the pool
 - **Connection errors** (refused, reset, EOF) → same treatment as 5xx, plus immediate pin invalidation
+- **A response over a [response size cap](security.md#response-size-caps)** (a 502, or a stream cut off at the cap) → counts as a failure and moves the affinity pin. One oversized response is one strike; any success resets the count.
 - **Timeouts** → ignored for health purposes. A timeout means the backend is busy (long generation), not broken. The timeout itself is the throttle.
 
 This is the primary health signal. A backend that serves messages is alive, regardless of what any probe says.
 
 Every probe below (health, alive, metrics scrape) uses the proxy's shared outbound transport — the same TLS floor and the same `TransportFactory`-supplied transport as live requests, with `HTTP_PROXY` not consulted, as for live traffic — so a backend that needs a client certificate, a private CA or a pin on the live leg is probed with that same material.
 
-**Health probes (GET).** Periodic GET requests to a configurable path (default: `models`, resolving to `{base_url}models`). Lightweight — no tokens consumed, no KV cache pressure. Marks backends unhealthy after `unhealthy_after` consecutive failures (default: 3). Can be disabled entirely with `health_check.enabled: false`.
+**Health probes (GET).** Periodic GET requests to a configurable path (default: `models`, resolving to `{base_url}models`). Lightweight — no tokens consumed, no KV cache pressure. Marks backends unhealthy after `health_check.unhealthy_after` consecutive failures (default: 3). Can be disabled entirely with `health_check.enabled: false`.
 
 **Alive probes (OR-based, per-group).** More invasive checks that validate the full inference pipeline. Configured per-group under `groups.<name>.monitoring.alive`. Disabled by default — must be explicitly enabled. Two probe types:
 - `lightweight_chat` — sends a minimal chat completion (`max_tokens: 1`) to exercise the full pipeline
@@ -658,7 +663,7 @@ Defenders are configured at the top level (not under `server:`) — see
 
 #### Metrics retry
 
-If `/metrics` is unavailable at startup, the proxy falls back to health-only mode and periodically retries `/metrics` (default every 120s). When it becomes available, the proxy seamlessly transitions to full scraping — no restart required.
+If `/metrics` is unavailable at startup, the proxy falls back to health-only mode and periodically retries `/metrics` (default every 120s). This needs health checks on: with `health_check.enabled: false`, a failed first scrape is not retried. When it becomes available, the proxy seamlessly transitions to full scraping — no restart required.
 
 ### Request defenders
 
@@ -911,7 +916,7 @@ Each endpoint forwards requests in the client's format — no protocol translati
 
 A config file that changes any of them is **refused as a whole**: the proxy logs `config reload rejected: config changes fields a reload cannot apply (restart to change them): <fields>` and keeps running the previous config, including its routes and backends. Values are compared after defaults, so spelling out a default (`port: 4000`) is not a change. Restart the process to apply such a change. The comparison is always against the config the process started with, so no sequence of reloads can move a startup-only field.
 
-Everything else is reloadable: `routes`, `backends`, `groups`, `load_balancing`, `defenders`, `sig_message_capture` (the capture handle is rebuilt and an armed window is cleared), `server.api_key`, `server.passthrough_unrouted`, `server.log_level`, `server.max_request_body_mb`, `server.drop_empty_content`, and `server.allow_plaintext` (a listen-policy input: re-checked on every reload, so a config that fails the policy is refused too). A config that fails to load is refused the same way. Each reload also re-probes the backends.
+Everything else is reloadable: `routes`, `backends`, `groups`, `load_balancing`, `defenders`, `sig_message_capture` (the capture handle is rebuilt and an armed window is cleared), `server.api_key`, `server.passthrough_unrouted`, `server.log_level`, `server.max_request_body_mb`, `server.max_response_body_mb` and `server.max_response_line_mb` (read per request from the request's generation, so a request in flight keeps the caps it started with), `server.drop_empty_content`, and `server.allow_plaintext` (a listen-policy input: re-checked on every reload, so a config that fails the policy is refused too). A config that fails to load is refused the same way. Each reload also re-probes the backends.
 
 Per-backend `max_concurrency` limits belong to the config that set them: a request holds a slot of the config it was routed with, so a reload starts the new config with fresh limits while requests still running finish under the old ones.
 
