@@ -39,7 +39,7 @@ type TransportConfig struct {
 
 type ServerConfig struct {
 	Host                string          `yaml:"host"`
-	Port                int             `yaml:"port"`
+	Port                int             `yaml:"port"`                 // default 4000; an explicit 0 binds an ephemeral port
 	APIKey              string          `yaml:"api_key"`              // required bearer token for inbound requests
 	PassthroughUnrouted bool            `yaml:"passthrough_unrouted"` // false = reject unknown models; true = forward to first backend
 	LogLevel            *int            `yaml:"log_level"`            // 0-4 (see internal/logger); LOG_LEVEL env wins when set
@@ -56,7 +56,7 @@ type ServerConfig struct {
 type PrometheusConfig struct {
 	Enabled        bool      `yaml:"enabled"`
 	Host           string    `yaml:"host"` // bind address; default 127.0.0.1 (localhost-only, no auth on metrics)
-	Port           int       `yaml:"port"`
+	Port           int       `yaml:"port"` // default 9091; an explicit 0 binds an ephemeral port
 	Path           string    `yaml:"path"`
 	AllowPlaintext bool      `yaml:"allow_plaintext"` // required to bind non-loopback without TLS
 	TLS            TLSConfig `yaml:"tls"`             // independent of server.tls; leave empty to serve plaintext (loopback only, or with allow_plaintext)
@@ -311,7 +311,14 @@ func parse(raw []byte, source string, lookup func(string) string) (*Config, erro
 		return nil, err
 	}
 
-	applyDefaults(&cfg)
+	// A second decode of the same document tells an explicit port (0
+	// included) from an absent or null one, which only the decoder can see.
+	var set explicitPorts
+	if err := yaml.Unmarshal([]byte(expanded), &set); err != nil {
+		return nil, errorf("parse config: %w", yamlError{err})
+	}
+
+	applyDefaults(&cfg, set)
 
 	if err := validate(&cfg); err != nil {
 		return nil, err
@@ -464,11 +471,29 @@ func expandPorts(backends []Backend) ([]Backend, error) {
 	return out, nil
 }
 
-func applyDefaults(cfg *Config) {
+// explicitPorts records which listener ports the YAML gives a value. A port
+// key that is absent or null (`port:`, `port: ~`, or an unquoted ${NAME} that
+// expands to nothing) is unset and takes its default; a quoted "${NAME}" that
+// expands to nothing is the empty string, which fails to decode as a port. An
+// explicit value, 0 included, is kept, and 0 binds a port the kernel picks.
+// Presence is decided by the YAML decoder itself, so anchors and merge keys
+// count as they do for the value.
+type explicitPorts struct {
+	Server struct {
+		Port *int `yaml:"port"`
+	} `yaml:"server"`
+	Telemetry struct {
+		Prometheus struct {
+			Port *int `yaml:"port"`
+		} `yaml:"prometheus"`
+	} `yaml:"telemetry"`
+}
+
+func applyDefaults(cfg *Config, set explicitPorts) {
 	if cfg.Server.Host == "" {
 		cfg.Server.Host = "0.0.0.0"
 	}
-	if cfg.Server.Port == 0 {
+	if set.Server.Port == nil {
 		cfg.Server.Port = 4000
 	}
 	if cfg.Server.Transport.MaxIdleConns == 0 {
@@ -489,7 +514,7 @@ func applyDefaults(cfg *Config) {
 	if cfg.Server.MaxResponseLineMB == 0 {
 		cfg.Server.MaxResponseLineMB = defaultResponseLineMB(cfg.Server.MaxResponseBodyMB)
 	}
-	if cfg.Telemetry.Prometheus.Port == 0 {
+	if set.Telemetry.Prometheus.Port == nil {
 		cfg.Telemetry.Prometheus.Port = 9091
 	}
 	if cfg.Telemetry.Prometheus.Path == "" {
